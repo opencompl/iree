@@ -1044,6 +1044,69 @@ def IREELinalgExt_OnlineAttentionOp : IREELinalgExt_PureOp<"online_attention",
 
   let hasCanonicalizer = 1;
 }
+
+//===----------------------------------------------------------------------===//
+// ExpReduction
+//===----------------------------------------------------------------------===//
+
+def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
+    [ AttrSizedOperandSegments,
+      Pure,
+      DestinationStyleOpInterface,
+      // DeclareOpInterfaceMethods<LinalgExtInterface>,
+      DeclareOpInterfaceMethods<LinalgStructuredInterface,
+        ["getLibraryCallName",
+        "getIteratorTypesArray"]>,
+      SingleBlockImplicitTerminator<"::mlir::linalg::YieldOp">,
+      DeclareOpInterfaceMethods<TilingInterface,
+          [ "getIterationDomain",
+            "getLoopIteratorTypes",
+            "getResultTilePosition",
+            "getTiledImplementation",
+            "generateResultTileValue" ]>]> {
+
+  let summary = [{A linalg.generic extension with support for exponential reduction.}];
+  let description = [{
+
+  }];
+
+  let arguments = (ins 
+    Variadic<AnyRankedTensor>:$inputs,
+    Variadic<AnyRankedTensor>:$outputs,
+    AffineMapArrayAttr:$indexing_maps,
+    IREELinalgExt_IteratorTypeArrayAttr:$iterator_types,
+    DenseI64ArrayAttr:$exp_reduced_operands);
+  let results = (outs Variadic<AnyRankedTensor>:$results);
+  let regions = (region SizedRegion<1>:$region);
+
+  let hasVerifier = 0;
+
+  let assemblyFormat = [{
+    `{`
+      `indexing_maps` `=` $indexing_maps `,`
+      `iterator_types` `=` $iterator_types `,`
+      `exp_reduced_operands` `=` $exp_reduced_operands
+    `}`
+    attr-dict-with-keyword
+    (`ins` `(` $inputs^ `:` type($inputs) `)` )?
+    (`outs` `(` $outputs^ `:` type($outputs) `)` )?
+    $region (`->` type($results)^)?
+  }];
+
+
+  let extraClassDeclaration = [{
+    static std::function<void(ImplicitLocOpBuilder &, Block &, ArrayRef<NamedAttribute>, llvm::function_ref<mlir::InFlightDiagnostic()>)>
+    getRegionBuilder() {
+      return nullptr;
+    }
+
+    // DestinationStyleOpInterface methods
+    MutableOperandRange getDpsInitsMutable() {
+      return getOutputsMutable();
+    }
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Im2col
 //===----------------------------------------------------------------------===//
