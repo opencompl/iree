@@ -91,4 +91,22 @@ def SplitReductionMappingAttr :
   }];
 }
 
+
+//===----------------------------------------------------------------------===//
+// Operand map attribute
+//===----------------------------------------------------------------------===//
+
+def OperandMapAttr :
+    AttrDef<IREELinalgExt_Dialect, "OperandMapAttr"> {
+  let mnemonic = "operand_map";
+  let parameters = (ins
+    "int64_t":$input_operand_index,
+    ArrayRefParameter<"int64_t">:$output_operand_indexes
+  );
+  let assemblyFormat = "`<` `(` $input_operand_index `)` `->` `(` $output_operand_indexes `)` `>`";
+  let description = [{
+  }];
+  let extraClassDeclaration = [{
+  }];
+}
 #endif // IREE_DIALECT_LINALGEXT_BASE

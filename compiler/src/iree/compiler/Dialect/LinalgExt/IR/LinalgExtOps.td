@@ -1053,7 +1053,6 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
     [ AttrSizedOperandSegments,
       Pure,
       DestinationStyleOpInterface,
-      // DeclareOpInterfaceMethods<LinalgExtInterface>,
       DeclareOpInterfaceMethods<LinalgStructuredInterface,
         ["getLibraryCallName",
         "getIteratorTypesArray"]>,
@@ -1075,7 +1074,7 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
     Variadic<AnyRankedTensor>:$outputs,
     AffineMapArrayAttr:$indexing_maps,
     IREELinalgExt_IteratorTypeArrayAttr:$iterator_types,
-    DenseI64ArrayAttr:$exp_reduced_operands);
+    TypedArrayAttrBase<OperandMapAttr, "Reduction maps">:$exp_reduction_maps);
   let results = (outs Variadic<AnyRankedTensor>:$results);
   let regions = (region SizedRegion<1>:$region);
 
@@ -1085,7 +1084,7 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
     `{`
       `indexing_maps` `=` $indexing_maps `,`
       `iterator_types` `=` $iterator_types `,`
-      `exp_reduced_operands` `=` $exp_reduced_operands
+      `exp_reduction_maps` `=` $exp_reduction_maps
     `}`
     attr-dict-with-keyword
     (`ins` `(` $inputs^ `:` type($inputs) `)` )?

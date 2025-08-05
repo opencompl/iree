@@ -1,3 +1,5 @@
+// RUN: iree-compile --split-input-file --iree-hal-target-device=local --iree-hal-local-target-device-backends=vmvx --output-format=vm-bytecode --iree-vm-bytecode-module-output-format=flatbuffer-text %s --mlir-print-ir-after=iree-vm-ordinal-allocation
+
 #QK_trait = {
   indexing_maps = [
     affine_map<(B, M, K2, K1) -> (B, M, K1)>,
@@ -26,21 +28,22 @@
 
 stream.executable public @main {
   stream.executable.export public @main workgroups() -> (index, index, index) {
-    %x, %y, %z = flow.dispatch.workgroup_count_from_slice
+    %x, %y, %z = iree_tensor_ext.dispatch.workgroup_count_from_slice
     stream.return %x, %y, %z : index, index, index
   }
+
   builtin.module {
     func.func @main(%arg0: !stream.binding, %arg1: !stream.binding, %arg2: !stream.binding, %arg3: !stream.binding) {
       %cst0 = arith.constant 0.0 : f32
       %cst = arith.constant 1.250000e-01 : f32
       %c0 = arith.constant 0 : index
-      %0 = stream.binding.subspan %arg0[%c0] : !stream.binding -> !flow.dispatch.tensor<readonly:tensor<20x4096x64xf16>>
-      %1 = stream.binding.subspan %arg1[%c0] : !stream.binding -> !flow.dispatch.tensor<readonly:tensor<20x4096x64xf16>>
-      %2 = stream.binding.subspan %arg2[%c0] : !stream.binding -> !flow.dispatch.tensor<readonly:tensor<20x4096x64xf16>>
-      %3 = stream.binding.subspan %arg3[%c0] : !stream.binding -> !flow.dispatch.tensor<writeonly:tensor<20x4096x64xf16>>
-      %4 = flow.dispatch.tensor.load %0, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<20x4096x64xf16>> -> tensor<20x4096x64xf16>
-      %5 = flow.dispatch.tensor.load %1, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<20x4096x64xf16>> -> tensor<20x4096x64xf16>
-      %6 = flow.dispatch.tensor.load %2, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !flow.dispatch.tensor<readonly:tensor<20x4096x64xf16>> -> tensor<20x4096x64xf16>
+      %0 = stream.binding.subspan %arg0[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf32>>
+      %1 = stream.binding.subspan %arg1[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf32>>
+      %2 = stream.binding.subspan %arg2[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf32>>
+      %3 = stream.binding.subspan %arg3[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<20x4096x64xf32>>
+      %4 = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf32>> -> tensor<20x4096x64xf32>
+      %5 = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf32>> -> tensor<20x4096x64xf32>
+      %6 = iree_tensor_ext.dispatch.tensor.load %2, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf32>> -> tensor<20x4096x64xf32>
 
       %S_empty = tensor.empty() : tensor<20x4096x4096xf32>
       %S_fill  = linalg.fill ins(%cst0 : f32)
@@ -48,12 +51,10 @@ stream.executable public @main {
                              -> tensor<20x4096x4096xf32>
 
       %S = linalg.generic #QK_trait
-                          ins(%4, %5 : tensor<20x4096x64xf16>, tensor<20x4096x64xf16>)
+                          ins(%4, %5 : tensor<20x4096x64xf32>, tensor<20x4096x64xf32>)
                           outs(%S_empty : tensor<20x4096x4096xf32>) {
-      ^bb0(%q : f16, %k : f16, %s : f32):
-        %q_32 = arith.extf %q : f16 to f32
-        %k_32 = arith.extf %k : f16 to f32
-        %mul  = arith.mulf %q_32, %k_32 : f32
+      ^bb0(%q : f32, %k : f32, %s : f32):
+        %mul  = arith.mulf %q, %k : f32
         %sum  = arith.addf %mul, %s : f32
         linalg.yield %sum : f32
       } -> tensor<20x4096x4096xf32>
@@ -90,36 +91,33 @@ stream.executable public @main {
           affine_map<(B, M, N, K2) -> (B, M, N)>
         ],
         iterator_types = [
-          #iree_linalg_ext.iterator_type<parallel>,
-          #iree_linalg_ext.iterator_type<parallel>,
-          #iree_linalg_ext.iterator_type<parallel>,
-          #iree_linalg_ext.iterator_type<reduction>
+        #iree_linalg_ext.iterator_type<parallel>,
+        #iree_linalg_ext.iterator_type<parallel>,
+        #iree_linalg_ext.iterator_type<parallel>,
+        #iree_linalg_ext.iterator_type<reduction>
         ],
-        exp_reduced_operands = [3]
-      } ins(%scaled_S, %6 : tensor<20x4096x4096xf32>, tensor<20x4096x64xf16>)
+        exp_reduction_maps = [ #iree_linalg_ext.operand_map<(2)->(3,4)> ]
+      } ins(%scaled_S, %6 : tensor<20x4096x4096xf32>, tensor<20x4096x64xf32>)
       outs(%max_init, %sum_init, %acc_init : tensor<20x4096x64xf32>, tensor<20x4096x64xf32>, tensor<20x4096x64xf32>) {
-      ^bb0(%ex : f32, %v : f16, %max : f32, %sum : f32, %acc : f32):
-        %nmax = arith.maximumf %max, %ex : f32
+      ^bb0(%ex : f32, %v : f32, %m : f32, %sum : f32, %acc : f32):
         %nsum = arith.addf %ex, %sum : f32
-        %v_32 = arith.extf %v : f16 to f32
-        %mul  = arith.mulf %ex, %v_32 : f32
+        %mul  = arith.mulf %ex, %v : f32
         %nacc = arith.addf %mul, %acc : f32
-        
-        iree_linalg_ext.yield %nmax, %nsum, %nacc : f32, f32, f32
+        linalg.yield %m, %nsum, %nacc : f32, f32, f32
       } -> tensor<20x4096x64xf32>, tensor<20x4096x64xf32>, tensor<20x4096x64xf32>
 
-      %result_empty = tensor.empty() : tensor<20x4096x64xf16>
+      %result_empty = tensor.empty() : tensor<20x4096x64xf32>
 
       %result = linalg.generic #PV_sum_div
                                ins(%PV, %SUM : tensor<20x4096x64xf32>, tensor<20x4096x64xf32>)
-                               outs(%result_empty : tensor<20x4096x64xf16>) {
-      ^bb0(%pv : f32, %sum : f32, %res : f16):
+                               outs(%result_empty : tensor<20x4096x64xf32>) {
+      ^bb0(%pv : f32, %sum : f32, %res : f32):
         %out = arith.divf %pv, %sum : f32
-        %trunc = arith.truncf %out : f32 to f16
-        linalg.yield %trunc : f16
-      } -> tensor<20x4096x64xf16>
+        linalg.yield %out : f32
+      } -> tensor<20x4096x64xf32>
 
-      flow.dispatch.tensor.store %result, %3, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : tensor<20x4096x64xf16> -> !flow.dispatch.tensor<writeonly:tensor<20x4096x64xf16>>
+      iree_tensor_ext.dispatch.tensor.store  %result, %3, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] 
+        : tensor<20x4096x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<20x4096x64xf32>>
       return
     }
   }
