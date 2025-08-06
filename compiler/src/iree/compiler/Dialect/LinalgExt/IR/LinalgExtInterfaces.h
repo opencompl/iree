@@ -32,6 +32,8 @@ LogicalResult verifyLinalgExtOpInterface(Operation *op);
 
 void registerConcatOpTilingInterfaceExternalModel(MLIRContext *ctx);
 
+void populateExpReductionDecompositionPatterns(RewritePatternSet &patterns);
+
 /// Include the generated interface declarations.
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h.inc" // IWYU pragma: export
 

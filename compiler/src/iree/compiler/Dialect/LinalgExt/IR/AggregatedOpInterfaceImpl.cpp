@@ -12,6 +12,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Utils/Utils.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Utils/Utils.h"
@@ -1044,4 +1045,91 @@ FailureOr<SmallVector<Value>> CustomOp::decomposeOperation(OpBuilder &builder) {
   return customOpReplacements;
 }
 
+struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ExpReductionOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+
+    // Split the op into:
+    // curr_max = max(s, old_max)
+    // ex = e^{x - curr_max}
+    // norm = e^{curr_max - old_max}
+    // norm_outs = outs * norm (for each outs in exp_reduction)
+    // exp_reduction_generic ins(ex, ...) outs(norm_outs)
+
+
+    SmallVector<Value> inputs = op.getDpsInputs();
+    SmallVector<Value> normOuts;
+    normOuts.resize(op.getNumDpsInits());
+
+    for (auto& elem : op.getExpReductionMaps()) {
+      auto op_mapping = cast<OperandMapAttr>(elem);
+      auto input_index = op_mapping.getInputOperandIndex();
+      OpOperand* normVal = op.getDpsInputOperand(input_index);
+      OpOperand* oldNormVal = op.getDpsInitOperand(input_index);
+      AffineMap normValMap = op.getMatchingIndexingMap(normVal);
+      AffineMap oldNormValMap = op.getMatchingIndexingMap(oldNormVal);
+
+      // ex = e^(normVal - oldNormVal)
+      // Value ex = computeSubAndExp2(rewriter, loc, normValMap, oldNormValMap, normVal.get(), oldNormVal->get());
+      
+      // norm = e^(oldNormVal - normVal)
+      Value norm = computeSubAndExp2(rewriter, loc, oldNormValMap, oldNormValMap,
+                                  normVal->get(), oldNormVal->get());
+                                  
+      for (auto& oldIndex : op_mapping.getOutputOperandIndices()) {
+        auto oldOut = op.getDpsInitOperand(oldIndex);
+        auto oldOutMap = op.getMatchingIndexingMap(oldOut);
+        auto normOut = elementwiseValueInPlace<arith::MulFOp>(rewriter,  loc, oldOutMap, normValMap, oldOut->get(), norm);
+        normOuts[oldIndex - inputs.size()] = normOut;
+      }
+    }
+
+    // curr_max = max(s, old_max)
+    // OpOperand *s = op.getDpsInputOperand(0);
+    // OpOperand *oldMax = op.getDpsInitOperand(0);
+    // AffineMap sMap = op.getMatchingIndexingMap(s);
+    // AffineMap oldMaxMap = op.getMatchingIndexingMap(oldMax);
+    // Value currMax = reduce<arith::MaximumFOp>(rewriter, loc, sMap, oldMaxMap,
+    //                                           s->get(), oldMax->get());
+
+    // // ex = e^{s - curr_max}
+    // Value ex =
+    //     computeSubAndExp2(rewriter, loc, oldMaxMap, sMap, currMax, s->get());
+
+    // // norm = e^{old_max - curr_max}
+    // Value norm = computeSubAndExp2(rewriter, loc, oldMaxMap, oldMaxMap, currMax,
+    //                                oldMax->get());
+    // AffineMap normMap = oldMaxMap;
+
+    // // norm_outs = outs * norm (for each outs in exp_reduction)
+    // SmallVector<Value> normOuts = {currMax};
+    // for (OpOperand &oldOut :
+    //      op.getDpsInitsMutable().slice(1, op.getNumDpsInits() - 1)) {
+    //   AffineMap oldOutMap = op.getMatchingIndexingMap(&oldOut);
+    //   Value normOldOut = elementwiseValueInPlace<arith::MulFOp>(
+    //       rewriter, loc, oldOutMap, normMap, oldOut.get(), norm);
+    //   normOuts.push_back(normOldOut);
+    // }
+
+    // // exp_reduction_generic ins(ex, ...) outs(norm_outs)
+    linalg::GenericOp expRedGeneric = rewriter.create<linalg::GenericOp>(
+        loc, TypeRange(normOuts), inputs, normOuts, op.getIndexingMapsArray(),
+        op.getIteratorTypesArray());
+    rewriter.inlineRegionBefore(op.getRegion(), expRedGeneric.getRegion(),
+                                expRedGeneric.getRegion().begin());
+    expRedGeneric->setDiscardableAttrs(op->getDiscardableAttrDictionary());
+
+    rewriter.replaceOp(op, expRedGeneric);
+
+    return success();
+  }
+};
+
+void populateExpReductionDecompositionPatterns(RewritePatternSet &patterns) {
+  patterns.add<DecomposeExpReduction>(
+      patterns.getContext());
+}
 } // namespace mlir::iree_compiler::IREE::LinalgExt
