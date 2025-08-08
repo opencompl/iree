@@ -1,4 +1,4 @@
-// RUN: iree-compile --split-input-file --iree-hal-target-device=local --iree-hal-local-target-device-backends=gpu --output-format=vm-bytecode --iree-vm-bytecode-module-output-format=flatbuffer-text %s --mlir-print-ir-after=iree-vm-ordinal-allocation
+// RUN: iree-opt --pass-pipeline="builtin.module(func.func(iree-linalg-ext-decompose-exp-reduction))" %s
 
 #config = #iree_gpu.lowering_config<
   {
