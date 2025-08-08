@@ -1082,7 +1082,6 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
       
       // norm = e^(oldNormVal - normVal)
       Value norm = computeSubAndExp2(rewriter, loc, normValMap, oldNormValMap, normVal->get(), oldNormVal->get());
-      // llvm::errs() << "break3\n";
 
       inputs[input_index] = ex;
       normOuts[input_index] = currMax;
@@ -1093,40 +1092,6 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
         auto normOut = elementwiseValueInPlace<arith::MulFOp>(rewriter,  loc, oldOutMap, oldNormValMap, oldOut->get(), norm);
         normOuts[oldIndex] = normOut;
       }
-    }
-
-    // curr_max = max(s, old_max)
-    // OpOperand *s = op.getDpsInputOperand(0);
-    // OpOperand *oldMax = op.getDpsInitOperand(0);
-    // AffineMap sMap = op.getMatchingIndexingMap(s);
-    // AffineMap oldMaxMap = op.getMatchingIndexingMap(oldMax);
-    // Value currMax = reduce<arith::MaximumFOp>(rewriter, loc, sMap, oldMaxMap,
-    //                                           s->get(), oldMax->get());
-
-    // // ex = e^{s - curr_max}
-    // Value ex =
-    //     computeSubAndExp2(rewriter, loc, oldMaxMap, sMap, currMax, s->get());
-
-    // // norm = e^{old_max - curr_max}
-    // Value norm = computeSubAndExp2(rewriter, loc, oldMaxMap, oldMaxMap, currMax,
-    //                                oldMax->get());
-    // AffineMap normMap = oldMaxMap;
-
-    // // norm_outs = outs * norm (for each outs in exp_reduction)
-    // SmallVector<Value> normOuts = {currMax};
-    // for (OpOperand &oldOut :
-    //      op.getDpsInitsMutable().slice(1, op.getNumDpsInits() - 1)) {
-    //   AffineMap oldOutMap = op.getMatchingIndexingMap(&oldOut);
-    //   Value normOldOut = elementwiseValueInPlace<arith::MulFOp>(
-    //       rewriter, loc, oldOutMap, normMap, oldOut.get(), norm);
-    //   normOuts.push_back(normOldOut);
-    // }
-
-    // // linalg.generic ins(ex, ...) outs(norm_outs)
-    // llvm::errs() << "inputs:\n\t" << inputs << "\n";
-    
-    for (auto& inp : inputs){ 
-      llvm::errs() << "inp: \n" << inp << "\n\n";
     }
 
     linalg::GenericOp expRedGeneric = rewriter.create<linalg::GenericOp>(
