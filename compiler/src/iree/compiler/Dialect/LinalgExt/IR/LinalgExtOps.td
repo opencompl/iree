@@ -1066,7 +1066,9 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
 
   let summary = [{A linalg.generic extension with support for exponential reduction.}];
   let description = [{
+    The first output operand is calculated as the maximum of the first input operand.
 
+    The running output operand is used to compute the exponential forms of the operations indexed by exp_reduced_operands.
   }];
 
   let arguments = (ins 
@@ -1074,7 +1076,7 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
     Variadic<AnyRankedTensor>:$outputs,
     AffineMapArrayAttr:$indexing_maps,
     IREELinalgExt_IteratorTypeArrayAttr:$iterator_types,
-    TypedArrayAttrBase<OperandMapAttr, "Reduction maps">:$exp_reduction_maps);
+    DenseI64ArrayAttr:$exp_reduced_operands);
   let results = (outs Variadic<AnyRankedTensor>:$results);
   let regions = (region SizedRegion<1>:$region);
 
@@ -1084,7 +1086,7 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
     `{`
       `indexing_maps` `=` $indexing_maps `,`
       `iterator_types` `=` $iterator_types `,`
-      `exp_reduction_maps` `=` $exp_reduction_maps
+      `exp_reduced_operands` `=` $exp_reduced_operands
     `}`
     attr-dict-with-keyword
     (`ins` `(` $inputs^ `:` type($inputs) `)` )?

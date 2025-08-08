@@ -1063,35 +1063,32 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
     SmallVector<Value> normOuts;
     normOuts.resize(op.getNumDpsInits());
 
-    for (auto &elem : op.getExpReductionMaps()) {
-      auto op_mapping = cast<OperandMapAttr>(elem);
-      auto input_index = op_mapping.getInputOperandIndex();
-      OpOperand *normVal = op.getDpsInputOperand(input_index);
-      OpOperand *oldNormVal = op.getDpsInitOperand(input_index);
-      AffineMap normValMap = op.getMatchingIndexingMap(normVal);
-      AffineMap oldNormValMap = op.getMatchingIndexingMap(oldNormVal);
-      auto currMax =
-          reduce<arith::MaximumFOp>(rewriter, loc, normValMap, oldNormValMap,
+    const auto input_index = 0;
+    OpOperand *normVal = op.getDpsInputOperand(input_index);
+    OpOperand *oldNormVal = op.getDpsInitOperand(input_index);
+    AffineMap normValMap = op.getMatchingIndexingMap(normVal);
+    AffineMap oldNormValMap = op.getMatchingIndexingMap(oldNormVal);
+    auto currMax =
+        reduce<arith::MaximumFOp>(rewriter, loc, normValMap, oldNormValMap,
+                                  normVal->get(), oldNormVal->get());
+
+    // ex = e^{s - curr_max}
+    Value ex = computeSubAndExp2(rewriter, loc, oldNormValMap, normValMap,
+                                  currMax, normVal->get());
+
+    // norm = e^(oldNormVal - normVal)
+    Value norm = computeSubAndExp2(rewriter, loc, normValMap, oldNormValMap,
                                     normVal->get(), oldNormVal->get());
 
-      // ex = e^{s - curr_max}
-      Value ex = computeSubAndExp2(rewriter, loc, oldNormValMap, normValMap,
-                                   currMax, normVal->get());
+    inputs[input_index] = ex;
+    normOuts[input_index] = currMax;
 
-      // norm = e^(oldNormVal - normVal)
-      Value norm = computeSubAndExp2(rewriter, loc, normValMap, oldNormValMap,
-                                     normVal->get(), oldNormVal->get());
-
-      inputs[input_index] = ex;
-      normOuts[input_index] = currMax;
-
-      for (auto &oldIndex : op_mapping.getOutputOperandIndices()) {
-        auto oldOut = op.getDpsInitOperand(oldIndex);
-        auto oldOutMap = op.getMatchingIndexingMap(oldOut);
-        auto normOut = elementwiseValueInPlace<arith::MulFOp>(
-            rewriter, loc, oldOutMap, oldNormValMap, oldOut->get(), norm);
-        normOuts[oldIndex] = normOut;
-      }
+    for (auto &oldIndex : op.getExpReducedOperands()) {
+      auto oldOut = op.getDpsInitOperand(oldIndex);
+      auto oldOutMap = op.getMatchingIndexingMap(oldOut);
+      auto normOut = elementwiseValueInPlace<arith::MulFOp>(
+          rewriter, loc, oldOutMap, oldNormValMap, oldOut->get(), norm);
+      normOuts[oldIndex] = normOut;
     }
 
     linalg::GenericOp expRedGeneric = rewriter.create<linalg::GenericOp>(

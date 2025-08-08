@@ -98,7 +98,7 @@ builtin.module {
       #iree_linalg_ext.iterator_type<parallel>,
       #iree_linalg_ext.iterator_type<reduction>
       ],
-      exp_reduction_maps = [ #iree_linalg_ext.operand_map<(0)->(1,2)> ]
+      exp_reduced_operands = [ 1,2 ]
     } ins(%scaled_S, %V : tensor<20x4096x4096xf32>, tensor<20x4096x64xf32>)
     outs(%max_init, %sum_init, %acc_init : tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>) {
     ^bb0(%ex : f32, %v : f32, %m : f32, %sum : f32, %acc : f32):
