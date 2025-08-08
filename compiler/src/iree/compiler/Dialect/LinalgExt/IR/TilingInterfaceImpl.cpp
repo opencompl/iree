@@ -1706,7 +1706,6 @@ SmallVector<Range> ExpReductionOp::getIterationDomain(OpBuilder &b) {
       }));
 }
 
-
 FailureOr<TilingResult>
 ExpReductionOp::getTiledImplementation(OpBuilder &b,
                                        ArrayRef<OpFoldResult> offsets,
@@ -1786,7 +1785,6 @@ ExpReductionOp::generateResultTileValue(OpBuilder &b, unsigned resultNumber,
       SmallVector<Value>{tilingResult->tiledValues[resultNumber]},
       tilingResult->generatedSlices};
 }
-
 
 //===----------------------------------------------------------------------===//
 // Im2colOp

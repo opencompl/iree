@@ -2195,7 +2195,6 @@ void OnlineAttentionOp::getCanonicalizationPatterns(RewritePatternSet &patterns,
   patterns.insert<StaticizeLinalgExtOp<OnlineAttentionOp>>(ctx);
 }
 
-
 //===----------------------------------------------------------------------===//
 // ExpReductionOp
 //===----------------------------------------------------------------------===//

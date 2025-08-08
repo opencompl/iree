@@ -1058,38 +1058,38 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
     // norm = e^{curr_max - old_max}
     // norm_outs = outs * norm (for each outs in exp_reduction)
     // linalg.generic ins(ex, ...) outs(norm_outs)
-                                    
 
     SmallVector<Value> inputs = op.getDpsInputs();
     SmallVector<Value> normOuts;
     normOuts.resize(op.getNumDpsInits());
 
-    for (auto& elem : op.getExpReductionMaps()) {
+    for (auto &elem : op.getExpReductionMaps()) {
       auto op_mapping = cast<OperandMapAttr>(elem);
       auto input_index = op_mapping.getInputOperandIndex();
-      OpOperand* normVal = op.getDpsInputOperand(input_index); 
-      OpOperand* oldNormVal = op.getDpsInitOperand(input_index);
+      OpOperand *normVal = op.getDpsInputOperand(input_index);
+      OpOperand *oldNormVal = op.getDpsInitOperand(input_index);
       AffineMap normValMap = op.getMatchingIndexingMap(normVal);
       AffineMap oldNormValMap = op.getMatchingIndexingMap(oldNormVal);
-      auto currMax = reduce<arith::MaximumFOp>(
-        rewriter, loc, 
-        normValMap, oldNormValMap, normVal->get(), oldNormVal->get()
-      );
+      auto currMax =
+          reduce<arith::MaximumFOp>(rewriter, loc, normValMap, oldNormValMap,
+                                    normVal->get(), oldNormVal->get());
 
       // ex = e^{s - curr_max}
       Value ex = computeSubAndExp2(rewriter, loc, oldNormValMap, normValMap,
-                                  currMax, normVal->get());
-      
+                                   currMax, normVal->get());
+
       // norm = e^(oldNormVal - normVal)
-      Value norm = computeSubAndExp2(rewriter, loc, normValMap, oldNormValMap, normVal->get(), oldNormVal->get());
+      Value norm = computeSubAndExp2(rewriter, loc, normValMap, oldNormValMap,
+                                     normVal->get(), oldNormVal->get());
 
       inputs[input_index] = ex;
       normOuts[input_index] = currMax;
-                                  
-      for (auto& oldIndex : op_mapping.getOutputOperandIndices()) {
+
+      for (auto &oldIndex : op_mapping.getOutputOperandIndices()) {
         auto oldOut = op.getDpsInitOperand(oldIndex);
         auto oldOutMap = op.getMatchingIndexingMap(oldOut);
-        auto normOut = elementwiseValueInPlace<arith::MulFOp>(rewriter,  loc, oldOutMap, oldNormValMap, oldOut->get(), norm);
+        auto normOut = elementwiseValueInPlace<arith::MulFOp>(
+            rewriter, loc, oldOutMap, oldNormValMap, oldOut->get(), norm);
         normOuts[oldIndex] = normOut;
       }
     }
@@ -1108,7 +1108,6 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
 };
 
 void populateExpReductionDecompositionPatterns(RewritePatternSet &patterns) {
-  patterns.add<DecomposeExpReduction>(
-      patterns.getContext());
+  patterns.add<DecomposeExpReduction>(patterns.getContext());
 }
 } // namespace mlir::iree_compiler::IREE::LinalgExt
