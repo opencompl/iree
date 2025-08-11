@@ -1066,9 +1066,69 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
 
   let summary = [{A linalg.generic extension with support for exponential reduction.}];
   let description = [{
-    The first output operand is calculated as the maximum of the first input operand.
+    This operation extends linalg.generic, allowing specialization on operations that perform exponential reductions.
 
-    The running output operand is used to compute the exponential forms of the operations indexed by exp_reduced_operands.
+    The first input and output operands are intrinsically linked, with the initial value of the input operand always calculated as
+    `e` raised to power of the first output operand.
+    We refer to the input operand as the normalizing operand, and the output operand as the reducing operand.
+
+    The operands listed in `exp_reduced_operands` will be multiplied by the normalizing operand in the next reduction iteration.
+
+    As an example,
+
+    ```
+    %M, %O =  iree_linalg_ext.exp_reduction {
+      indexing_maps = [
+        affine_map<(i) -> (i)>,
+        affine_map<(i) -> (i)>,
+        affine_map<(i) -> (i)>
+      ],
+      iterator_types = [
+      #iree_linalg_ext.iterator_type<reduction>
+      ],
+      exp_reduced_operands = [ 1 ]
+    } ins(%V: tensor<256xf32>)
+      outs(%exp_V, %S: tensor<256xf32>, tensor<256xf32>) {
+    ^bb0(%norm: f32, %redux: f32, %s: f32): 
+      %add = arith.addf %norm, %s: f32
+      linalg.yield %redux, %add: f32, f32
+    } -> tensor<256xf32>, tensor<256xf32>
+    return %M : tensor<256xf32>
+  ```
+
+  gets lowered to
+
+  ```
+    #map = affine_map<(d0) -> (d0)>
+    %0 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%V : tensor<256xf32>) outs(%exp_V : tensor<256xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %5 = arith.maximumf %in, %out : f32
+      linalg.yield %5 : f32
+    } -> tensor<256xf32>
+    %1 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%0 : tensor<256xf32>) outs(%V : tensor<256xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %5 = arith.subf %out, %in : f32
+      %6 = math.exp2 %5 : f32
+      linalg.yield %6 : f32
+    } -> tensor<256xf32>
+    %2 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%V : tensor<256xf32>) outs(%exp_V : tensor<256xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %5 = arith.subf %out, %in : f32
+      %6 = math.exp2 %5 : f32
+      linalg.yield %6 : f32
+    } -> tensor<256xf32>
+    %3 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]} ins(%2 : tensor<256xf32>) outs(%S : tensor<256xf32>) {
+    ^bb0(%in: f32, %out: f32):
+      %5 = arith.mulf %in, %out : f32
+      linalg.yield %5 : f32
+    } -> tensor<256xf32>
+    %4:2 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["reduction"]} ins(%1 : tensor<256xf32>) outs(%0, %3 : tensor<256xf32>, tensor<256xf32>) {
+    ^bb0(%in: f32, %out: f32, %out_0: f32):
+      %5 = arith.addf %in, %out_0 : f32
+      linalg.yield %out, %5 : f32, f32
+    } -> (tensor<256xf32>, tensor<256xf32>)
+  }
+  ```
   }];
 
   let arguments = (ins 
