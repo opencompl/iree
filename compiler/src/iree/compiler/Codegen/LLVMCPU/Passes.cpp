@@ -476,7 +476,6 @@ void addCPUDataTilingPipeline(OpPassManager &funcPassManager,
 void addCPULinalgExtTileAndVectorizePipeline(
     OpPassManager &funcPassManager, const LLVMCPUPipelineOptions &pipelineOpt) {
   addTileAndDistributePasses(funcPassManager, pipelineOpt);
-  funcPassManager.addPass(IREE::LinalgExt::createDecomposeExpReductionPass());
   funcPassManager.addPass(createLLVMCPUTileRootAndFuseProducerConsumerPass(
       IREE::CPU::TilingLevel::VectorCommonParallelTiles));
   funcPassManager.addPass(
@@ -485,6 +484,7 @@ void addCPULinalgExtTileAndVectorizePipeline(
       IREE::CPU::TilingLevel::VectorReductionTiles));
   funcPassManager.addPass(
       IREE::LinalgExt::createDecomposeWinogradTransformPass());
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeExpReductionPass());
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
   funcPassManager.addPass(iree_compiler::createForallToForPass());
 
