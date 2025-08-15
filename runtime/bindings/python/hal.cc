@@ -180,7 +180,7 @@ py::object HalAllocator::AllocateBufferCopy(
   // only request that via PyBUF_ND. Long term, we should consult an
   // "oracle" in the runtime to determine the precise required format
   // and set flags accordingly (and fallback/copy on failure).
-  int flags = PyBUF_FORMAT | PyBUF_ND;
+  int flags = PyBUF_C_CONTIGUOUS | PyBUF_ND;
 
   // Acquire the backing buffer and setup RAII release.
   if (PyObject_GetBuffer(buffer.ptr(), &py_view, flags) != 0) {
@@ -243,7 +243,7 @@ HalBuffer HalAllocator::AllocateHostStagingBufferCopy(HalDevice& device,
   // only request that via PyBUF_ND. Long term, we should consult an
   // "oracle" in the runtime to determine the precise required format
   // and set flags accordingly (and fallback/copy on failure).
-  int flags = PyBUF_FORMAT | PyBUF_ND;
+  int flags = PyBUF_C_CONTIGUOUS | PyBUF_ND;
 
   // Acquire the backing buffer and setup RAII release.
   if (PyObject_GetBuffer(buffer.ptr(), &py_view, flags) != 0) {
@@ -1286,8 +1286,8 @@ void SetupHalBindings(nanobind::module_ m) {
       .value("TRANSFER_SOURCE", IREE_HAL_BUFFER_USAGE_TRANSFER_SOURCE)
       .value("TRANSFER_TARGET", IREE_HAL_BUFFER_USAGE_TRANSFER_TARGET)
       .value("TRANSFER", IREE_HAL_BUFFER_USAGE_TRANSFER)
-      .value("DISPATCH_INDIRECT_PARAMS",
-             IREE_HAL_BUFFER_USAGE_DISPATCH_INDIRECT_PARAMS)
+      .value("DISPATCH_INDIRECT_PARAMETERS",
+             IREE_HAL_BUFFER_USAGE_DISPATCH_INDIRECT_PARAMETERS)
       .value("DISPATCH_UNIFORM_READ",
              IREE_HAL_BUFFER_USAGE_DISPATCH_UNIFORM_READ)
       .value("DISPATCH_STORAGE_READ",
@@ -2025,7 +2025,7 @@ void SetupHalBindings(nanobind::module_ m) {
              py::handle pattern, iree_device_size_t target_offset,
              std::optional<iree_device_size_t> length, bool end) {
             Py_buffer pattern_view;
-            int flags = PyBUF_FORMAT | PyBUF_ND;
+            int flags = PyBUF_C_CONTIGUOUS | PyBUF_ND;
             if (PyObject_GetBuffer(pattern.ptr(), &pattern_view, flags) != 0) {
               // The GetBuffer call is required to set an appropriate error.
               throw py::python_error();

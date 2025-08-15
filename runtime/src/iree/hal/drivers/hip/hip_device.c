@@ -1006,7 +1006,11 @@ static void iree_hal_hip_async_buffer_release(
   iree_hal_hip_device_t* device = (iree_hal_hip_device_t*)user_data;
   void* ptr = iree_hal_hip_buffer_device_pointer(buffer);
   if (ptr) {
-    iree_hal_hip_allocator_free_async(device->device_allocator, buffer);
+    if (device->params.async_caching) {
+      iree_hal_hip_allocator_free_async(device->device_allocator, buffer);
+    } else {
+      iree_hal_hip_allocator_free_sync(device->device_allocator, buffer);
+    }
   }
 }
 
@@ -2693,6 +2697,7 @@ static const iree_hal_device_vtable_t iree_hal_hip_device_vtable = {
     .queue_copy = iree_hal_device_queue_emulated_copy,
     .queue_read = iree_hal_hip_device_queue_read,
     .queue_write = iree_hal_hip_device_queue_write,
+    .queue_dispatch = iree_hal_device_queue_emulated_dispatch,
     .queue_execute = iree_hal_hip_device_queue_execute,
     .queue_flush = iree_hal_hip_device_queue_flush,
     .wait_semaphores = iree_hal_hip_device_wait_semaphores,
