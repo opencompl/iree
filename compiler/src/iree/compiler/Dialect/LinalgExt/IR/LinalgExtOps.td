@@ -1148,9 +1148,9 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_PureOp<"exp_reduction",
       `iterator_types` `=` $iterator_types `,`
       `exp_reduced_operands` `=` $exp_reduced_operands
     `}`
-    attr-dict-with-keyword
-    (`ins` `(` $inputs^ `:` type($inputs) `)` )?
-    (`outs` `(` $outputs^ `:` type($outputs) `)` )?
+    attr-dict
+    `ins` `(` $inputs `:` type($inputs) `)` 
+    `outs` `(` $outputs `:` type($outputs) `)` 
     $region (`->` type($results)^)?
   }];
 
