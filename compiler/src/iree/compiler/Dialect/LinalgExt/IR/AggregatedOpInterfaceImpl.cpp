@@ -1065,21 +1065,22 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
     normOuts.resize(op.getNumDpsInits());
 
     const auto input_index = 0;
-    OpOperand *normVal = op.getDpsInputOperand(input_index);
-    OpOperand *oldNormVal = op.getDpsInitOperand(input_index);
-    AffineMap normValMap = op.getMatchingIndexingMap(normVal);
-    AffineMap oldNormValMap = op.getMatchingIndexingMap(oldNormVal);
+    OpOperand *sValue = op.getDpsInputOperand(input_index);
+    OpOperand *prevMax = op.getDpsInitOperand(input_index);
+    AffineMap normValMap = op.getMatchingIndexingMap(sValue);
+    AffineMap prevMaxMap = op.getMatchingIndexingMap(prevMax);
+
     auto currMax =
-        reduce<arith::MaximumFOp>(rewriter, loc, normValMap, oldNormValMap,
-                                  normVal->get(), oldNormVal->get());
+        reduce<arith::MaximumFOp>(rewriter, loc, normValMap, prevMaxMap,
+                                  sValue->get(), prevMax->get());
 
-    // ex = e^{s - curr_max}
-    Value ex = computeSubAndExp2(rewriter, loc, oldNormValMap, normValMap,
-                                  currMax, normVal->get());
+    // ex = e^{sValue - curr_max}
+    Value ex = computeSubAndExp2(rewriter, loc, prevMaxMap, normValMap,
+                                  currMax, sValue->get());
 
-    // norm = e^(curr_max - oldNormVal)
-    Value norm = computeSubAndExp2(rewriter, loc, oldNormValMap, oldNormValMap,
-                                    oldNormVal->get(), currMax);
+    // norm = e^(old_max - curr_max)
+    Value norm = computeSubAndExp2(rewriter, loc, prevMaxMap, prevMaxMap,
+                                     currMax, prevMax->get());
 
     inputs[input_index] = ex;
     normOuts[input_index] = currMax;
@@ -1088,7 +1089,7 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
       auto oldOut = op.getDpsInitOperand(oldIndex);
       auto oldOutMap = op.getMatchingIndexingMap(oldOut);
       auto normOut = elementwiseValueInPlace<arith::MulFOp>(
-          rewriter, loc, oldOutMap, oldNormValMap, oldOut->get(), norm);
+          rewriter, loc, oldOutMap, prevMaxMap, oldOut->get(), norm);
       normOuts[oldIndex] = normOut;
     }
 
