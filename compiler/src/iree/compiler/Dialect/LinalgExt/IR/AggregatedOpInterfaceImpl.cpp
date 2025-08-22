@@ -1070,17 +1070,16 @@ struct DecomposeExpReduction : OpRewritePattern<ExpReductionOp> {
     AffineMap normValMap = op.getMatchingIndexingMap(sValue);
     AffineMap prevMaxMap = op.getMatchingIndexingMap(prevMax);
 
-    auto currMax =
-        reduce<arith::MaximumFOp>(rewriter, loc, normValMap, prevMaxMap,
-                                  sValue->get(), prevMax->get());
+    auto currMax = reduce<arith::MaximumFOp>(
+        rewriter, loc, normValMap, prevMaxMap, sValue->get(), prevMax->get());
 
     // ex = e^{sValue - curr_max}
-    Value ex = computeSubAndExp2(rewriter, loc, prevMaxMap, normValMap,
-                                  currMax, sValue->get());
+    Value ex = computeSubAndExp2(rewriter, loc, prevMaxMap, normValMap, currMax,
+                                 sValue->get());
 
     // norm = e^(old_max - curr_max)
     Value norm = computeSubAndExp2(rewriter, loc, prevMaxMap, prevMaxMap,
-                                     currMax, prevMax->get());
+                                   currMax, prevMax->get());
 
     inputs[input_index] = ex;
     normOuts[input_index] = currMax;
@@ -1230,6 +1229,7 @@ struct DecomposeMultipleResults : OpRewritePattern<linalg::GenericOp> {
 };
 
 void populateExpReductionDecompositionPatterns(RewritePatternSet &patterns) {
-  patterns.add<DecomposeExpReduction, DecomposeMultipleResults>(patterns.getContext());
+  patterns.add<DecomposeExpReduction, DecomposeMultipleResults>(
+      patterns.getContext());
 }
 } // namespace mlir::iree_compiler::IREE::LinalgExt

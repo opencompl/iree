@@ -100,8 +100,8 @@ def DecomposeAttentionPass :
       "Decomposes attention op into a sequence of linalg ops";
 }
 
-def DecomposeExpReductionPass : Pass<"iree-linalg-ext-decompose-exp-reduction"> {
-  let summary = "";
+def DecomposeExpReductionPass : InterfacePass<"iree-linalg-ext-decompose-exp-reduction", "mlir::FunctionOpInterface"> {
+  let summary = "Decomposes exponential reduction op into a sequence of linalg ops";
 }
 
 def ConvertAttentionToOnlineAttentionPass :
