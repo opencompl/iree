@@ -282,6 +282,11 @@ void addConvTileAndDecomposeExpertPassPipeline(
   funcPassManager.addPass(createLLVMCPUTileRootAndFuseInputOperandsPass(
       IREE::CPU::TilingLevel::VectorReductionTiles));
   funcPassManager.addPass(createDecomposeConvolutionToLowerDimOpsPass());
+  llvm::dbgs() << "HELP\n";
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeAggregatedOpPass(
+      IREE::LinalgExt::DecomposeAggregatedOpPassOptions{
+          .filterOps =
+              IREE::LinalgExt::ExpReductionOp::getOperationName().str()}));
   funcPassManager.addPass(createFuseTensorPadWithConsumerPass());
   funcPassManager.addPass(createConcretizePadResultShapePass());
 
@@ -433,8 +438,12 @@ void addCPULinalgExtTileAndVectorizePipeline(
   funcPassManager.addPass(
       IREE::LinalgExt::createDecomposeWinogradTransformPass());
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
+  llvm::dbgs() << "HELP\n";
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeAggregatedOpPass(
+      IREE::LinalgExt::DecomposeAggregatedOpPassOptions{
+          .filterOps =
+              IREE::LinalgExt::ExpReductionOp::getOperationName().str()}));
   funcPassManager.addPass(iree_compiler::createForallToForPass());
-
   {
     GenericVectorizationPassOptions options;
     options.useConfiguredVectorSizes = pipelineOpt.useConfiguredVectorSizes;
