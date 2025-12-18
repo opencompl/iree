@@ -1435,7 +1435,11 @@ func.func @exp_reduction(%S: tensor<2x3xf32>) -> tensor<2xf32> {
       #iree_linalg_ext.iterator_type<reduction>
     ],
     exp_reduced_operands = [1]
-  } ins(%S: tensor<2x3xf32>)
+  }
+  attributes {
+    help = 1: i64
+  }
+  ins(%S: tensor<2x3xf32>)
     outs(%M, %out: tensor<2xf32>, tensor<2xf32>)
   {
   ^bb0(%s: f32, %m: f32, %o: f32):
