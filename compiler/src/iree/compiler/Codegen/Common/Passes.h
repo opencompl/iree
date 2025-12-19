@@ -18,6 +18,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
+#include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/Transform/IR/TransformOps.h"
@@ -96,6 +97,18 @@ createTileAndDistributeToWorkgroupsPass(
 // Pass to tile and distribute using scf.forall with workgroup reordering.
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
 createTileAndDistributeToWorkgroupsWithReordering(bool transposeWorkgroup);
+
+/// create a DecomposeAggregatedOpPass that decomposes the types in the list Ops
+template <typename... Ops, typename = std::enable_if_t<(sizeof...(Ops) > 0)>>
+std::unique_ptr<Pass> createDecomposeAggregatedOpPass() {
+  static_assert((std::is_base_of_v<::mlir::OpState, Ops> && ...), "");
+
+  return createDecomposeAggregatedOpPass(
+      IREE::LinalgExt::DecomposeAggregatedOpPassOptions{
+          .filterOps = llvm::join(
+              llvm::ArrayRef<llvm::StringLiteral>{Ops::getOperationName()...},
+              ",")});
+}
 
 //----------------------------------------------------------------------------//
 // CodeGen Common Patterns

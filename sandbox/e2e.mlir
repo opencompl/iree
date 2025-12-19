@@ -81,8 +81,8 @@ flow.executable private @executable_0 {
       }
         attributes {lowering_config = #iree_cpu.lowering_config<
           distribution = [1, 32, 32, 0],
-          vector_common_parallel = [0, 8, 8, 8],
-          vector_reduction = [0, 0, 0, 16]
+          vector_common_parallel = [0, 8, 8, 1],
+          vector_reduction = [0, 0, 0, 32]
         >}
         ins(%S, %V : tensor<20x4096x4096xf32>, tensor<20x4096x64xf32>)
         outs(%max_init, %sum_init, %acc_init : tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>)
@@ -95,19 +95,6 @@ flow.executable private @executable_0 {
       } -> tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>
 
       %result_empty = tensor.empty() : tensor<20x4096x64xf32>
-
-      // %result = linalg.generic{
-      //   indexing_maps = [
-      //     affine_map<(B,M,N) -> (B,M)>,
-      //     affine_map<(B,M,N) -> (B,M,N)>
-      //   ],
-      //   iterator_types= ["parallel", "parallel", "parallel"]
-      // } ins(%MAX: tensor<20x4096xf32>)
-      //   outs(%result_empty : tensor<20x4096x4xf32>) {
-      //     ^bb0(%m: f32, %o: f32):
-      //       linalg.yield %m : f32
-      //   } -> tensor<20x4096x4xf32>
-
       %result = linalg.generic {
                   indexing_maps = [
                     affine_map<(B, M, N) -> (B, M, N)>,
@@ -131,13 +118,13 @@ flow.executable private @executable_0 {
 
 func.func @attention(%arg0: !hal.buffer_view, %arg1: !hal.buffer_view, %arg2: !hal.buffer_view) -> !hal.buffer_view {
   %c = arith.constant 1 : index
-  %0 = hal.tensor.import %arg0 "q" : !hal.buffer_view -> tensor<20x4096x4xf32>
-  %1 = hal.tensor.import %arg1 "k" : !hal.buffer_view -> tensor<20x4096x4xf32>
-  %2 = hal.tensor.import %arg2 "v" : !hal.buffer_view -> tensor<20x4096x4xf32>
+  %0 = hal.tensor.import %arg0 "q" : !hal.buffer_view -> tensor<20x4096x64xf32>
+  %1 = hal.tensor.import %arg1 "k" : !hal.buffer_view -> tensor<20x4096x64xf32>
+  %2 = hal.tensor.import %arg2 "v" : !hal.buffer_view -> tensor<20x4096x64xf32>
 
-  %ret0 = flow.dispatch @executable_0::@dispatch[%c](%0, %1, %2) : (tensor<20x4096x4xf32>, tensor<20x4096x4xf32>, tensor<20x4096x4xf32>) ->  tensor<20x4096x4xf32>
+  %ret0 = flow.dispatch @executable_0::@dispatch[%c](%0, %1, %2) : (tensor<20x4096x64xf32>, tensor<20x4096x64xf32>, tensor<20x4096x64xf32>) ->  tensor<20x4096x64xf32>
 
-  %3 = hal.tensor.export %ret0 "out" : tensor<20x4096x4xf32> -> !hal.buffer_view
+  %3 = hal.tensor.export %ret0 "out" : tensor<20x4096x64xf32> -> !hal.buffer_view
   return %3 : !hal.buffer_view
 }
 
