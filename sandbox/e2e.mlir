@@ -80,9 +80,15 @@ flow.executable private @executable_0 {
         exp_reduced_operands = [1, 2]
       }
         attributes {lowering_config = #iree_cpu.lowering_config<
-          distribution = [1, 32, 32, 0],
-          vector_common_parallel = [0, 8, 8, 1],
-          vector_reduction = [0, 0, 0, 32]
+          // distribution = [1, 32, 0, 0],
+          // vector_common_parallel = [0, 8, 8, 8],
+          // vector_reduction = [0, 0, 0, 64]
+          distribution = [1, 32, 0, 0],
+          cache_parallel = [64, 64, 0, 0],
+          cache_reduction = [0, 0, 0, 8],
+          vector_common_parallel = [4, 4, 0, 0],
+          vector_reduction = [0, 0, 0, 8],
+          vector_inner_parallel = [0, 0, 0, 0]
         >}
         ins(%S, %V : tensor<20x4096x4096xf32>, tensor<20x4096x64xf32>)
         outs(%max_init, %sum_init, %acc_init : tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>)
@@ -94,18 +100,16 @@ flow.executable private @executable_0 {
         iree_linalg_ext.yield %m, %nsum, %nacc : f32, f32, f32
       } -> tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>
 
-      %result_empty = tensor.empty() : tensor<20x4096x64xf32>
       %result = linalg.generic {
                   indexing_maps = [
-                    affine_map<(B, M, N) -> (B, M, N)>,
                     affine_map<(B, M, N) -> (B, M)>,
                     affine_map<(B, M, N) -> (B, M, N)>
                   ],
                   iterator_types = ["parallel", "parallel", "parallel"]
                 }
-                ins(%PV, %SUM : tensor<20x4096x64xf32>, tensor<20x4096xf32>)
-                outs(%result_empty : tensor<20x4096x64xf32>) {
-      ^bb0(%pv : f32, %sum : f32, %res : f32):
+                ins(%SUM : tensor<20x4096xf32>)
+                outs(%PV : tensor<20x4096x64xf32>) {
+      ^bb0(%sum : f32, %pv : f32):
         %out = arith.divf %pv, %sum : f32
         linalg.yield %out : f32
       } -> tensor<20x4096x64xf32>

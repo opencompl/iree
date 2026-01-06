@@ -288,6 +288,34 @@ static Value computeSubAndExp(OpBuilder &builder, Location loc,
   return genericOp.getResult(0);
 }
 
+// Compute output = exp2((output - input) * log2e)
+static Value computeSubAndExp(OpBuilder &builder, Location loc,
+                              AffineMap inputMap, AffineMap outputMap,
+                              Value input, Value output) {
+  SmallVector<AffineMap> compressedMaps =
+      compressUnusedDims(SmallVector<AffineMap>{inputMap, outputMap});
+  inputMap = compressedMaps[0];
+  outputMap = compressedMaps[1];
+
+  SmallVector<utils::IteratorType> iteratorTypes(inputMap.getNumDims(),
+                                                 utils::IteratorType::parallel);
+  auto genericOp = linalg::GenericOp::create(
+      builder, loc, output.getType(), input, output,
+      SmallVector<AffineMap>{inputMap, outputMap}, iteratorTypes,
+      [&](OpBuilder &b, Location loc, ValueRange args) {
+        // Convert input to the same datatype as output.
+        Value in = convertScalarToDtype(b, loc, args[0], args[1].getType(),
+                                        /*isUnsignedCast=*/false);
+        Value diff = arith::SubFOp::create(b, loc, args[1], in);
+        Value log2e = arith::ConstantOp::create(
+            b, loc, b.getFloatAttr(diff.getType(), M_LOG2E));
+        Value mul = arith::MulFOp::create(b, loc, diff, log2e);
+        Value weight = math::Exp2Op::create(b, loc, mul);
+        linalg::YieldOp::create(b, loc, weight);
+      });
+  return genericOp.getResult(0);
+}
+
 // Helper method to check if a slice will be contiguous given the offset,
 // slice size. This checks that `inputSize` and `offset` are both evenly
 // divisible by `tileSize`.
@@ -1220,9 +1248,22 @@ FailureOr<SmallVector<Value>> ExpReductionOp::decomposeOperation(OpBuilder &b) {
   AffineMap normValMap = getMatchingIndexingMap(sValue);
   AffineMap prevMaxMap = getMatchingIndexingMap(prevMax);
 
+  auto sType = cast<ShapedType>(sValue->get().getType());
+  Value log2eAttr = arith::ConstantOp::create(
+      b, loc, b.getFloatAttr(sType.getElementType(), M_LOG2E));
+  // Value mul = arith::MulFOp::create(b, loc, diff, log2e);
+
+  Value emptyS =
+      tensor::EmptyOp::create(b, loc, sType.getShape(), sType.getElementType());
+  Value log2eTensor =
+      linalg::FillOp::create(b, loc, log2eAttr, emptyS).getResult(0);
+
+  Value scaledS = elementwiseValueInPlace<arith::MulFOp>(
+      b, loc, normValMap, normValMap, log2eTensor, sValue->get());
+
   // curr_max = max(sValue, prev_max)
   Value currMax = reduce<arith::MaximumFOp>(
-      rewriter, loc, normValMap, prevMaxMap, sValue->get(), prevMax->get());
+      rewriter, loc, normValMap, prevMaxMap, scaledS, prevMax->get());
   // ex = e^{sValue - curr_max}
   Value ex = computeSubAndExp(rewriter, loc, prevMaxMap, normValMap, currMax,
                               sValue->get(), /*useExp2=*/true);

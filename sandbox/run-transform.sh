@@ -18,6 +18,4 @@ if [ ! -f .cmade ]; then
     touch .cmade
 fi
 cmake --build $IREE_BUILD
-$IREE_BUILD/tools/iree-compile --iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-cpu=host  --compile-from=flow --mlir-print-ir-after-all e2e.mlir 2>e2e.dbg.mlir 1>e2e.out.vmfb
-# $IREE_BUILD/tools/iree-compile --iree-hal-target-device=local --iree-hal-local-target-device-backends=llvm-cpu --iree-llvmcpu-target-cpu=host  --compile-from=flow --mlir-print-ir-after=iree-linalg-ext-decompose-aggregated-ops e2e.mlir 2>e2e.dbg.mlir 1>e2e.out.vmfb
-uv run run-e2e.py
+$IREE_BUILD/tools/iree-opt --iree-transform-dialect-interpreter --split-input-file --verify-diagnostics -canonicalize -cse tile-reduction.mlir 1> tile-reduction.out.mlir
