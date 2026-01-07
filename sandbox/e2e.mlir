@@ -85,11 +85,11 @@ flow.executable private @executable_0 {
           // vector_common_parallel = [0, 8, 8, 8],
           // vector_reduction = [0, 0, 0, 64]
           distribution           = [1, 2, 0, 0, 0],
-          cache_parallel         = [0, 0, 128, 0, 0],
+          cache_parallel         = [0, 0, 256, 0, 0],
           cache_reduction        = [0, 0, 0, 128, 0],
-          vector_common_parallel = [0, 0, 4, 0, 0],
+          vector_common_parallel = [0, 0, 4, 16, 0],
           vector_reduction       = [0, 0, 0, 0, 8],
-          vector_inner_parallel  = [0, 0, 4, 4, 8]
+          vector_inner_parallel  = [0, 0, 4, 16, 0]
         >}
         ins(%S, %V : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x64xf32>)
         outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>)
