@@ -13,6 +13,19 @@ def is_hip_cdna2():
     # return target.backend == 'hip' and target.arch == 'gfx90a'
 
 
+def torch_test(q, k, v):
+    DEVICE = "cuda"
+    ref_dtype = torch.float32
+    q = q.to(ref_dtype)
+    k = k.to(ref_dtype)
+    v = v.to(ref_dtype)
+    p = torch.matmul(q, k.transpose(2, 3))
+    p = torch.softmax(p.float(), dim=-1)
+    p = p.to(ref_dtype)
+    out = torch.matmul(p, v)
+    return out
+
+
 def main():
     flatbuffer = comp.compile_file(
         "e2e.mlir",
@@ -30,16 +43,17 @@ def main():
     k = torch.randn(shape, dtype=torch.float32)
     v = torch.randn(shape, dtype=torch.float32)
 
-    # ireert.load_vm_module(modules)
     # print(dir(modules))
     iree_output = module.attention(q, k, v)
     iree_output = torch.from_numpy(iree_output.to_host())
-    torch_output = scaled_dot_product_attention(q, k, v, scale=1)
+    torch_output = torch_test(q, k, v).cpu()
+    # torch_output = scaled_dot_product_attention(q, k, v, scale=1)
     # triton_output = attention(q.to(device=device),k.to(device=device),v.to(device=device), False, 1)
 
-    # print(iree_output)
+    print(iree_output)
     print(torch_output)
-    print(triton_output)
+    # print(torch.column_stack((iree_output, torch_output)))
+    # print(triton_output)
 
     rtol = 1e-2 if is_hip_cdna2() else 0
     if torch.allclose(iree_output, torch_output, atol=1e-2, rtol=rtol):
