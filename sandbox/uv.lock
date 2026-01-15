@@ -160,7 +160,7 @@ wheels = [
 
 [[package]]
 name = "iree-base-compiler"
-version = "3.10.0.dev0+77e9fb857b0fa2f4f8a11af5e16b24feffadba39"
+version = "3.10.0.dev0+f8fc822f8b0dc84d2961ce09cb71c5f41eaae745"
 source = { directory = "../build/compiler" }
 dependencies = [
     { name = "numpy" },
@@ -177,7 +177,7 @@ provides-extras = ["onnx"]
 
 [[package]]
 name = "iree-base-runtime"
-version = "3.10.0.dev0+77e9fb857b0fa2f4f8a11af5e16b24feffadba39"
+version = "3.10.0.dev0+f8fc822f8b0dc84d2961ce09cb71c5f41eaae745"
 source = { directory = "../build/runtime" }
 dependencies = [
     { name = "ml-dtypes" },

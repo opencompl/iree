@@ -1121,13 +1121,6 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_Op<"exp_reduction", [
     "getTiledImplementation",
     "getResultTilePosition",
     "generateResultTileValue"
-  ]>,
-  DeclareOpInterfaceMethods<PartialReductionOpInterface,
-  [
-    "generateInitialTensorForPartialReduction",
-    "tileToPartialReduction",
-    "mergeReductions",
-    "getPartialResultTilePosition"
   ]>
 ]> {
   let summary = [{

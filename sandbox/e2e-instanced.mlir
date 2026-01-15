@@ -15,19 +15,19 @@ flow.executable private @executable_0 {
       %cst0 = arith.constant 0.0 : f32
       %c0 = arith.constant 0 : index
 
-      %dispQ = stream.binding.subspan %argQ[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x64xf32>>
-      %dispK = stream.binding.subspan %argK[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x64xf32>>
-      %dispV = stream.binding.subspan %argV[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x64xf32>>
-      %dispR = stream.binding.subspan %ret[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x32x4096x64xf32>>
+      %dispQ = stream.binding.subspan %argQ[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x8192x64xf32>>
+      %dispK = stream.binding.subspan %argK[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x8192x64xf32>>
+      %dispV = stream.binding.subspan %argV[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x8192x64xf32>>
+      %dispR = stream.binding.subspan %ret[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x32x8192x64xf32>>
 
-      %Q = iree_tensor_ext.dispatch.tensor.load %dispQ, offsets = [0,0,0,0], sizes = [4,32,4096,64], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x64xf32>> -> tensor<4x32x4096x64xf32>
-      %K = iree_tensor_ext.dispatch.tensor.load %dispK, offsets = [0,0,0,0], sizes = [4,32,4096,64], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x64xf32>> -> tensor<4x32x4096x64xf32>
-      %V = iree_tensor_ext.dispatch.tensor.load %dispV, offsets = [0,0,0,0], sizes = [4,32,4096,64], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x64xf32>> -> tensor<4x32x4096x64xf32>
+      %Q = iree_tensor_ext.dispatch.tensor.load %dispQ, offsets = [0,0,0,0], sizes = [4,32,8192,64], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x8192x64xf32>> -> tensor<4x32x8192x64xf32>
+      %K = iree_tensor_ext.dispatch.tensor.load %dispK, offsets = [0,0,0,0], sizes = [4,32,8192,64], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x8192x64xf32>> -> tensor<4x32x8192x64xf32>
+      %V = iree_tensor_ext.dispatch.tensor.load %dispV, offsets = [0,0,0,0], sizes = [4,32,8192,64], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x8192x64xf32>> -> tensor<4x32x8192x64xf32>
 
-      %S_empty = tensor.empty() : tensor<4x32x4096x4096xf32>
+      %S_empty = tensor.empty() : tensor<4x32x8192x8192xf32>
       %S_fill  = linalg.fill ins(%cst0 : f32)
-                              outs(%S_empty : tensor<4x32x4096x4096xf32>)
-                              -> tensor<4x32x4096x4096xf32>
+                              outs(%S_empty : tensor<4x32x8192x8192xf32>)
+                              -> tensor<4x32x8192x8192xf32>
 
       %S = linalg.generic  {
           indexing_maps = [
@@ -37,31 +37,31 @@ flow.executable private @executable_0 {
           ],
           iterator_types = ["parallel", "parallel",  "parallel", "parallel", "reduction"]
         }
-        ins(%Q, %K : tensor<4x32x4096x64xf32>, tensor<4x32x4096x64xf32>)
-        outs(%S_fill : tensor<4x32x4096x4096xf32>)
+        ins(%Q, %K : tensor<4x32x8192x64xf32>, tensor<4x32x8192x64xf32>)
+        outs(%S_fill : tensor<4x32x8192x8192xf32>)
       {
       ^bb0(%q : f32, %k : f32, %s : f32):
         %mul  = arith.mulf %q, %k : f32
         %sum  = arith.addf %mul, %s : f32
         linalg.yield %sum : f32
-      } -> tensor<4x32x4096x4096xf32>
+      } -> tensor<4x32x8192x8192xf32>
 
-      %red_empty = tensor.empty() : tensor<4x32x4096x64xf32>
-      %max_empty = tensor.empty() : tensor<4x32x4096xf32>
+      %red_empty = tensor.empty() : tensor<4x32x8192x64xf32>
+      %max_empty = tensor.empty() : tensor<4x32x8192xf32>
 
       %max_el = arith.constant -3.40282347E+38 : f32
       %max_init = linalg.fill ins(%max_el : f32)
-                              outs(%max_empty : tensor<4x32x4096xf32>)
-                              -> tensor<4x32x4096xf32>
+                              outs(%max_empty : tensor<4x32x8192xf32>)
+                              -> tensor<4x32x8192xf32>
 
-      %sum_empty = tensor.empty() : tensor<4x32x4096xf32>
+      %sum_empty = tensor.empty() : tensor<4x32x8192xf32>
       %sum_el = arith.constant 0.000000e+00 : f32
       %sum_init = linalg.fill ins(%sum_el : f32)
-                              outs(%sum_empty : tensor<4x32x4096xf32>)
-                              -> tensor<4x32x4096xf32>
+                              outs(%sum_empty : tensor<4x32x8192xf32>)
+                              -> tensor<4x32x8192xf32>
       %acc_init = linalg.fill ins(%sum_el : f32)
-                              outs(%red_empty : tensor<4x32x4096x64xf32>)
-                              -> tensor<4x32x4096x64xf32>
+                              outs(%red_empty : tensor<4x32x8192x64xf32>)
+                              -> tensor<4x32x8192x64xf32>
 
       %MAX, %SUM, %PV = iree_linalg_ext.exp_reduction {
         indexing_maps = [
@@ -88,15 +88,15 @@ flow.executable private @executable_0 {
           vector_reduction       = [0, 0, 0, 0, 8],
           vector_inner_parallel  = [0, 0, 4, 16, 0]
         >}
-        ins(%S, %V : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x64xf32>)
-        outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>)
+        ins(%S, %V : tensor<4x32x8192x8192xf32>, tensor<4x32x8192x64xf32>)
+        outs(%max_init, %sum_init, %acc_init : tensor<4x32x8192xf32>, tensor<4x32x8192xf32>, tensor<4x32x8192x64xf32>)
       {
       ^bb0(%ex : f32, %v : f32, %m : f32, %sum : f32, %acc : f32):
         %nsum = arith.addf %ex, %sum : f32
         %mul  = arith.mulf %ex, %v : f32
         %nacc = arith.addf %mul, %acc : f32
         iree_linalg_ext.yield %m, %nsum, %nacc : f32, f32, f32
-      } -> tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>
+      } -> tensor<4x32x8192xf32>, tensor<4x32x8192xf32>, tensor<4x32x8192x64xf32>
 
       %result = linalg.generic {
                   indexing_maps = [
@@ -105,14 +105,14 @@ flow.executable private @executable_0 {
                   ],
                   iterator_types = ["parallel",  "parallel", "parallel", "parallel"]
                 }
-                ins(%SUM : tensor<4x32x4096xf32>)
-                outs(%PV : tensor<4x32x4096x64xf32>) {
+                ins(%SUM : tensor<4x32x8192xf32>)
+                outs(%PV : tensor<4x32x8192x64xf32>) {
       ^bb0(%sum : f32, %pv : f32):
         %out = arith.divf %pv, %sum : f32
         linalg.yield %out : f32
-      } -> tensor<4x32x4096x64xf32>
+      } -> tensor<4x32x8192x64xf32>
 
-      iree_tensor_ext.dispatch.tensor.store %result, %dispR, offsets = [0,0,0,0], sizes = [4,32,4096,64], strides = [1,1,1,1] : tensor<4x32x4096x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x32x4096x64xf32>>
+      iree_tensor_ext.dispatch.tensor.store %result, %dispR, offsets = [0,0,0,0], sizes = [4,32,8192,64], strides = [1,1,1,1] : tensor<4x32x8192x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x32x8192x64xf32>>
       return
     }
   }
@@ -120,13 +120,13 @@ flow.executable private @executable_0 {
 
 func.func @attention(%arg0: !hal.buffer_view, %arg1: !hal.buffer_view, %arg2: !hal.buffer_view) -> !hal.buffer_view {
   %c = arith.constant 1 : index
-  %0 = hal.tensor.import %arg0 "q" : !hal.buffer_view -> tensor<4x32x4096x64xf32>
-  %1 = hal.tensor.import %arg1 "k" : !hal.buffer_view -> tensor<4x32x4096x64xf32>
-  %2 = hal.tensor.import %arg2 "v" : !hal.buffer_view -> tensor<4x32x4096x64xf32>
+  %0 = hal.tensor.import %arg0 "q" : !hal.buffer_view -> tensor<4x32x8192x64xf32>
+  %1 = hal.tensor.import %arg1 "k" : !hal.buffer_view -> tensor<4x32x8192x64xf32>
+  %2 = hal.tensor.import %arg2 "v" : !hal.buffer_view -> tensor<4x32x8192x64xf32>
 
-  %ret0 = flow.dispatch @executable_0::@dispatch[%c](%0, %1, %2) : (tensor<4x32x4096x64xf32>, tensor<4x32x4096x64xf32>, tensor<4x32x4096x64xf32>) ->  tensor<4x32x4096x64xf32>
+  %ret0 = flow.dispatch @executable_0::@dispatch[%c](%0, %1, %2) : (tensor<4x32x8192x64xf32>, tensor<4x32x8192x64xf32>, tensor<4x32x8192x64xf32>) ->  tensor<4x32x8192x64xf32>
 
-  %3 = hal.tensor.export %ret0 "out" : tensor<4x32x4096x64xf32> -> !hal.buffer_view
+  %3 = hal.tensor.export %ret0 "out" : tensor<4x32x8192x64xf32> -> !hal.buffer_view
   return %3 : !hal.buffer_view
 }
 

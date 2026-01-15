@@ -24,13 +24,28 @@ def torch_test(q, k, v):
 
 
 def main():
+    # shape = (4, 32, 4096, 64)
+    shape = (4, 32, 8192, 64)
+    kv_dict = {
+        "BATCH": shape[0],
+        "HEADS": shape[1],
+        "NCTX": shape[2],
+        "HEADDIM": shape[3],
+    }
+
+    instanced_file = "e2e-instanced.mlir"
+    template = open("e2e-template.mlir", "r").read()
+    for key, val in kv_dict.items():
+        template = template.replace(key, str(val))
+    with open("e2e-instanced.mlir", "w") as f:
+        f.write(template)
+
     flatbuffer = comp.compile_file(
-        "e2e.mlir",
+        instanced_file,
         target_backends=["llvm-cpu"],
         extra_args=["--iree-hal-target-device=local", "--iree-llvmcpu-target-cpu=host"],
     )
     module = ireert.load_vm_flatbuffer(flatbuffer, backend="llvm-cpu")
-    shape = (4, 32, 4096, 64)
     device = "cuda"
 
     q = torch.randn(shape, dtype=torch.float32)
