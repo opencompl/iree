@@ -1,3 +1,4 @@
 *.vmfb
 *.dbg.mlir
+*.instanced.mlir
 .cmade

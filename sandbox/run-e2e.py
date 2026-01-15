@@ -25,19 +25,19 @@ def torch_test(q, k, v):
 
 def main():
     # shape = (4, 32, 4096, 64)
-    shape = (4, 32, 8192, 64)
-    kv_dict = {
+    shape = (4, 32, 4096, 64)
+    shape_config = {
         "BATCH": shape[0],
         "HEADS": shape[1],
         "NCTX": shape[2],
         "HEADDIM": shape[3],
     }
 
-    instanced_file = "e2e-instanced.mlir"
+    instanced_file = f"e2e-{shape_config['BATCH']}-{shape_config['HEADS']}-{shape_config['NCTX']}-{shape_config['HEADDIM']}.instanced.mlir"
     template = open("e2e-template.mlir", "r").read()
-    for key, val in kv_dict.items():
+    for key, val in shape_config.items():
         template = template.replace(key, str(val))
-    with open("e2e-instanced.mlir", "w") as f:
+    with open(instanced_file, "w") as f:
         f.write(template)
 
     flatbuffer = comp.compile_file(
