@@ -813,6 +813,9 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   }
 
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
+  IREE::LinalgExt::DecomposeAggregatedOpPassOptions decomposeOptions;
+  decomposeOptions.filterOps = "iree_linalg_ext.exp_reduction";
+  funcPassManager.addPass(IREE::LinalgExt::createDecomposeAggregatedOpPass(decomposeOptions));
   funcPassManager.addPass(createConfigTrackingCanonicalizerPass());
   funcPassManager.addPass(createCSEPass());
 

@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
@@ -1166,6 +1167,8 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     return SmallVector<linalg::GenericOp>{genericOp};
   }
 
+  auto loweringConfig = getLoweringConfig(genericOp);
+
   IRRewriter::InsertionGuard g(rewriter);
   SmallVector<linalg::GenericOp> results;
   // Create num_results linalg.generics, each producing a single result (and
@@ -1220,6 +1223,14 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
           }
           linalg::YieldOp::create(b, loc, regionMapping.lookup(result));
         });
+
+    // HACK: Set layout on operation that looks like a contraction.
+    if (loweringConfig) {
+      if (linalg::isaContractionOpInterface(newOp)) {
+        setLoweringConfig(newOp, loweringConfig);
+      }
+    }
+
     rewriter.replaceAllUsesWith(genericOp.getResult(resultNumber),
                                 newOp.getResult(0));
 
@@ -1294,6 +1305,12 @@ FailureOr<SmallVector<Value>> ExpReductionOp::decomposeOperation(OpBuilder &b) {
   auto yieldOp =
       cast<IREE::LinalgExt::YieldOp>(expRedGeneric.getBody()->getTerminator());
   rewriter.replaceOpWithNewOp<linalg::YieldOp>(yieldOp, yieldOp.getOperands());
+
+  // Preserve lowering_config on expRedGeneric.
+  if (auto loweringConfig = getLoweringConfig(*this)) {
+    setLoweringConfig(expRedGeneric, loweringConfig);
+  }
+
   FailureOr<SmallVector<linalg::GenericOp>> decomposedResults =
       decomposeMultipleResults(expRedGeneric, rewriter);
   if (failed(decomposedResults)) {
