@@ -30,6 +30,94 @@ namespace mlir::iree_compiler::IREE::VectorExt {
 
 using VectorValue = TypedValue<VectorType>;
 
+static LogicalResult basisFromSizesStridesAllowDuplicateStrides(
+    ArrayRef<int64_t> sizes, ArrayRef<int64_t> strides,
+    SmallVectorImpl<int64_t> &basis, SmallVectorImpl<size_t> &dimToResult) {
+  assert(sizes.size() == strides.size());
+  size_t numDims = sizes.size();
+  basis.reserve(numDims);
+
+  struct BasisTerm {
+    int64_t stride;
+    int64_t size;
+    size_t dim;
+    bool isBroadcast;
+  };
+
+  SmallVector<BasisTerm> terms;
+  terms.reserve(numDims);
+  for (auto [dim, stride, size] : llvm::enumerate(strides, sizes)) {
+    terms.push_back(BasisTerm{
+        /*stride=*/stride == 0 ? 1 : stride,
+        /*size=*/stride == 0 ? 1 : size,
+        /*dim=*/dim,
+        /*isBroadcast=*/stride == 0,
+    });
+  }
+  llvm::sort(terms, [](const BasisTerm &lhs, const BasisTerm &rhs) {
+    return std::tie(lhs.stride, lhs.isBroadcast, lhs.dim) <
+           std::tie(rhs.stride, rhs.isBroadcast, rhs.dim);
+  });
+
+  int64_t previousSizes = 1;
+  SmallVector<std::optional<size_t>> basisEntryToDim;
+  basisEntryToDim.reserve(numDims);
+  DenseMap<int64_t, size_t> strideToBasisEntry;
+  DenseMap<int64_t, int64_t> strideToSize;
+  dimToResult.assign(numDims, ~0U);
+
+  for (const BasisTerm &term : terms) {
+    if (term.isBroadcast) {
+      basisEntryToDim.push_back(term.dim);
+      basis.push_back(1);
+      continue;
+    }
+
+    if (auto it = strideToBasisEntry.find(term.stride);
+        it != strideToBasisEntry.end()) {
+      int64_t priorSize = strideToSize.lookup(term.stride);
+      if (priorSize != term.size) {
+        return failure();
+      }
+      dimToResult[term.dim] = it->second;
+      continue;
+    }
+
+    if (term.stride % previousSizes != 0) {
+      return failure();
+    }
+
+    if (term.stride != previousSizes) {
+      int64_t jumpSize = term.stride / previousSizes;
+      basisEntryToDim.push_back(std::nullopt);
+      basis.push_back(jumpSize);
+      previousSizes *= jumpSize;
+    }
+
+    size_t basisEntry = basisEntryToDim.size();
+    basisEntryToDim.push_back(term.dim);
+    basis.push_back(term.size);
+    strideToBasisEntry[term.stride] = basisEntry;
+    strideToSize[term.stride] = term.size;
+    previousSizes *= term.size;
+  }
+
+  std::reverse(basis.begin(), basis.end());
+  size_t basisLength = basis.size();
+  for (auto [forwardBasisPos, dimPos] : llvm::enumerate(basisEntryToDim)) {
+    if (!dimPos) {
+      continue;
+    }
+    if (dimToResult[*dimPos] == ~0U) {
+      dimToResult[*dimPos] = forwardBasisPos;
+    }
+  }
+  for (size_t &resultPos : dimToResult) {
+    resultPos = basisLength - resultPos;
+  }
+  return success();
+}
+
 // Project the nested layout. This take a mask on the dimensions of the vector
 // associated with this layout and projects out those dimensions. This reduces
 // the rank of the layout in the process.
@@ -671,12 +759,14 @@ NestedLayoutAttr::computeThreadIds(Value threadId, int64_t subgroupSize,
   SmallVector<int64_t> subgroupBasis, threadBasis;
   SmallVector<size_t> subgroupDimToResult, threadDimToResult;
 
-  if (failed(basisFromSizesStrides(getSubgroupTile(), getSubgroupStrides(),
-                                   subgroupBasis, subgroupDimToResult))) {
+  if (failed(basisFromSizesStridesAllowDuplicateStrides(
+          getSubgroupTile(), getSubgroupStrides(), subgroupBasis,
+          subgroupDimToResult))) {
     return {};
   }
-  if (failed(basisFromSizesStrides(getThreadTile(), getThreadStrides(),
-                                   threadBasis, threadDimToResult))) {
+  if (failed(basisFromSizesStridesAllowDuplicateStrides(
+          getThreadTile(), getThreadStrides(), threadBasis,
+          threadDimToResult))) {
     return {};
   }
 

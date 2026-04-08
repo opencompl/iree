@@ -6,6 +6,8 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
+#include "iree/compiler/Codegen/Utils/VectorOpUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 
 #include <cassert>
@@ -57,6 +59,42 @@ static constexpr int kMaxCandidatesPerValue = 4;
 
 namespace {
 
+static FailureOr<NestedLayoutAttr>
+getIterationSpaceLayoutFromResultLayout(NestedLayoutAttr resultLayout,
+                                        AffineMap resultMap) {
+  if (!resultMap.isProjectedPermutation(/*allowZeroInResults=*/true)) {
+    return failure();
+  }
+
+  int64_t iterRank = resultMap.getNumDims();
+  SmallVector<int64_t> subgroupTile(iterRank, 1);
+  SmallVector<int64_t> batchTile(iterRank, 1);
+  SmallVector<int64_t> outerTile(iterRank, 1);
+  SmallVector<int64_t> threadTile(iterRank, 1);
+  SmallVector<int64_t> elementTile(iterRank, 1);
+  SmallVector<int64_t> subgroupStrides(iterRank, 0);
+  SmallVector<int64_t> threadStrides(iterRank, 0);
+
+  for (auto [resultIdx, expr] : llvm::enumerate(resultMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      continue;
+    }
+    int64_t iterDim = dimExpr.getPosition();
+    subgroupTile[iterDim] = resultLayout.getSubgroupTile()[resultIdx];
+    batchTile[iterDim] = resultLayout.getBatchTile()[resultIdx];
+    outerTile[iterDim] = resultLayout.getOuterTile()[resultIdx];
+    threadTile[iterDim] = resultLayout.getThreadTile()[resultIdx];
+    elementTile[iterDim] = resultLayout.getElementTile()[resultIdx];
+    subgroupStrides[iterDim] = resultLayout.getSubgroupStrides()[resultIdx];
+    threadStrides[iterDim] = resultLayout.getThreadStrides()[resultIdx];
+  }
+
+  return NestedLayoutAttr::get(
+      resultLayout.getContext(), subgroupTile, batchTile, outerTile,
+      threadTile, elementTile, subgroupStrides, threadStrides);
+}
+
 struct LayoutAnalysis {
   /// Multiple candidate layouts per value (Phase 1).
   llvm::MapVector<Value, llvm::SmallSetVector<VectorLayoutInterface, 4>>
@@ -74,6 +112,7 @@ struct LayoutAnalysis {
   void propagateForward(Value val);
   void propagateOneForward(Value val, VectorLayoutInterface layout);
   void runForward();
+  void seedResolved();
 
   //===--- Resolve ---===//
 
@@ -157,6 +196,12 @@ void LayoutAnalysis::runForward() {
   }
 }
 
+void LayoutAnalysis::seedResolved() {
+  for (auto &[val, layout] : resolved) {
+    addCandidate(val, layout);
+  }
+}
+
 /// Propagate a single layout forward through all users of a value.
 void LayoutAnalysis::propagateOneForward(Value val,
                                          VectorLayoutInterface layout) {
@@ -169,6 +214,19 @@ void LayoutAnalysis::propagateOneForward(Value val,
       Value result = forOp.getTiedLoopResult(&use);
       addCandidate(arg, layout);
       addCandidate(result, layout);
+      continue;
+    }
+
+    if (auto expReduction = dyn_cast<IREE::LinalgExt::ExpReductionOp>(user)) {
+      Block *body = expReduction.getBody();
+      if (operandIdx < body->getNumArguments()) {
+        addCandidate(body->getArgument(operandIdx), layout);
+      }
+      if (operandIdx >= expReduction.getNumDpsInputs()) {
+        addCandidate(expReduction->getResult(operandIdx -
+                                             expReduction.getNumDpsInputs()),
+                     layout);
+      }
       continue;
     }
 
@@ -188,6 +246,15 @@ void LayoutAnalysis::propagateOneForward(Value val,
         addCandidate(thenArg, layout);
         addCandidate(elseArg, layout);
         addCandidate(result, layout);
+        continue;
+      }
+    }
+
+    if (auto yieldOp = dyn_cast<IREE::LinalgExt::YieldOp>(user)) {
+      Operation *parentOp = yieldOp->getParentOp();
+      if (auto expReduction =
+              dyn_cast<IREE::LinalgExt::ExpReductionOp>(parentOp)) {
+        addCandidate(expReduction->getResult(operandIdx), layout);
         continue;
       }
     }
@@ -281,7 +348,7 @@ void LayoutAnalysis::propagateOneForward(Value val,
 /// Pick first candidate for each value.
 void LayoutAnalysis::resolve() {
   for (auto &[val, candidateSet] : candidates) {
-    if (!candidateSet.empty()) {
+    if (!candidateSet.empty() && !resolved.contains(val)) {
       resolved[val] = candidateSet.front();
     }
   }
@@ -396,6 +463,28 @@ void LayoutAnalysis::fixupOp(Operation *op) {
   if (auto contract = dyn_cast<vector::ContractionOp>(op)) {
     VectorLayoutInterface layout = getResolvedLayout(contract.getResult());
     setLayoutOrClone(&contract.getAccMutable(), layout);
+
+    auto nestedLayout = dyn_cast<NestedLayoutAttr>(layout);
+    if (!nestedLayout) {
+      return;
+    }
+    FailureOr<NestedLayoutAttr> maybeIterLayout =
+        getIterationSpaceLayoutFromResultLayout(
+            nestedLayout, contract.getIndexingMapsArray()[2]);
+    if (failed(maybeIterLayout)) {
+      return;
+    }
+
+    if (!hasResolvedLayout(contract.getLhs())) {
+      setLayoutOrClone(&contract.getLhsMutable(),
+                       maybeIterLayout.value().apply(
+                           contract.getIndexingMapsArray()[0]));
+    }
+    if (!hasResolvedLayout(contract.getRhs())) {
+      setLayoutOrClone(&contract.getRhsMutable(),
+                       maybeIterLayout.value().apply(
+                           contract.getIndexingMapsArray()[1]));
+    }
     return;
   }
 
@@ -454,6 +543,33 @@ void LayoutAnalysis::fixupOp(Operation *op) {
       setLayoutOrClone(&forOp.getInitArgsMutable()[i], layout);
     }
     fixupRegion(forOp.getBodyRegion());
+    return;
+  }
+
+  // exp_reduction: tie result layouts to yield/body args, recurse, then
+  // back-propagate body argument layouts to the op operands.
+  if (auto expReduction = dyn_cast<IREE::LinalgExt::ExpReductionOp>(op)) {
+    Block *body = expReduction.getBody();
+    auto yieldOp = cast<IREE::LinalgExt::YieldOp>(body->getTerminator());
+    unsigned numInputs = expReduction.getNumDpsInputs();
+    for (auto [i, result] : llvm::enumerate(expReduction->getResults())) {
+      VectorLayoutInterface layout = getResolvedLayout(result);
+      setLayoutOrClone(&yieldOp->getOpOperand(i), layout);
+      Value tiedInitArg = body->getArgument(numInputs + i);
+      if (layout && !hasResolvedLayout(tiedInitArg)) {
+        resolved[tiedInitArg] = layout;
+      }
+    }
+
+    fixupRegion(expReduction.getBodyRegion());
+
+    for (auto [i, operand] : llvm::enumerate(expReduction->getOperands())) {
+      Value bodyArg = body->getArgument(i);
+      if (!hasResolvedLayout(bodyArg)) {
+        continue;
+      }
+      setLayoutOrClone(&expReduction->getOpOperand(i), getResolvedLayout(bodyArg));
+    }
     return;
   }
 
@@ -525,9 +641,22 @@ void propagateVectorLayoutInfo(
   // Resolve: pick first candidate for each value.
   analysis.resolve();
 
-  // Phase 2: Backward fixup (mutates IR).
-  for (Region &region : root->getRegions()) {
-    analysis.fixupRegion(region);
+  // Alternate backward fixup and forward propagation a few times. Some layouts
+  // are only discovered during backward fixup (for example via loop/custom-op
+  // region plumbing), and those newly-resolved values may in turn unlock more
+  // operand layouts on a subsequent backward pass.
+  size_t previousResolvedCount = 0;
+  for (int iter = 0; iter < 4; ++iter) {
+    for (Region &region : root->getRegions()) {
+      analysis.fixupRegion(region);
+    }
+    analysis.seedResolved();
+    analysis.runForward();
+    analysis.resolve();
+    if (analysis.resolved.size() == previousResolvedCount) {
+      break;
+    }
+    previousResolvedCount = analysis.resolved.size();
   }
 
   layouts = std::move(analysis.resolved);
