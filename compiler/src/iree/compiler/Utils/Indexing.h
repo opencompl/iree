@@ -81,6 +81,14 @@ LogicalResult basisFromSizesStrides(ArrayRef<int64_t> sizes,
                                     SmallVectorImpl<int64_t> &basis,
                                     SmallVectorImpl<size_t> &dimToResult);
 
+/// Like `basisFromSizesStrides`, but permits multiple dimensions to share the
+/// same positive stride when they also share the same size. This is useful for
+/// reconstructed bases on reshaped/distributed views where several logical
+/// dimensions intentionally reuse the same underlying thread progression.
+LogicalResult basisFromSizesStridesAllowDuplicateStrides(
+    ArrayRef<int64_t> sizes, ArrayRef<int64_t> strides,
+    SmallVectorImpl<int64_t> &basis, SmallVectorImpl<size_t> &dimToResult);
+
 /// Returns the coefficient for the dimension on `position` in the affine
 /// expression `expr`. If the dimension doesn't exist in the expression, `0` is
 /// returned. If the coefficient can't be calculated, for example in case of
