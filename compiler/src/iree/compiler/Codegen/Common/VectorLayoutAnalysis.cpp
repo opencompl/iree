@@ -7,7 +7,6 @@
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
 #include "iree/compiler/Codegen/Utils/VectorOpUtils.h"
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 
 #include <cassert>
@@ -217,19 +216,6 @@ void LayoutAnalysis::propagateOneForward(Value val,
       continue;
     }
 
-    if (auto expReduction = dyn_cast<IREE::LinalgExt::ExpReductionOp>(user)) {
-      Block *body = expReduction.getBody();
-      if (operandIdx < body->getNumArguments()) {
-        addCandidate(body->getArgument(operandIdx), layout);
-      }
-      if (operandIdx >= expReduction.getNumDpsInputs()) {
-        addCandidate(expReduction->getResult(operandIdx -
-                                             expReduction.getNumDpsInputs()),
-                     layout);
-      }
-      continue;
-    }
-
     if (auto yieldOp = dyn_cast<scf::YieldOp>(user)) {
       Operation *parentOp = yieldOp->getParentOp();
       if (auto forOp = dyn_cast<scf::ForOp>(parentOp)) {
@@ -246,15 +232,6 @@ void LayoutAnalysis::propagateOneForward(Value val,
         addCandidate(thenArg, layout);
         addCandidate(elseArg, layout);
         addCandidate(result, layout);
-        continue;
-      }
-    }
-
-    if (auto yieldOp = dyn_cast<IREE::LinalgExt::YieldOp>(user)) {
-      Operation *parentOp = yieldOp->getParentOp();
-      if (auto expReduction =
-              dyn_cast<IREE::LinalgExt::ExpReductionOp>(parentOp)) {
-        addCandidate(expReduction->getResult(operandIdx), layout);
         continue;
       }
     }
@@ -543,33 +520,6 @@ void LayoutAnalysis::fixupOp(Operation *op) {
       setLayoutOrClone(&forOp.getInitArgsMutable()[i], layout);
     }
     fixupRegion(forOp.getBodyRegion());
-    return;
-  }
-
-  // exp_reduction: tie result layouts to yield/body args, recurse, then
-  // back-propagate body argument layouts to the op operands.
-  if (auto expReduction = dyn_cast<IREE::LinalgExt::ExpReductionOp>(op)) {
-    Block *body = expReduction.getBody();
-    auto yieldOp = cast<IREE::LinalgExt::YieldOp>(body->getTerminator());
-    unsigned numInputs = expReduction.getNumDpsInputs();
-    for (auto [i, result] : llvm::enumerate(expReduction->getResults())) {
-      VectorLayoutInterface layout = getResolvedLayout(result);
-      setLayoutOrClone(&yieldOp->getOpOperand(i), layout);
-      Value tiedInitArg = body->getArgument(numInputs + i);
-      if (layout && !hasResolvedLayout(tiedInitArg)) {
-        resolved[tiedInitArg] = layout;
-      }
-    }
-
-    fixupRegion(expReduction.getBodyRegion());
-
-    for (auto [i, operand] : llvm::enumerate(expReduction->getOperands())) {
-      Value bodyArg = body->getArgument(i);
-      if (!hasResolvedLayout(bodyArg)) {
-        continue;
-      }
-      setLayoutOrClone(&expReduction->getOpOperand(i), getResolvedLayout(bodyArg));
-    }
     return;
   }
 
