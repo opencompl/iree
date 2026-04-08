@@ -18,6 +18,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/OpDefinition.h"
@@ -2203,63 +2204,96 @@ Im2colOp::getTiledImplementation(OpBuilder &builder,
                                  ArrayRef<OpFoldResult> sizes) {
   Location loc = getLoc();
   OpFoldResult one = builder.getIndexAttr(1);
-  OpFoldResult zero = builder.getIndexAttr(0);
 
-  ReifiedRankedShapedTypeDims reifiedInputShapes;
-  SmallVector<OpFoldResult> inputOffsets(getInputRank(), zero);
-  SmallVector<OpFoldResult> inputSizes = getDims(builder, loc, getInput());
-
-  // Set batch offsets and sizes for input
-  for (auto [outDim, inDim] :
-       llvm::zip_equal(getBatchOutputDims(), getBatchPos())) {
-    inputOffsets[inDim] = offsets[outDim];
-    inputSizes[inDim] = sizes[outDim];
-  }
-
-  SmallVector<OpFoldResult> inputStrides(getInputRank(), one);
-
-  // Input
-  Operation *inputSlice = getSlice(builder, loc, getInput(), inputOffsets,
-                                   inputSizes, inputStrides);
+  Value inputValue = getInput();
 
   SmallVector<OpFoldResult> outputStrides(getOutputRank(), one);
   Operation *outputSlice =
       getSlice(builder, loc, getOutput(), offsets, sizes, outputStrides);
 
-  SmallVector<Type, 4> resultTypes;
-  if (hasPureTensorSemantics()) {
-    resultTypes.append(outputSlice->result_type_begin(),
-                       outputSlice->result_type_end());
+  // Adjust offsets by adding the tiling offsets. The offsets are in canonical
+  // [Batch, M, K] order, and output_perm[actual] = canonical, so we use
+  // output_perm directly to map actual tensor dims to canonical positions.
+  SmallVector<OpFoldResult> newOffsets(getMixedOffsets());
+  ArrayRef<int64_t> outPerm = getOutputPerm();
+  for (int64_t actual = 0; actual < getOutputRank(); ++actual) {
+    int64_t canonical = outPerm[actual];
+    newOffsets[canonical] =
+        addOfrs(builder, loc, offsets[actual], newOffsets[canonical]);
   }
 
-  // Adjust m_offset and k_offset by adding the offsets from tiling.
-  SmallVector<OpFoldResult> newKOffsets, newMOffsets;
-  for (auto [outDim, kOffset] :
-       llvm::zip_equal(getKOutputDims(), getMixedKOffset())) {
-    OpFoldResult kTileOffset = offsets[outDim];
-    newKOffsets.push_back(addOfrs(builder, loc, kTileOffset, kOffset));
-  }
-  for (auto [outDim, mOffset] :
-       llvm::zip_equal(getMOutputDims(), getMixedMOffset())) {
-    OpFoldResult mTileOffset = offsets[outDim];
-    newMOffsets.push_back(addOfrs(builder, loc, mTileOffset, mOffset));
+  // Compute tile-local output padding amounts.
+  // new_pad_low[d] = max(output_pad_low[d] - tileOff[d], 0)
+  // new_pad_high[d] = max(tileOff[d] + tileSize[d] - (origDim[d] -
+  //                       output_pad_high[d]), 0)
+  SmallVector<OpFoldResult> existingOutPadLow = getMixedOutputPadLow();
+  SmallVector<OpFoldResult> existingOutPadHigh = getMixedOutputPadHigh();
+  SmallVector<OpFoldResult> newOutPadLow, newOutPadHigh;
+  if (!existingOutPadLow.empty()) {
+    MLIRContext *ctx = builder.getContext();
+    AffineExpr d0 = getAffineDimExpr(0, ctx);
+    AffineExpr d1 = getAffineDimExpr(1, ctx);
+    AffineMap posMaxMap =
+        AffineMap::get(1, 0, {d0, getAffineConstantExpr(0, ctx)}, ctx);
+    AffineMap subMap = AffineMap::get(2, 0, d0 - d1, ctx);
+
+    SmallVector<OpFoldResult> origDims =
+        tensor::getMixedSizes(builder, loc, getOutput());
+    OpFoldResult zero = builder.getIndexAttr(0);
+
+    for (int64_t d = 0; d < getOutputRank(); ++d) {
+      // new_pad_low = max(pad_low - tileOff, 0)
+      // When pad_low is statically zero, skip the computation and keep zero.
+      OpFoldResult tilePadLow;
+      if (isZeroInteger(existingOutPadLow[d])) {
+        tilePadLow = zero;
+      } else {
+        OpFoldResult lowDiff = affine::makeComposedFoldedAffineApply(
+            builder, loc, subMap, {existingOutPadLow[d], offsets[d]});
+        tilePadLow = affine::makeComposedFoldedAffineMax(builder, loc,
+                                                         posMaxMap, {lowDiff});
+      }
+
+      // validEnd = origDim - pad_high; overrun = tileOff + tileSize - validEnd
+      // When pad_high is statically zero, skip the computation and keep zero.
+      OpFoldResult tilePadHigh;
+      if (isZeroInteger(existingOutPadHigh[d])) {
+        tilePadHigh = zero;
+      } else {
+        OpFoldResult validEnd = affine::makeComposedFoldedAffineApply(
+            builder, loc, subMap, {origDims[d], existingOutPadHigh[d]});
+        OpFoldResult tileEnd = affine::makeComposedFoldedAffineApply(
+            builder, loc, AffineMap::get(2, 0, d0 + d1, ctx),
+            {offsets[d], sizes[d]});
+        OpFoldResult highDiff = affine::makeComposedFoldedAffineApply(
+            builder, loc, subMap, {tileEnd, validEnd});
+        tilePadHigh = affine::makeComposedFoldedAffineMax(
+            builder, loc, posMaxMap, {highDiff});
+      }
+
+      newOutPadLow.push_back(tilePadLow);
+      newOutPadHigh.push_back(tilePadHigh);
+    }
   }
 
-  // Create the tiled op.
-  SmallVector<Value> operands = {inputSlice->getResult(0),
-                                 outputSlice->getResult(0)};
+  // Create the tiled op. The input is not sliced (batch offset is in the op).
+  SmallVector<Value> operands = {inputValue, outputSlice->getResult(0)};
   // Copy all metadata operands from the untiled operation.
   operands.append(getOperation()->getOperands().begin() + 2,
                   getOperation()->getOperands().end());
   Im2colOp tiledOp =
       mlir::clone(builder, *this, outputSlice->getResultTypes(), operands);
-  // Set the new k_offset and m_offset, since they have changed with tiling.
-  tiledOp.setMixedKOffset(newKOffsets);
-  tiledOp.setMixedMOffset(newMOffsets);
+  // Set the new offsets, since they have changed with tiling.
+  // output_sizes remain unchanged by tiling (key design property).
+  tiledOp.setMixedOffsets(newOffsets);
+  // Set tile-local output padding amounts.
+  if (!newOutPadLow.empty()) {
+    tiledOp.setMixedOutputPadLow(newOutPadLow);
+    tiledOp.setMixedOutputPadHigh(newOutPadHigh);
+  }
 
-  return TilingResult{{tiledOp},
-                      SmallVector<Value>(tiledOp->getResults()),
-                      {inputSlice, outputSlice}};
+  return TilingResult{
+      {tiledOp}, SmallVector<Value>(tiledOp->getResults()), {outputSlice}};
 }
 
 FailureOr<TilingResult>
@@ -3634,8 +3668,8 @@ LogicalResult CustomOp::getResultTilePosition(
 
 namespace {
 struct ConcatOpTilingExternalModel
-    : public TilingInterface::ExternalModel<ConcatOpTilingExternalModel,
-                                            tensor::ConcatOp> {
+    : TilingInterface::ExternalModel<ConcatOpTilingExternalModel,
+                                     tensor::ConcatOp> {
   SmallVector<utils::IteratorType> getLoopIteratorTypes(Operation *op) const {
     auto concatOp = cast<tensor::ConcatOp>(op);
     SmallVector<utils::IteratorType> iteratorTypes(

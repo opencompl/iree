@@ -54,7 +54,6 @@ iree_cc_library(
     "Passes.cpp"
     "Transforms.cpp"
     "UnrollToIntrinsics.cpp"
-    "VectorizeIREEGPUOps.cpp"
   DEPS
     ::PassesIncGen
     LLVMSupport
@@ -78,6 +77,7 @@ iree_cc_library(
     MLIRTensorDialect
     MLIRTransformUtils
     MLIRTransforms
+    MLIRUBDialect
     MLIRVectorDialect
     MLIRVectorTransforms
     MLIRVectorUtils
@@ -87,6 +87,8 @@ iree_cc_library(
     iree::compiler::Codegen::Transforms
     iree::compiler::Codegen::Utils
     iree::compiler::Dialect::LinalgExt::Utils
+    iree::compiler::Dialect::Util::IR
+    iree::compiler::Dialect::Util::Transforms
   PUBLIC
 )
 

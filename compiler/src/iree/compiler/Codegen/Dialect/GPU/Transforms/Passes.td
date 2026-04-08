@@ -43,6 +43,8 @@ def LowerIREEGPUOpsPass :
   let summary = "Post bufferization lowerings of iree_gpu ops before late lowerings";
   let dependentDialects = [
     "::mlir::gpu::GPUDialect",
+    "::mlir::iree_compiler::IREE::Util::UtilDialect",
+    "::mlir::ub::UBDialect",
   ];
 }
 
@@ -51,17 +53,9 @@ def UnrollToIntrinsicsPass :
   let summary = "Unrolls iree_gpu.multi_mma ops to their inner vector size.";
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
+    "::mlir::iree_compiler::IREE::Util::UtilDialect",
+    "::mlir::ub::UBDialect",
     "::mlir::vector::VectorDialect",
-  ];
-}
-
-def VectorizeIREEGPUOpsPass :
-    InterfacePass<"iree-gpu-vectorize-ops", "mlir::FunctionOpInterface"> {
-  let summary = "Vectorizes then lowers a few iree_gpu ops before vectorization.";
-  let dependentDialects = [
-    "::mlir::vector::VectorDialect",
-    "::mlir::arith::ArithDialect",
-    "::mlir::iree_compiler::IREE::GPU::IREEGPUDialect"
   ];
 }
 
