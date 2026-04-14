@@ -1,0 +1,38 @@
+// Project-local debug tasks
+//
+// For more documentation on how to configure debug tasks,
+// see: https://zed.dev/docs/debugger
+[
+    {
+        "build": {
+            "command": "cmake",
+            "args": ["--build", "build", "--target", "iree-compile"]
+        },
+        "adapter": "CodeLLDB",
+        "label": "Debug Attention",
+        "program": "build/tools/iree-compile",
+        "request": "launch",
+        "args": [
+            "--iree-hal-target-backends=rocm",
+            "--iree-rocm-target=gfx942",
+            "--compile-to=executable-configurations",
+            "sandbox/attention.mlir"
+        ]
+    },
+    {
+        "build": {
+            "command": "cmake",
+            "args": ["--build", "build", "--target", "iree-compile"]
+        },
+        "adapter": "CodeLLDB",
+        "label": "Compile Matmul",
+        "program": "build/tools/iree-compile",
+        "request": "launch",
+        "args": [
+            "--iree-hal-target-backends=rocm",
+            "--iree-rocm-target=gfx942",
+            "--compile-to=executable-configurations",
+            "sandbox/matmul.mlir"
+        ]
+    }
+]

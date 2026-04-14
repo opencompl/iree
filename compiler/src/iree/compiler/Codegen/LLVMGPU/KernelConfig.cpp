@@ -22,6 +22,7 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtInterfaces.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
@@ -1738,6 +1739,154 @@ static LogicalResult setWinogradOpConfig(IREE::GPU::TargetAttr target,
                                                pipeline, workgroupSize);
 }
 
+static LogicalResult setExpReductionLoweringConfig(
+    IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
+    IREE::LinalgExt::ExpReductionOp op) {
+  // Get iteration domain bounds.
+  SmallVector<int64_t> bounds = op.getStaticLoopRanges();
+
+  // Determine parallel and reduction dimensions.
+  SmallVector<unsigned> parallelDims;
+  SmallVector<unsigned> reductionDims;
+  auto loopIteratorTypes = op.getLoopIteratorTypes();
+  for (auto [dim, iterType] : llvm::enumerate(loopIteratorTypes)) {
+    if (iterType == utils::IteratorType::parallel) {
+      parallelDims.push_back(dim);
+    } else if (iterType == utils::IteratorType::reduction) {
+      reductionDims.push_back(dim);
+    }
+  }
+
+  // Currently only support single reduction dimension.
+  if (reductionDims.size() != 1) {
+    return failure();
+  }
+
+  // Make sure reduction dimension is static.
+  if (ShapedType::isDynamic(bounds[reductionDims[0]])) {
+    return failure();
+  }
+
+  // Get target subgroup size.
+  int64_t preferredSubgroupSize = target.getPreferredSubgroupSize();
+
+  // Initialize workgroup tile sizes to 0 for reduction dimensions, 1 for parallel.
+  // This follows the pattern from setSortConfig: non-parallel loops should be 0
+  // because they don't get tiled at the workgroup level.
+  size_t numLoops = loopIteratorTypes.size();
+  SmallVector<int64_t> workgroupTileSizes(numLoops, 0);
+  for (auto parallelDim : parallelDims) {
+    workgroupTileSizes[parallelDim] = 1;
+  }
+
+  // Tile the innermost parallel dimension to provide enough work for all threads.
+  if (!parallelDims.empty()) {
+    int64_t innermostParallelDim = parallelDims.back();
+    int64_t dimSize = bounds[innermostParallelDim];
+    if (!ShapedType::isDynamic(dimSize)) {
+      // Tile to preferredSubgroupSize or the dimension size, whichever is smaller.
+      workgroupTileSizes[innermostParallelDim] = std::min(dimSize, preferredSubgroupSize);
+    }
+  }
+
+  // Set reduction tile size to subgroup size for warp-level reduction.
+  SmallVector<int64_t> reductionTileSizes(numLoops, 0);
+  reductionTileSizes[reductionDims[0]] = preferredSubgroupSize;
+
+  // Set workgroup size to subgroup size.
+  std::array<int64_t, 3> workgroupSize = {preferredSubgroupSize, 1, 1};
+
+  // Create lowering config.
+  MLIRContext *context = op->getContext();
+  OpBuilder b(context);
+  SmallVector<NamedAttribute> attrs = {
+      {"workgroup", b.getI64ArrayAttr(workgroupTileSizes)},
+      {"reduction", b.getI64ArrayAttr(reductionTileSizes)}};
+
+  // Set subgroup basis using greedy distribution like attention.
+  // Distribute the 'available' resource to the basis on the given dimensions.
+  // `currDim` tracks number of dims on which resources have already been
+  // distributed (to keep track of order of dimension distribution).
+  // Dynamic dimensions are treated as inf (distribute everything).
+  auto distributeDimensionsToBasisGreedily =
+      [&bounds](int64_t available, ArrayRef<uint32_t> dims,
+                IREE::GPU::Basis &basis, int64_t &currDim) {
+        // Iterate over dimensions and try to distribute resources over them.
+        for (int64_t dim : llvm::reverse(dims)) {
+          // We iterate over the basis in a reverse dimension to get smaller
+          // strides for inner dimensions.
+          int64_t rCurrDim = basis.counts.size() - currDim - 1;
+          ++currDim;
+          // Keep track of the order the dimensions are distributed in.
+          basis.mapping[dim] = rCurrDim;
+          // Try to distribute the resources over the dimensions greedily.
+          int64_t dimSize = bounds[dim];
+          if (ShapedType::isDynamic(dimSize)) {
+            // Distribute remaining resources on the dynamic dim.
+            basis.counts[rCurrDim] = available;
+            available = 1;
+            continue;
+          }
+          int64_t used = std::gcd(available, dimSize);
+          available /= used;
+          basis.counts[rCurrDim] = used;
+        }
+        return available;
+      };
+
+  // For a single-subgroup workgroup, distribute 1 subgroup across all dimensions.
+  // The subgroup basis represents distribution across subgroups, not threads.
+  IREE::GPU::Basis subgroupBasis = {
+      SmallVector<int64_t>(numLoops, 1),  // 1 subgroup for all dimensions
+      SmallVector<int64_t>(numLoops)};
+
+  // Distribute the subgroup basis mapping across dimensions.
+  int64_t currDim = 0;
+  distributeDimensionsToBasisGreedily(1, reductionDims, subgroupBasis, currDim);
+  distributeDimensionsToBasisGreedily(1, parallelDims, subgroupBasis, currDim);
+
+  IREE::GPU::setBasis(context, attrs, IREE::GPU::TilingLevel::Subgroup,
+                      subgroupBasis);
+
+  // Thread-level distribution within the single subgroup.
+  // Threads are distributed over the reduction dimension for warp-level reduction.
+  IREE::GPU::Basis laneBasis = {
+      SmallVector<int64_t>(numLoops, 1),
+      SmallVector<int64_t>(numLoops)};
+
+  int64_t numRemainingThreads = preferredSubgroupSize;
+  currDim = 0;
+  numRemainingThreads = distributeDimensionsToBasisGreedily(
+      numRemainingThreads, reductionDims, laneBasis, currDim);
+  // Parallel dimensions have no thread distribution (count=1).
+  distributeDimensionsToBasisGreedily(1, parallelDims, laneBasis, currDim);
+
+  IREE::GPU::setBasis(context, attrs, IREE::GPU::TilingLevel::Thread, laneBasis);
+
+  auto configDict = DictionaryAttr::get(context, attrs);
+  auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
+
+  // Set pipeline config.
+  SmallVector<NamedAttribute, 1> pipelineAttrs;
+  auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
+
+  // Apply lowering config to operation.
+  if (failed(setOpConfigAndEntryPointFnTranslation(
+          entryPoint, op, loweringConfig,
+          CodeGenPipeline::LLVMGPUVectorDistribute, workgroupSize,
+          preferredSubgroupSize, pipelineConfig))) {
+    return failure();
+  }
+
+  return success();
+}
+
+static LogicalResult setExpReductionOpConfig(
+    IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
+    IREE::LinalgExt::ExpReductionOp op) {
+  return setExpReductionLoweringConfig(target, entryPoint, op);
+}
+
 //====---------------------------------------------------------------------===//
 // Sort Pipeline Configuration
 //====---------------------------------------------------------------------===//
@@ -2407,6 +2556,10 @@ static LogicalResult setRootConfig(IREE::GPU::TargetAttr target,
         LDBG() << "Winograd Config";
         return setWinogradOpConfig(target, entryPointFn, winogradOp);
       })
+      .Case([&](IREE::LinalgExt::ExpReductionOp expReductionOp) {
+        LDBG() << "ExpReduction Config";
+        return setExpReductionOpConfig(target, entryPointFn, expReductionOp);
+      })
       .Case([&](IREE::LinalgExt::CustomOp customOp) {
         LDBG() << "CustomOp Config";
         return setDefaultCustomOpLoweringConfig(
@@ -2518,6 +2671,17 @@ LogicalResult initGPULaunchConfig(FunctionOpInterface funcOp) {
              IREE::LinalgExt::ScatterOp, IREE::LinalgExt::MapStoreOp,
              linalg::PackOp, linalg::UnPackOp>(op)) {
       rootOperation = op;
+
+      if (isa<IREE::LinalgExt::ExpReductionOp>(op)) {
+            // Place your logic here.
+            // This block executes ONLY when an ExpReductionOp is
+            // the first non-utility operation found in the reverse trace.
+            llvm::dbgs() << "Detected IREE::LinalgExt::ExpReductionOp as the kernel root!";
+
+            // Example: You could trigger a specific configuration
+            // or log hardware-specific parameters here.
+        }
+
       break;
     }
     if (auto genericOp = dyn_cast<linalg::GenericOp>(op)) {
