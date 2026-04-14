@@ -1803,6 +1803,19 @@ static LogicalResult setExpReductionLoweringConfig(
       {"workgroup", b.getI64ArrayAttr(workgroupTileSizes)},
       {"reduction", b.getI64ArrayAttr(reductionTileSizes)}};
 
+  // Determine which DPS inputs are function arguments and should be promoted.
+  // Only promote operands that are inputs to the function the op belongs to.
+  SmallVector<int64_t> promotedOperands;
+  FunctionOpInterface parentFunc = op->getParentOfType<mlir::FunctionOpInterface>();
+  SmallPtrSet<Value, 4> funcArgs(llvm::from_range,
+    llvm::map_range(parentFunc.getArguments(), [](BlockArgument ba) -> Value{ return ba; }));
+  for (auto [index, operandValue] : llvm::enumerate(op.getDpsInputs())) {
+    if (funcArgs.contains(operandValue)) {
+      promotedOperands.push_back(index);
+    }
+  }
+  IREE::GPU::appendPromotedOperandsList(context, attrs, promotedOperands);
+
   // Set subgroup basis using greedy distribution like attention.
   // Distribute the 'available' resource to the basis on the given dimensions.
   // `currDim` tracks number of dims on which resources have already been

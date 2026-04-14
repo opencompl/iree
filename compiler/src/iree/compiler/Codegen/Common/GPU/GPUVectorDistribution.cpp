@@ -154,6 +154,10 @@ LogicalResult distributeVectorOps(Operation *root,
   FrozenRewritePatternSet frozenPatterns(std::move(distributionPatterns));
   applyVectorDistribution(root, frozenPatterns);
 
+  llvm::errs() << "vectors distributed\n";
+  root->print(llvm::errs());
+  llvm::errs() << "\n\n";
+
   RewritePatternSet patterns(root->getContext());
   IREE::VectorExt::ToSIMDOp::getCanonicalizationPatterns(patterns,
                                                          root->getContext());
@@ -162,6 +166,8 @@ LogicalResult distributeVectorOps(Operation *root,
   if (failed(applyPatternsGreedily(root, std::move(patterns)))) {
     return failure();
   }
+
+  llvm::errs() << "successfully distributed greedily";
 
   // Remove signature after distribution.
   root->walk([](Operation *op) { IREE::VectorExt::removeOpSignature(op); });
@@ -176,6 +182,7 @@ LogicalResult distributeVectorOps(Operation *root,
               llvm::dbgs() << "Found live cast op: " << *op << "\n";
               llvm::dbgs() << "With live user: " << *user << "\n";
             });
+            llvm::errs() << "wellwellwell " << *op << " with user " << *user << " failed to distribute\n";
             return WalkResult::interrupt();
           }
         }

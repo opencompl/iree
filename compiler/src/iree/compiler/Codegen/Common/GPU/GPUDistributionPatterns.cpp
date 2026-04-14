@@ -90,8 +90,11 @@ struct DistributeElementwise final
     // Check if this operation has elementwise mappable traits. This is
     // more restricted than only having elementwise trait.
     if (!OpTrait::hasElementwiseMappableTraits(op)) {
+      llvm::errs() << "failed to distribute elemwise: " << op->getName() << "\n";
       return failure();
     }
+
+    llvm::errs() << "distributing elemwise: " << op->getName() << "\n";
 
     // Get the distributed operands.
     SmallVector<Value> operands;

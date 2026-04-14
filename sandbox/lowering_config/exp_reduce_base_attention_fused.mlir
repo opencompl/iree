@@ -96,11 +96,10 @@ flow.executable private @executable_0 {
         exp_reduced_operands = [1, 2]
       }
         attributes {lowering_config = #iree_gpu.lowering_config<{
-          workgroup = [1, 1, 64, 0, 0],
+          workgroup = [1, 1, 128, 0, 0],
           reduction = [0, 0, 0,  0, 32],
           subgroup_basis = [[1, 1, 4, 1, 1], [0, 1, 2, 3, 4]],
-          mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16, col_major=true>,
-          promote_operands = [1]
+          mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16, col_major=true>
         }>}
         ins(%S, %V : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x64xf16>)
         outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>)
