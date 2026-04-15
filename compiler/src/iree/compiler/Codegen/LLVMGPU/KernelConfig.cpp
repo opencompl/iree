@@ -13,6 +13,7 @@
 #include "compiler/src/iree/compiler/Codegen/LLVMGPU/Utils/LLVMGPUSelectUKernels.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUHeuristics.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenEnums.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
@@ -1923,13 +1924,12 @@ static LogicalResult setExpReductionLoweringConfig(
 
   // Set pipeline config.
   SmallVector<NamedAttribute, 1> pipelineAttrs;
-  auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
+  // auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
 
   // Apply lowering config to operation.
   if (failed(setOpConfigAndEntryPointFnTranslation(
           entryPoint, op, loweringConfig,
-          CodeGenPipeline::LLVMGPUVectorDistribute, workgroupSize,
-          preferredSubgroupSize, pipelineConfig))) {
+          getGPUTranslationInfo(context, GPUPipeline::Distribute, workgroupSize)))) {
     return failure();
   }
 
