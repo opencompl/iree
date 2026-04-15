@@ -51,7 +51,7 @@ iree_cc_library(
   SRCS
     "ConvertToLLVM.cpp"
     "DispatchABI.cpp"
-    "ExpandF16OpToF32Pass.cpp"
+    "ExpandF16OpToF32.cpp"
     "KernelDispatch.cpp"
     "LLVMCPU2DScalableTo1DScalable.cpp"
     "LLVMCPUAssignConstantOrdinals.cpp"
@@ -167,8 +167,10 @@ iree_cc_library(
     iree::compiler::Dialect::LinalgExt::Transforms
     iree::compiler::Dialect::LinalgExt::Utils
     iree::compiler::Dialect::TensorExt::IR
+    iree::compiler::Dialect::Util::Analysis
     iree::compiler::Dialect::Util::IR
     iree::compiler::Dialect::Util::Transforms
+    iree::compiler::Transforms
     iree::compiler::Utils
     iree::schemas::cpu_data
     iree::schemas::instruments

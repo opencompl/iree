@@ -43,6 +43,8 @@ def LowerIREEGPUOpsPass :
   let summary = "Post bufferization lowerings of iree_gpu ops before late lowerings";
   let dependentDialects = [
     "::mlir::gpu::GPUDialect",
+    "::mlir::iree_compiler::IREE::Util::UtilDialect",
+    "::mlir::ub::UBDialect",
   ];
 }
 
@@ -51,17 +53,26 @@ def UnrollToIntrinsicsPass :
   let summary = "Unrolls iree_gpu.multi_mma ops to their inner vector size.";
   let dependentDialects = [
     "::mlir::arith::ArithDialect",
+    "::mlir::iree_compiler::IREE::Util::UtilDialect",
+    "::mlir::ub::UBDialect",
     "::mlir::vector::VectorDialect",
   ];
 }
 
-def VectorizeIREEGPUOpsPass :
-    InterfacePass<"iree-gpu-vectorize-ops", "mlir::FunctionOpInterface"> {
-  let summary = "Vectorizes then lowers a few iree_gpu ops before vectorization.";
+def ConvertForallToGenericNestGPUPass :
+    InterfacePass<"iree-gpu-convert-forall-to-generic-nest",
+                  "mlir::FunctionOpInterface"> {
+  let summary = "Converts scf.forall ops with GPU mapping to pcf.generic";
+  let description = [{
+    Converts scf.forall ops with gpu.thread mapping to nested pcf.generic ops
+    using subgroup (outer) and lane (inner) scopes.
+  }];
   let dependentDialects = [
-    "::mlir::vector::VectorDialect",
+    "::mlir::iree_compiler::IREE::PCF::PCFDialect",
+    "::mlir::iree_compiler::IREE::GPU::IREEGPUDialect",
     "::mlir::arith::ArithDialect",
-    "::mlir::iree_compiler::IREE::GPU::IREEGPUDialect"
+    "::mlir::affine::AffineDialect",
+    "::mlir::scf::SCFDialect",
   ];
 }
 

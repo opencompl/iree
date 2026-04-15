@@ -204,6 +204,9 @@ spirv::ResourceLimitsAttr convertLimits(IREE::GPU::TargetAttr target) {
 
   SmallVector<Attribute, 4> coopMatAttrs;
   for (IREE::GPU::MMAAttr mmaOp : wgp.getMma()) {
+    if (mmaOp.isBlockIntrinsic()) {
+      continue;
+    }
     auto [mSize, nSize, kSize] = mmaOp.getMNKShape();
     auto [aType, bType, cType] = mmaOp.getABCElementTypes();
 
@@ -244,8 +247,7 @@ spirv::ResourceLimitsAttr convertLimits(IREE::GPU::TargetAttr target) {
 //===----------------------------------------------------------------------===//
 
 FailureOr<spirv::TargetEnvAttr>
-convertGPUTarget(MLIRContext *context, IREE::HAL::ExecutableVariantOp variant) {
-  IREE::HAL::ExecutableTargetAttr target = variant.getTarget();
+convertGPUTarget(MLIRContext *context, IREE::HAL::ExecutableTargetAttr target) {
   IREE::GPU::TargetAttr gpuTarget = getGPUTargetAttr(context, target);
 
   SmallVector<StringRef> features;
@@ -257,8 +259,7 @@ convertGPUTarget(MLIRContext *context, IREE::HAL::ExecutableVariantOp variant) {
 
   std::optional<Version> version = deduceVersion(features);
   if (!version) {
-    return variant.emitError("cannot deduce spirv version from target "
-                             "features; need to specify 'spirv1.x'");
+    return failure();
   }
   processCapabilities(features, caps);
   processExtensions(features, exts);
@@ -271,10 +272,14 @@ convertGPUTarget(MLIRContext *context, IREE::HAL::ExecutableVariantOp variant) {
   addDotProductFeatures(compute, wgp.getDot().getValue(), caps, exts);
   addMatrixFeatures(wgp.getMma(), caps, exts, coopMatAttrs);
 
-  auto triple = spirv::VerCapExtAttr::get(
-      *version, caps.getArrayRef(), exts.getArrayRef(), variant.getContext());
+  auto triple = spirv::VerCapExtAttr::get(*version, caps.getArrayRef(),
+                                          exts.getArrayRef(), context);
+  StringRef backend;
+  if (target) {
+    backend = target.getBackend();
+  }
   return spirv::TargetEnvAttr::get(
-      triple, convertLimits(gpuTarget), deduceClientAPI(target.getBackend()),
+      triple, convertLimits(gpuTarget), deduceClientAPI(backend),
       deduceVendor(gpuTarget), spirv::DeviceType::Unknown,
       spirv::TargetEnvAttr::kUnknownDeviceID);
 }
@@ -282,20 +287,34 @@ convertGPUTarget(MLIRContext *context, IREE::HAL::ExecutableVariantOp variant) {
 struct SPIRVConvertGPUTargetPass final
     : impl::SPIRVConvertGPUTargetPassBase<SPIRVConvertGPUTargetPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<spirv::SPIRVDialect>();
+    registry.insert<IREE::GPU::IREEGPUDialect, spirv::SPIRVDialect>();
   }
 
   void runOnOperation() override {
     mlir::ModuleOp moduleOp = getOperation();
-    auto variant = moduleOp->getParentOfType<IREE::HAL::ExecutableVariantOp>();
     MLIRContext *context = &getContext();
-
+    IREE::HAL::ExecutableTargetAttr targetAttr;
+    for (auto funcOp : moduleOp.getOps<FunctionOpInterface>()) {
+      auto attr = IREE::HAL::ExecutableTargetAttr::lookup(funcOp);
+      if (!attr) {
+        continue;
+      }
+      if (!targetAttr) {
+        targetAttr = attr;
+        continue;
+      }
+      if (targetAttr != attr) {
+        moduleOp->emitError()
+            << "inconsistent executable target attributes across functions";
+        return signalPassFailure();
+      }
+    }
     FailureOr<spirv::TargetEnvAttr> spirvTarget =
-        convertGPUTarget(context, variant);
+        convertGPUTarget(context, targetAttr);
     if (failed(spirvTarget)) {
+      moduleOp->emitError() << "failed to convert GPU target to SPIR-V target";
       return signalPassFailure();
     }
-
     moduleOp->setAttr(spirv::getTargetEnvAttrName(), *spirvTarget);
   }
 };

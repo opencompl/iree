@@ -51,6 +51,15 @@ OpFoldResult addOfrs(OpBuilder &builder, Location loc, OpFoldResult a,
   return affine::makeComposedFoldedAffineApply(builder, loc, addMap, {a, b});
 }
 
+OpFoldResult subOfrs(OpBuilder &builder, Location loc, OpFoldResult a,
+                     OpFoldResult b) {
+  AffineExpr d0, d1;
+  bindDims(builder.getContext(), d0, d1);
+  return affine::makeComposedFoldedAffineApply(
+      builder, loc, AffineMap::get(2, 0, {d0 - d1}, builder.getContext()),
+      {a, b});
+}
+
 OpFoldResult mulOfrs(OpBuilder &builder, Location loc, OpFoldResult a,
                      OpFoldResult b) {
   AffineExpr d0, d1;
@@ -615,7 +624,7 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
   DenseMap<int64_t, AffineExpr> convToIgemmDimMap;
   for (auto [idx, expr] : llvm::enumerate(outputMap.getResults())) {
     auto convDimIdx = cast<AffineDimExpr>(expr).getPosition();
-    convToIgemmDimMap[convDimIdx] = getAffineDimExpr(idx, expr.getContext());
+    convToIgemmDimMap[convDimIdx] = getAffineDimExpr(idx, ctx);
   }
 
   // Lambda to remap conv dim indices to igemm dimensions.
@@ -690,9 +699,10 @@ getIGEMMGenericConvDetails(linalg::LinalgOp linalgOp) {
                                    : SmallVector<Value>({input, filter});
   igemmDetails.igemmOperands.push_back(output);
   SmallVector<int64_t> igemmLoopBounds;
-  igemmLoopBounds.insert(igemmLoopBounds.end(), outputShape.begin(),
-                         outputShape.begin() + numParallelDims);
-  SmallVector<utils::IteratorType> igemmLoopIterators(outputShape.size(),
+  for (auto [idx, expr] : llvm::enumerate(outputMap.getResults())) {
+    igemmLoopBounds.push_back(outputShape[idx]);
+  }
+  SmallVector<utils::IteratorType> igemmLoopIterators(numParallelDims,
                                                       parallel);
 
   for (auto iter : llvm::enumerate(filterIterators)) {

@@ -2080,8 +2080,8 @@ SmallVector<int64_t> ResourceTransientsOp::getTiedResultOperandIndices() {
 namespace {
 
 struct FoldConsecutiveResourceTransientsOps
-    : public OpRewritePattern<ResourceTransientsOp> {
-  using OpRewritePattern::OpRewritePattern;
+    : OpRewritePattern<ResourceTransientsOp> {
+  using Base::Base;
   LogicalResult matchAndRewrite(ResourceTransientsOp op,
                                 PatternRewriter &rewriter) const override {
     auto resourceOp = op.getResource().getDefiningOp<ResourceTransientsOp>();
@@ -3834,7 +3834,7 @@ void AsyncParameterWriteOp::getAsyncAccessRanges(
 
 LogicalResult AsyncParameterGatherOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   // The result type matches the target operand type.
   AsyncParameterGatherOpAdaptor adaptor(operands, attributes, properties,
@@ -3900,7 +3900,7 @@ void AsyncParameterGatherOp::getAsyncAccessRanges(
 
 LogicalResult AsyncParameterScatterOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
     SmallVectorImpl<Type> &inferredReturnTypes) {
   // The result type matches the source operand type.
   AsyncParameterScatterOpAdaptor adaptor(operands, attributes, properties,

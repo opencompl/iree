@@ -8,10 +8,8 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
-#include "llvm/ADT/STLExtras.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/PatternMatch.h"
@@ -21,7 +19,7 @@ namespace mlir::iree_compiler::IREE::LinalgExt {
 namespace {
 
 struct FuseTransposeWithAttentionOp final
-    : public OpRewritePattern<LinalgExt::AttentionOp> {
+    : OpRewritePattern<LinalgExt::AttentionOp> {
   FuseTransposeWithAttentionOp(MLIRContext *context,
                                linalg::ControlFusionFn controlFn,
                                PatternBenefit benefit = 1)
@@ -38,11 +36,17 @@ struct FuseTransposeWithAttentionOp final
       }
 
       auto maybeProducer = input->get().getDefiningOp<linalg::GenericOp>();
-      if (maybeProducer && maybeProducer.isSingleYieldOp()) {
-        producer = maybeProducer;
-        operand = input;
-        break;
+      if (!maybeProducer || !maybeProducer.isSingleYieldOp()) {
+        continue;
       }
+      auto producerMaps = maybeProducer.getIndexingMapsArray();
+      if (!producerMaps[0].isProjectedPermutation() ||
+          !producerMaps[1].isPermutation()) {
+        continue;
+      }
+      producer = maybeProducer;
+      operand = input;
+      break;
     }
     if (!operand) {
       return rewriter.notifyMatchFailure(attentionOp, "no operand found");
@@ -53,10 +57,6 @@ struct FuseTransposeWithAttentionOp final
     auto producerMaps = producer.getIndexingMapsArray();
     AffineMap producerInputMap = producerMaps[0];
     AffineMap producerResultMap = producerMaps[1];
-    if (!producerInputMap.isProjectedPermutation() ||
-        !producerResultMap.isPermutation()) {
-      return failure();
-    }
 
     rewriter.modifyOpInPlace(attentionOp, [&]() {
       SmallVector<AffineMap> newIndexingMaps =
@@ -80,7 +80,7 @@ private:
 // Bubbles transpose-V out of attention to expose the more performant
 // attention-transposeV.
 struct BubbleTransposeVFromAttentionOp
-    : public OpRewritePattern<LinalgExt::AttentionOp> {
+    : OpRewritePattern<LinalgExt::AttentionOp> {
   BubbleTransposeVFromAttentionOp(MLIRContext *context,
                                   linalg::ControlFusionFn controlFn,
                                   PatternBenefit benefit = 1)

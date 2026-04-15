@@ -34,7 +34,7 @@ namespace mlir::iree_compiler {
 namespace {
 
 struct PromoteContractOperands final
-    : public vector::MaskableOpRewritePattern<vector::ContractionOp> {
+    : vector::MaskableOpRewritePattern<vector::ContractionOp> {
   using MaskableOpRewritePattern::MaskableOpRewritePattern;
 
   FailureOr<Value>
@@ -507,7 +507,7 @@ private:
   }
 };
 
-struct UnrollElementwiseOps final : public RewritePattern {
+struct UnrollElementwiseOps final : RewritePattern {
   UnrollElementwiseOps(MLIRContext *context, PatternBenefit benefit = 1)
       : RewritePattern(MatchAnyOpTypeTag(), benefit, context) {}
 
@@ -617,11 +617,13 @@ struct LLVMGPUVectorLoweringPass final
           contractLoweringPatterns,
           vector::VectorMultiReductionLowering::InnerReduction);
       contractLoweringPatterns.add<UnrollElementwiseOps>(funcOp->getContext());
-      // Unroll transfer_gather ops to rank 1 and lower contiguous ones to
-      // vector.transfer_read.
-      IREE::VectorExt::populateVectorTransferGatherLoweringPatterns(
+      // Unroll transfer_gather/scatter ops to rank 1 and lower contiguous ones
+      // to vector.transfer_read/write.
+      IREE::VectorExt::populateVectorTransferGatherScatterLoweringPatterns(
           contractLoweringPatterns);
       IREE::VectorExt::TransferGatherOp::getCanonicalizationPatterns(
+          contractLoweringPatterns, ctx);
+      IREE::VectorExt::TransferScatterOp::getCanonicalizationPatterns(
           contractLoweringPatterns, ctx);
       if (failed(applyPatternsGreedily(funcOp,
                                        std::move(contractLoweringPatterns)))) {

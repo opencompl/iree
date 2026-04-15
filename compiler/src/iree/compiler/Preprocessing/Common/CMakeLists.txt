@@ -27,17 +27,19 @@ iree_cc_library(
     "Passes.h.inc"
   SRCS
     "ApplyPDLPatterns.cpp"
-    "AttrBasedPipelinePass.cpp"
+    "AttrBasedPipeline.cpp"
     "Convert1X1FilterConv2DToMatmul.cpp"
     "ConvertConvFilterToChannelsLast.cpp"
     "ConvertConvToChannelsLast.cpp"
+    "ConvertStridedInsertSliceToGeneric.cpp"
     "FoldAttentionWithTranspose.cpp"
     "GeneralizeLinalgMatMul.cpp"
-    "InterpreterPass.cpp"
+    "Interpreter.cpp"
     "MakeSingleDispatchForFunction.cpp"
     "PadLinalgOps.cpp"
     "PadToIntrinsics.cpp"
     "Passes.cpp"
+    "SwapStridedInsertSliceWithContraction.cpp"
     "TransposeMatmul.cpp"
   DEPS
     ::PassesIncGen

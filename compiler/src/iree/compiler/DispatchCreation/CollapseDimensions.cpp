@@ -52,7 +52,7 @@ using IREE::LinalgExt::LinalgFusionOpInterface;
 namespace {
 /// Pass declaration.
 struct CollapseDimensionsPass final
-    : public impl::CollapseDimensionsPassBase<CollapseDimensionsPass> {
+    : impl::CollapseDimensionsPassBase<CollapseDimensionsPass> {
   using Base::Base;
   void runOnOperation() override;
 };
@@ -219,6 +219,27 @@ static bool isEligibleForCollapse(Operation *op) {
   auto genericOp = dyn_cast<linalg::GenericOp>(op);
   if (!genericOp) {
     return false;
+  }
+
+  // Skip collapse for scatter-like generics that use tensor.extract with
+  // linalg.index-based addressing. These are strided scatter patterns where
+  // 1D collapse introduces expensive delinearization (div/mod chains) that
+  // dominates execution. Keeping the multi-dimensional iteration space
+  // allows direct workgroup tiling without delinearization.
+  {
+    bool hasTensorExtract = false;
+    bool hasLinalgIndex = false;
+    genericOp.getBlock()->walk([&](Operation *inner) {
+      if (isa<tensor::ExtractOp>(inner)) {
+        hasTensorExtract = true;
+      }
+      if (isa<linalg::IndexOp>(inner)) {
+        hasLinalgIndex = true;
+      }
+    });
+    if (hasTensorExtract && hasLinalgIndex) {
+      return false;
+    }
   }
 
   auto hasEncoding = [](Type type) -> bool {

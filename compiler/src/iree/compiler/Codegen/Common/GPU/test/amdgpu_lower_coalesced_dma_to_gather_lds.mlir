@@ -13,8 +13,8 @@
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_64 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [64, 1, 1] subgroup_size = 32>
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_64 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: 4x128 memref with 32 lanes.
 //   - Elements per lane = 128 / 32 = 4 (each lane reads 4 contiguous f32s)
@@ -86,7 +86,7 @@ func.func @lower_coalesced_gather_dma_multiple(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: 2x64 memref with 32 lanes.
 //   - Elements per lane = 64 / 32 = 2 (each lane reads 2 contiguous f16s)
@@ -142,7 +142,7 @@ func.func @lower_coalesced_copy_dma_basic(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: 1D memref with 128 elements and 32 lanes.
 //   * Elements per lane = 128 / 32 = 4 (each lane reads 4 contiguous f32s)
@@ -185,7 +185,7 @@ func.func @lower_coalesced_copy_dma_1d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: Single-row 2D memref (1x128) with 32 lanes.
 // This verifies that a 2D memref with only 1 row produces a single transfer,
@@ -234,7 +234,7 @@ func.func @lower_coalesced_copy_dma_single_row_2d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: 3D memref with shape 2x2x128 and 32 lanes.
 //   * Elements per lane = 128 / 32 = 4
@@ -303,7 +303,7 @@ func.func @lower_coalesced_copy_dma_3d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_256_wide = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [256, 1, 1] subgroup_size = 256>
+#translation_256_wide = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [256, 1, 1] subgroup_size = 256>
 
 // Test: Wide forall with 256 lanes, 2D memref 2x1024.
 //   * subgroup_size = 256
@@ -360,7 +360,7 @@ func.func @lower_coalesced_copy_dma_wide_forall_2d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test gather 2D with indices.
 // Source indices use srcDimOffset (with lane offset) for index lookup.
@@ -416,7 +416,7 @@ func.func @lower_coalesced_gather_dma_with_indices(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: Verify iteration uses destShape, not sourceShape.
 // If code iterated over sourceShape, would generate 256 ops.
@@ -482,7 +482,7 @@ func.func @gather_iterates_over_dest_shape_not_source(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: N-transfer mode for wide innermost dimension.
 // When innermostDimSize > subgroupSize * elementsPerLane, multiple
@@ -538,7 +538,7 @@ func.func @lower_coalesced_dma_multiple_transfers_1d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: N-transfer mode for 2D memref with wide innermost dimension.
 //   - Shape: 2x256, innermostDimSize = 256
@@ -592,7 +592,7 @@ func.func @lower_coalesced_dma_multiple_transfers_2d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: Mixed DMA sizes within the same row.
 // When innermost dimension isn't evenly divisible by the largest DMA size,
@@ -653,7 +653,7 @@ func.func @lower_coalesced_dma_mixed_sizes_1d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: Mixed DMA sizes with 2D contiguous memref (linearized path).
 // Since the destination is fully contiguous, the linearized transfer path is
@@ -719,7 +719,7 @@ func.func @lower_coalesced_dma_mixed_sizes_2d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test: Linearized transfer spanning 2 rows per transfer.
 // When destination is fully contiguous, the entire memref is treated as a 1D
@@ -783,7 +783,7 @@ func.func @lower_coalesced_dma_linearized_2_rows_per_transfer(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128, 32]>>}>
 
-#translation_3d = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_3d = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test with 3D shape where only innermost 2 dims are contiguous.
 // Dest shape: <2x4x32xf32> with strided<[256, 32, 1]>
@@ -850,7 +850,7 @@ func.func @lower_3d_partial_contiguous(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128, 32]>>}>
 
-#translation_3d_mixed = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_3d_mixed = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test with 3D shape where innermost 2 dims require mixed DMA sizes.
 // Dest shape: <2x5x32xf32> with strided<[256, 32, 1]>
@@ -909,7 +909,7 @@ func.func @lower_3d_partial_contiguous_mixed_dma(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // Test gather with indices on the innermost (only) dimension.
 // This tests true per-element gather where each lane loads its own index.
@@ -989,7 +989,7 @@ func.func @lower_coalesced_gather_dma_innermost_1d(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // CHECK-LABEL: func.func @lower_coalesced_dma_lane_offset_regression
 // CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<16x64xf32, #amdgpu.address_space<fat_raw_buffer>>
@@ -1044,7 +1044,7 @@ func.func @lower_coalesced_dma_lane_offset_regression(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // CHECK-LABEL: func.func @lower_coalesced_dma_with_in_bounds
 // CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<2x128xf32, #amdgpu.address_space<fat_raw_buffer>>
@@ -1117,7 +1117,7 @@ func.func @lower_coalesced_dma_with_in_bounds(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_64_unaligned = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [64, 1, 1] subgroup_size = 64>
+#translation_64_unaligned = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 64>
 
 // CHECK-LABEL: func.func @lower_coalesced_dma_4x64_tensor_pad_fusion
 // CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<?x64xf32, strided<[64, 1], offset: ?>, #amdgpu.address_space<fat_raw_buffer>>
@@ -1177,7 +1177,7 @@ func.func @lower_coalesced_dma_4x64_tensor_pad_fusion(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_32_pad = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32_pad = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 // CHECK-LABEL: func.func @gather_dma_non_outermost_oob_check
 // CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<4x6xf32, #amdgpu.address_space<fat_raw_buffer>>
@@ -1236,7 +1236,7 @@ func.func @gather_dma_non_outermost_oob_check(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_64_inner_pad = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [64, 1, 1] subgroup_size = 64>
+#translation_64_inner_pad = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 64>
 
 // CHECK-LABEL: func.func @gather_dma_inner_dim_oob_64x62
 // CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<64x62xf32, #amdgpu.address_space<fat_raw_buffer>>
@@ -1300,7 +1300,7 @@ func.func @gather_dma_inner_dim_oob_64x62(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 func.func @fallback_1d_basic(
     %source: memref<48xf32, #amdgpu.address_space<fat_raw_buffer>>,
@@ -1354,7 +1354,7 @@ func.func @fallback_1d_basic(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 func.func @fallback_2d_basic(
     %source: memref<3x16xf32, #amdgpu.address_space<fat_raw_buffer>>,
@@ -1406,7 +1406,7 @@ func.func @fallback_2d_basic(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 func.func @fallback_gather_with_indices(
     %source: memref<1024x16xf32, #amdgpu.address_space<fat_raw_buffer>>,
@@ -1455,7 +1455,7 @@ func.func @fallback_gather_with_indices(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 func.func @fallback_non_outermost_oob(
     %source: memref<4x12xf32, #amdgpu.address_space<fat_raw_buffer>>,
@@ -1513,7 +1513,7 @@ func.func @fallback_non_outermost_oob(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [128]>>}>
 
-#translation_32_outer = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [32, 1, 1] subgroup_size = 32>
+#translation_32_outer = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [32, 1, 1] subgroup_size = 32>
 
 func.func @fallback_with_outer_dims(
     %source: memref<2x8xf32, strided<[64, 1]>, #amdgpu.address_space<fat_raw_buffer>>,
@@ -1566,7 +1566,7 @@ func.func @fallback_with_outer_dims(
     max_load_instruction_bits = 128, simds_per_wgp = 4,
     vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
 
-#translation_64 = #iree_codegen.translation_info<pipeline = LLVMGPUTileAndFuse workgroup_size = [64, 1, 1] subgroup_size = 32>
+#translation_64 = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 32>
 
 func.func @no_lower_oob_without_fat_raw_buffer(
     %source: memref<2x128xf32>,
@@ -1579,5 +1579,125 @@ func.func @no_lower_oob_without_fat_raw_buffer(
       memref<2x128xf32>,
       memref<4x128xf32, #gpu.address_space<workgroup>>, index
   } {mapping = [#gpu.thread<linear_dim_0>]}
+  return
+}
+
+// -----
+
+// Test: Inverse source swizzle when destination has swizzle_hint.
+// The destination traces through expand_shape -> swizzle_hint -> alloc.
+// Source indices should be swizzled, destination indices should be linear.
+//
+// Shape: 4x128 f32 dest. With 64 lanes, 128-bit DMA = 4 elements/lane.
+// 256 elements/transfer, 512 total = 2 transfers.
+// XOR swizzle with row_width=128, access_width=16 permutes source offsets.
+
+#executable_target_rocm_hsaco_fb_swizzle = #hal.executable.target<"rocm",
+  "rocm-hsaco-fb", {iree_codegen.target_info = #iree_gpu.target<
+  arch = "gfx950", features = "", wgp = <
+    compute = fp32, storage = b32, subgroup = none, dot = none, mma = [],
+    subgroup_size_choices = [64, 64],
+    max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024,
+    max_workgroup_memory_bytes = 65536,
+    max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+    max_load_instruction_bits = 128, simds_per_wgp = 4,
+    vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
+
+#translation_swizzle = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 64>
+
+// CHECK-LABEL: func.func @lower_dma_with_dest_swizzle
+// CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<4x128xf32, #amdgpu.address_space<fat_raw_buffer>>
+func.func @lower_dma_with_dest_swizzle(
+    %source: memref<4x128xf32, #amdgpu.address_space<fat_raw_buffer>>)
+  attributes {
+    hal.executable.target = #executable_target_rocm_hsaco_fb_swizzle,
+    translation_info = #translation_swizzle} {
+  %alloc = memref.alloc() : memref<512xf32, #gpu.address_space<workgroup>>
+  %swizzled = iree_codegen.swizzle_hint %alloc[#iree_codegen.xor_shuffle<128, 16>]
+      : memref<512xf32, #gpu.address_space<workgroup>>
+  %dest = memref.expand_shape %swizzled [[0, 1]]
+      output_shape [4, 128]
+      : memref<512xf32, #gpu.address_space<workgroup>>
+      into memref<4x128xf32, #gpu.address_space<workgroup>>
+  // CHECK: scf.forall (%[[LANE_ID:[a-zA-Z0-9]+]]) in (64)
+  scf.forall (%lane) in (64) {
+    // CHECK: %[[C4:.+]] = arith.constant 4 : index
+    // CHECK: %[[LANE_OFFSET:.+]] = arith.muli %[[LANE_ID]], %[[C4]]
+    //
+    // Transfer 1: linearOffset = 0, source gets XOR-swizzled offset.
+    // CHECK: %[[C0:.+]] = arith.constant 0 : index
+    // CHECK: %[[SRC_LIN0:.+]] = arith.addi %[[C0]], %[[LANE_OFFSET]]
+    // XOR swizzle: extractCol, extractRow, xori, updateCol, diff, add.
+    // CHECK: %[[COL0:.+]] = affine.apply
+    // CHECK: %[[ROW0:.+]] = affine.apply
+    // CHECK: %[[XOR0:.+]] = arith.xori %[[ROW0]], %[[COL0]]
+    // CHECK: %[[UCOL0:.+]] = affine.apply
+    // CHECK: %[[DIFF0:.+]] = arith.subi %[[UCOL0]], %[[SRC_LIN0]]
+    // CHECK: %[[SWIZZLED0:.+]] = arith.addi %[[SRC_LIN0]], %[[DIFF0]]
+    // Source delinearized from swizzled offset.
+    // CHECK: %[[SRC_DELIN0:.+]]:2 = affine.delinearize_index %[[SWIZZLED0]] into (4, 128)
+    // Destination delinearized from unswizzled offset (no xori).
+    // CHECK: %[[DST_DELIN0:.+]]:2 = affine.delinearize_index %[[C0]] into (4, 128)
+    // CHECK: amdgpu.gather_to_lds %[[SRC]][%[[SRC_DELIN0]]#0, %[[SRC_DELIN0]]#1], %{{.+}}[%[[DST_DELIN0]]#0, %[[DST_DELIN0]]#1] : vector<4xf32>
+    //
+    // Remaining 1 transfer also has XOR swizzle on source.
+    // CHECK-COUNT-1: amdgpu.gather_to_lds
+    // CHECK-NOT: amdgpu.gather_to_lds
+    // CHECK-NOT: iree_gpu.coalesced_gather_dma
+    iree_gpu.coalesced_gather_dma %source into %dest lane(%lane)
+        : memref<4x128xf32, #amdgpu.address_space<fat_raw_buffer>>,
+          memref<4x128xf32, #gpu.address_space<workgroup>>, index
+  } {mapping = [#iree_gpu.lane_id<0>]}
+  return
+}
+
+// -----
+
+// Test: Swizzle trace through chained view-like ops.
+// Destination traces: subview -> expand_shape -> swizzle_hint -> alloc.
+// The swizzle should still be detected through the chain.
+
+#executable_target_rocm_hsaco_fb_swizzle_chain = #hal.executable.target<"rocm",
+  "rocm-hsaco-fb", {iree_codegen.target_info = #iree_gpu.target<
+  arch = "gfx950", features = "", wgp = <
+    compute = fp32, storage = b32, subgroup = none, dot = none, mma = [],
+    subgroup_size_choices = [64, 64],
+    max_workgroup_sizes = [1024, 1024, 1024],
+    max_thread_count_per_workgroup = 1024,
+    max_workgroup_memory_bytes = 65536,
+    max_workgroup_counts = [2147483647, 2147483647, 2147483647],
+    max_load_instruction_bits = 128, simds_per_wgp = 4,
+    vgpr_space_bits = 8192, dma_sizes = [32, 128]>>}>
+
+#translation_swizzle_chain = #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<TileAndFuse> workgroup_size = [64, 1, 1] subgroup_size = 64>
+
+// CHECK-LABEL: func.func @lower_dma_with_chained_view_ops
+// CHECK-SAME:    %[[SRC:[a-zA-Z0-9]+]]: memref<2x128xf32, #amdgpu.address_space<fat_raw_buffer>>
+func.func @lower_dma_with_chained_view_ops(
+    %source: memref<2x128xf32, #amdgpu.address_space<fat_raw_buffer>>)
+  attributes {
+    hal.executable.target = #executable_target_rocm_hsaco_fb_swizzle_chain,
+    translation_info = #translation_swizzle_chain} {
+  %alloc = memref.alloc() : memref<512xf32, #gpu.address_space<workgroup>>
+  %swizzled = iree_codegen.swizzle_hint %alloc[#iree_codegen.xor_shuffle<128, 16>]
+      : memref<512xf32, #gpu.address_space<workgroup>>
+  %expanded = memref.expand_shape %swizzled [[0, 1]]
+      output_shape [4, 128]
+      : memref<512xf32, #gpu.address_space<workgroup>>
+      into memref<4x128xf32, #gpu.address_space<workgroup>>
+  %dest = memref.subview %expanded[0, 0] [2, 128] [1, 1]
+      : memref<4x128xf32, #gpu.address_space<workgroup>>
+      to memref<2x128xf32, strided<[128, 1]>, #gpu.address_space<workgroup>>
+  // CHECK: scf.forall (%[[LANE_ID:[a-zA-Z0-9]+]]) in (64)
+  scf.forall (%lane) in (64) {
+    // XOR swizzle should still be applied through the subview+expand chain.
+    // CHECK: arith.xori
+    // CHECK: amdgpu.gather_to_lds
+    // CHECK-NOT: iree_gpu.coalesced_gather_dma
+    iree_gpu.coalesced_gather_dma %source into %dest lane(%lane)
+        : memref<2x128xf32, #amdgpu.address_space<fat_raw_buffer>>,
+          memref<2x128xf32, strided<[128, 1]>, #gpu.address_space<workgroup>>, index
+  } {mapping = [#iree_gpu.lane_id<0>]}
   return
 }

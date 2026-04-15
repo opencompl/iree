@@ -83,6 +83,10 @@ static ScaledMMAAttr chooseScaledIntrinsicMMAAttr(TypeRange eTypes,
 static MMAAttr chooseIntrinsicMMAAttr(TypeRange eTypes, TargetWgpAttr wgp) {
   MMAAttr candidateMma;
   for (MMAAttr mma : wgp.getMma()) {
+    // TODO: Enable block intrinsics for encoding.
+    if (mma.isBlockIntrinsic()) {
+      continue;
+    }
     // Filter out intrinsics that don't match the element types of this matmul.
     auto [et0, et1, et2] = mma.getABCElementTypes();
     if (et0 != eTypes[0] || et1 != eTypes[1] || et2 != eTypes[2]) {
@@ -551,7 +555,7 @@ static Operation *lowerContractionOrScaledContractionOpToInnerTiledOp(
 }
 
 struct GPUEncodingPackedLayoutMaterializerAttr
-    : public PackedLayoutMaterializerAttrExternalModelBase<
+    : PackedLayoutMaterializerAttrExternalModelBase<
           GPUEncodingPackedLayoutMaterializerAttr, GPUEncodingResolverAttr> {
   DictionaryAttr getConfiguration(Attribute attr) const {
     return cast<GPUEncodingResolverAttr>(attr).getConfiguration();
@@ -601,7 +605,7 @@ struct GPUEncodingPackedLayoutMaterializerAttr
 };
 
 struct GPUEncodingResolverMaterializerAttr
-    : public EncodingLayoutMaterializerAttrExternalModelBase<
+    : EncodingLayoutMaterializerAttrExternalModelBase<
           GPUEncodingResolverMaterializerAttr, GPUEncodingResolverAttr> {
   Operation *lowerOp(Attribute attr, OpBuilder &b, Operation *op,
                      TypeRange convertedResTypes,

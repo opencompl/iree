@@ -18,11 +18,13 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SMT/IR/SMTTypes.h"
 #include "mlir/Dialect/Utils/IndexingUtils.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
+#include "mlir/Interfaces/ValueBoundsOpInterface.h"
 #include "mlir/Support/LLVM.h"
 
 // Custom parse/print helper for the knobs dictionary in constraints op.
@@ -422,6 +424,13 @@ std::optional<SmallVector<int64_t, 4>> InnerTiledOp::getShapeForUnroll() {
   return shape;
 }
 
+void InnerTiledOp::populateBoundsForShapedValueDim(
+    Value value, int64_t dim, ValueBoundsConstraintSet &cstr) {
+  // Result shapes equal the corresponding DPS init shapes.
+  auto resultIdx = cast<OpResult>(value).getResultNumber();
+  cstr.bound(value)[dim] == cstr.getExpr(getDpsInits()[resultIdx], dim);
+}
+
 //===----------------------------------------------------------------------===//
 // WorkgroupCountHintOp
 //===----------------------------------------------------------------------===//
@@ -464,6 +473,64 @@ void WorkgroupCountHintOp::print(OpAsmPrinter &printer) {
                                 /*elidedAttrs=*/{"static_sizes"});
 }
 
+//===----------------------------------------------------------------------===//
+// DispatchConfigOp
+//===----------------------------------------------------------------------===//
+
+void DispatchConfigOp::build(OpBuilder &odsBuilder, OperationState &odsState,
+                             FlatSymbolRefAttr functionRef) {
+  DispatchConfigOp::build(odsBuilder, odsState, functionRef,
+                          /*workgroup_size=*/nullptr,
+                          /*subgroup_size=*/nullptr);
+}
+
+LogicalResult DispatchConfigOp::verify() {
+  if (auto wgSize = getWorkgroupSize()) {
+    if (wgSize->empty() || wgSize->size() > 3) {
+      return emitOpError("workgroup_size must have 1 to 3 entries, got ")
+             << wgSize->size();
+    }
+  }
+
+  return success();
+}
+
+LogicalResult DispatchConfigOp::verifyRegions() {
+  Block &block = getBody().front();
+  // The terminator must yield exactly 3 index values (workgroup count x, y, z).
+  auto yieldOp = cast<YieldOp>(block.getTerminator());
+  if (yieldOp.getNumOperands() != 3) {
+    return emitOpError("expected terminator to yield exactly 3 operands "
+                       "(workgroup count x, y, z), got ")
+           << yieldOp.getNumOperands();
+  }
+  for (auto [i, type] : llvm::enumerate(yieldOp.getOperandTypes())) {
+    if (!type.isIndex()) {
+      return emitOpError("expected terminator operand #")
+             << i << " to be index type, got " << type;
+    }
+  }
+
+  return success();
+}
+
+SmallVector<int64_t> DispatchConfigOp::getStaticNumWorkgroups() {
+  SmallVector<int64_t> result;
+  auto yieldOp = cast<YieldOp>(getBody().front().getTerminator());
+  for (Value v : yieldOp.getOperands()) {
+    if (std::optional<int64_t> cst = getConstantIntValue(v)) {
+      result.push_back(*cst);
+    } else {
+      result.push_back(ShapedType::kDynamic);
+    }
+  }
+  return result;
+}
+
+//===----------------------------------------------------------------------===//
+// WorkgroupCountHintOp
+//===----------------------------------------------------------------------===//
+
 void WorkgroupCountHintOp::build(OpBuilder &builder, OperationState &state,
                                  ArrayRef<OpFoldResult> sizes) {
   SmallVector<int64_t> staticSizes;
@@ -478,10 +545,12 @@ void WorkgroupCountHintOp::build(OpBuilder &builder, OperationState &state,
 //===----------------------------------------------------------------------===//
 
 /// Recursively check whether `name` appears as a knob name in `attr`.
-/// Checks IntKnobAttr names and recurses into DictionaryAttr/ArrayAttr.
+/// Checks IntKnobAttr/OneOfKnobAttr names and recurses into
+/// DictionaryAttr/ArrayAttr.
 static bool hasKnobName(Attribute attr, StringRef name) {
   return TypeSwitch<Attribute, bool>(attr)
-      .Case([&](IntKnobAttr knob) { return knob.getName().getValue() == name; })
+      .Case<IntKnobAttr, OneOfKnobAttr>(
+          [&](auto knob) { return knob.getName().getValue() == name; })
       .Case([&](DictionaryAttr dict) {
         return llvm::any_of(dict, [&](NamedAttribute entry) {
           return hasKnobName(entry.getValue(), name);
@@ -519,9 +588,10 @@ LogicalResult ConstraintsOp::verify() {
   // dictionary contains attributes (not ops), so we'd still need custom
   // verification for dictionary <--> KnobOp correspondence.
   // Rejecting duplicates is not just pedantic -- when this op is lowered to
-  // SMT, each KnobOp becomes an `smt.declare_const`. The SMT dialect creates
-  // a fresh symbolic constant per declaration regardless of the name string,
-  // so two KnobOps with the same name would silently introduce two independent
+  // SMT, each KnobOp becomes an `smt.declare_const`. The SMT dialect
+  // creates a fresh symbolic constant per declaration regardless of the name
+  // string, so two KnobOps with the same name would silently introduce two
+  // independent
   // solver variables where one was intended, producing incorrect constraints.
   DictionaryAttr knobs = getKnobsAttr();
   llvm::StringMap<Location> seenKnobs;
@@ -540,5 +610,41 @@ LogicalResult ConstraintsOp::verify() {
     }
   }
 
+  return success();
+}
+
+LogicalResult LookupOp::verify() {
+  if (getKeys().size() != getValues().size()) {
+    return emitOpError("keys and values must have the same size, got ")
+           << getKeys().size() << " keys and " << getValues().size()
+           << " values";
+  }
+  if (getKeys().empty()) {
+    return emitOpError("lookup table must be non-empty");
+  }
+  // Check for duplicate keys -- a duplicate would make the table ambiguous
+  // and could produce different behavior between direct evaluation and
+  // the chained smt.ite lowering.
+  llvm::SmallDenseSet<int64_t> seen;
+  for (int64_t key : getKeys()) {
+    if (!seen.insert(key).second) {
+      return emitOpError("duplicate key ") << key << " in lookup table";
+    }
+  }
+  return success();
+}
+
+LogicalResult AssertOp::verify() {
+  size_t placeholderCount = 0;
+  StringRef fmt = getMsg();
+  for (size_t pos = 0; (pos = fmt.find("{}", pos)) != StringRef::npos;
+       pos += 2) {
+    ++placeholderCount;
+  }
+  if (placeholderCount != getPrintArgs().size()) {
+    return emitOpError("format string has ")
+           << placeholderCount << " placeholder(s) but got "
+           << getPrintArgs().size() << " arg(s)";
+  }
   return success();
 }

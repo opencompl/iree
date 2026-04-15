@@ -40,8 +40,8 @@ public:
 /// Uses gpu.num_subgroups for worker count and gpu.subgroup_id for worker ID.
 /// Allocations at this scope use GPU shared memory space.
 struct SubgroupScopeModel
-    : public PCF::ScopeAttrInterface::ExternalModel<SubgroupScopeModel,
-                                                    GPU::SubgroupScopeAttr> {
+    : PCF::ScopeAttrInterface::ExternalModel<SubgroupScopeModel,
+                                             GPU::SubgroupScopeAttr> {
   SmallVector<Value> getWorkerCounts(Attribute attr, OpBuilder &builder,
                                      Location loc, int64_t numIds) const {
     assert(numIds >= 1 && "expected at least one requested worker count");
@@ -84,14 +84,19 @@ struct SubgroupScopeModel
                                         MLIRContext *context) const {
     return gpu::AddressSpaceAttr::get(context, gpu::AddressSpace::Workgroup);
   }
+
+  int64_t getNativeNumProcessorIds(Attribute attr) const {
+    // SubgroupScope natively provides a single 1D processor ID (subgroup_id).
+    return 1;
+  }
 };
 
 /// External model for LaneScopeAttr implementing ScopeAttrInterface.
 /// Uses gpu.subgroup_size for worker count and gpu.lane_id for worker ID.
 /// Allocations at this scope are not yet supported.
 struct LaneScopeModel
-    : public PCF::ScopeAttrInterface::ExternalModel<LaneScopeModel,
-                                                    GPU::LaneScopeAttr> {
+    : PCF::ScopeAttrInterface::ExternalModel<LaneScopeModel,
+                                             GPU::LaneScopeAttr> {
   SmallVector<Value> getWorkerCounts(Attribute attr, OpBuilder &builder,
                                      Location loc, int64_t numIds) const {
     assert(numIds >= 1 && "expected at least one requested worker count");
@@ -133,6 +138,11 @@ struct LaneScopeModel
     // Lane scope allocations are not supported - need custom allocation
     // logic to allocate + subview.
     return failure();
+  }
+
+  int64_t getNativeNumProcessorIds(Attribute attr) const {
+    // LaneScope natively provides a single 1D processor ID (lane_id).
+    return 1;
   }
 };
 
