@@ -780,6 +780,33 @@ util.func @elementwise_dynamic(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>) -
 
 // -----
 
+// CHECK-LABEL: util.func public @empty_with_noncollapsible_shape_add_inside_dispatch
+// CHECK-DAG:     %[[C0:.+]] = arith.constant 16 : index
+// CHECK-DAG:     %[[C1:.+]] = arith.constant 1 : index
+// CHECK-DAG:     %[[CAP0:.+]] = arith.addi %[[C0]], %[[C1]] : index
+// CHECK-DAG:     %[[CAP1:.+]] = arith.addi %[[CAP0]], %[[C1]] : index
+// CHECK:     %[[DISPATCH:.+]] = flow.dispatch.region -> (tensor<?xf32>{%[[COLLAPSED_DIM:.+]]})
+// CHECK-DAG:     %[[EMPTY:.+]] = tensor.empty(%[[EMPTY_DIM:.+]]) : tensor<?xf32>
+// CHECK:     %[[EXPAND:.+]] = tensor.expand_shape %[[DISPATCH]]
+// CHECK-SAME:    output_shape [%[[CAP0]], %[[CAP1]]]
+// CHECK:     util.return %[[EXPAND]] : tensor<?x?xf32>
+util.func public @empty_with_noncollapsible_shape_add_inside_dispatch() -> tensor<?x?xf32> {
+  %c16 = arith.constant 16 : index
+  %c1 = arith.constant 1 : index
+  %captured_dim = arith.addi %c16, %c1 : index
+  %captured_dim2 = arith.addi %captured_dim, %c1 : index
+  %dispatch = flow.dispatch.region -> (tensor<?x?xf32>{%captured_dim, %captured_dim2}) {
+    %dim = arith.addi %captured_dim, %captured_dim2 : index
+    %empty = tensor.empty(%dim, %captured_dim2) : tensor<?x?xf32>
+    %cst = arith.constant 1.000000e+00 : f32
+    %filled = linalg.fill ins(%cst : f32) outs(%empty : tensor<?x?xf32>) -> tensor<?x?xf32>
+    flow.return %filled : tensor<?x?xf32>
+  }
+  util.return %dispatch : tensor<?x?xf32>
+}
+
+// -----
+
 util.func public @masked_attention_dynamic(%arg0: index, %arg1: tensor<4x8x4x?x32x128xf16>, %arg2: tensor<4x?x32x8x128xf16>, %arg3: tensor<4x?x32x8x128xf16>) -> tensor<4x?x32x8x4x128xf16> {
   %c32 = arith.constant 32 : index
   %0 = arith.divsi %arg0, %c32 : index
@@ -953,3 +980,48 @@ util.func public @collapse_inside_scf(%arg0: tensor<128x24x48x384xbf16>) -> tens
 //       CHECK:   %[[GEN1:.+]] = linalg.generic
 //  CHECK-SAME:     ins(%[[GEN0]]
 //       CHECK:   tensor.parallel_insert_slice %[[GEN1]]
+
+// -----
+
+// Scatter-like generics with tensor.extract + linalg.index should NOT be
+// collapsed. Collapsing introduces expensive delinearization (div/mod) on
+// the index-computed extract indices.
+#map = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>
+util.func public @no_collapse_scatter_generic(%src: tensor<1x25x25x32xf16>) -> tensor<1x52x52x32xf16> {
+  %zero = arith.constant 0.000000e+00 : f16
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c25 = arith.constant 25 : index
+  %empty = tensor.empty() : tensor<1x52x52x32xf16>
+  %result = linalg.generic {
+    indexing_maps = [#map],
+    iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+  } outs(%empty : tensor<1x52x52x32xf16>) {
+  ^bb0(%out: f16):
+    %n = linalg.index 0 : index
+    %h = linalg.index 1 : index
+    %w = linalg.index 2 : index
+    %c_idx = linalg.index 3 : index
+    %sh = arith.subi %h, %c1 : index
+    %rem_h = arith.remsi %sh, %c2 : index
+    %div_h = arith.divsi %sh, %c2 : index
+    %ge = arith.cmpi sge, %sh, %c0 : index
+    %eq = arith.cmpi eq, %rem_h, %c0 : index
+    %lt = arith.cmpi slt, %div_h, %c25 : index
+    %valid = arith.andi %ge, %eq : i1
+    %valid2 = arith.andi %valid, %lt : i1
+    %clamped = arith.maxsi %div_h, %c0 : index
+    %extracted = tensor.extract %src[%n, %clamped, %w, %c_idx] : tensor<1x25x25x32xf16>
+    %val = arith.select %valid2, %extracted, %zero : f16
+    linalg.yield %val : f16
+  } -> tensor<1x52x52x32xf16>
+  util.return %result : tensor<1x52x52x32xf16>
+}
+
+// CHECK-LABEL: @no_collapse_scatter_generic
+// The generic should NOT be collapsed — it should retain 4 parallel dims.
+// CHECK:       linalg.generic
+// CHECK-SAME:    iterator_types = ["parallel", "parallel", "parallel", "parallel"]
+// CHECK:         tensor.extract
+// CHECK:         arith.select

@@ -221,6 +221,27 @@ static bool isEligibleForCollapse(Operation *op) {
     return false;
   }
 
+  // Skip collapse for scatter-like generics that use tensor.extract with
+  // linalg.index-based addressing. These are strided scatter patterns where
+  // 1D collapse introduces expensive delinearization (div/mod chains) that
+  // dominates execution. Keeping the multi-dimensional iteration space
+  // allows direct workgroup tiling without delinearization.
+  {
+    bool hasTensorExtract = false;
+    bool hasLinalgIndex = false;
+    genericOp.getBlock()->walk([&](Operation *inner) {
+      if (isa<tensor::ExtractOp>(inner)) {
+        hasTensorExtract = true;
+      }
+      if (isa<linalg::IndexOp>(inner)) {
+        hasLinalgIndex = true;
+      }
+    });
+    if (hasTensorExtract && hasLinalgIndex) {
+      return false;
+    }
+  }
+
   auto hasEncoding = [](Type type) -> bool {
     auto rankedTensorType = dyn_cast<RankedTensorType>(type);
     if (!rankedTensorType || !rankedTensorType.getEncoding()) {
@@ -269,6 +290,10 @@ static void populateReassocAndMaps(
       llvm::to_vector(llvm::seq<int64_t>(0, emptyOp.getType().getRank())))};
   resultMaps = {AffineMap::getMultiDimIdentityMap(emptyOp.getType().getRank(),
                                                   emptyOp.getContext())};
+  operandMaps.assign(emptyOp.getNumOperands(),
+                     AffineMap::get(emptyOp.getType().getRank(), 0,
+                                    ArrayRef<AffineExpr>{},
+                                    emptyOp.getContext()));
 }
 
 static void
