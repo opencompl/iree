@@ -2,3 +2,5 @@
 *.dbg.mlir
 *.instanced.mlir
 .cmade
+*.err
+*.out

@@ -9,7 +9,6 @@ iree-compile \
     --iree-hal-target-backends=rocm \
     --iree-rocm-target=gfx942 \
     --mlir-print-ir-after-all \
-    --debug=iree-codegen-vector-layout-analysis \
     exp_reduce_base_attention_fused.mlir > exp_reduce_base_attention_fused.out 2>exp_reduce_base_attention_fused.err
 
 # --mlir-print-ir-after-all \

@@ -12,9 +12,13 @@
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Passes.h"
 #include "iree/compiler/Codegen/Dialect/GPU/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
+#include "llvm/ADT/DenseMap.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
@@ -106,6 +110,135 @@ LogicalResult packToIntrinsic(linalg::LinalgOp linalgOp,
   setLoweringConfig(maybeResult->packedLinalgOp, loweringConfig);
   return success();
 }
+
+static Value createTruncInputGeneric(PatternRewriter &rewriter, Location loc,
+                                     Value input, FloatType resultElementType) {
+  auto inputType = cast<RankedTensorType>(input.getType());
+  auto resultType = RankedTensorType::get(inputType.getShape(),
+                                          resultElementType,
+                                          inputType.getEncoding());
+  auto empty = tensor::EmptyOp::create(
+      rewriter, loc, tensor::getMixedSizes(rewriter, loc, input),
+      resultElementType);
+  SmallVector<AffineMap> maps(
+      2, rewriter.getMultiDimIdentityMap(inputType.getRank()));
+  SmallVector<utils::IteratorType> iteratorTypes(
+      inputType.getRank(), utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+             rewriter, loc, TypeRange{resultType}, ValueRange{input},
+             ValueRange{empty}, maps, iteratorTypes,
+             [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
+               Value truncated = arith::TruncFOp::create(
+                   b, nestedLoc, resultElementType, args.front());
+               linalg::YieldOp::create(b, nestedLoc, truncated);
+             })
+      .getResult(0);
+}
+
+struct ExtractTruncFOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
+  using Base::Base;
+
+  ExtractTruncFOpsFromGeneric(MLIRContext *context)
+      : OpRewritePattern(context, /*benefit=*/2) {}
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
+                                PatternRewriter &rewriter) const override {
+    auto loweringConfig =
+        getLoweringConfig<IREE::GPU::LoweringConfigAttr>(genericOp);
+    if (!loweringConfig || !getMmaKind(loweringConfig) ||
+        !genericOp.hasPureTensorSemantics()) {
+      return failure();
+    }
+
+    Block &body = genericOp.getRegion().front();
+    DenseMap<unsigned, FloatType> extractedArgTypes;
+    SmallVector<Value> newOperands(genericOp->getOperands());
+
+    for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
+      unsigned operandIndex = inputOperand->getOperandNumber();
+      auto arg = body.getArgument(operandIndex);
+      if (arg.use_empty()) {
+        continue;
+      }
+
+      SmallVector<arith::TruncFOp> truncOps;
+      Type resultType;
+      bool allUsesAreTrunc = true;
+      for (Operation *user : arg.getUsers()) {
+        auto truncOp = dyn_cast<arith::TruncFOp>(user);
+        if (!truncOp) {
+          allUsesAreTrunc = false;
+          break;
+        }
+        if (resultType && truncOp.getType() != resultType) {
+          allUsesAreTrunc = false;
+          break;
+        }
+        resultType = truncOp.getType();
+        truncOps.push_back(truncOp);
+      }
+      if (!allUsesAreTrunc || truncOps.empty()) {
+        continue;
+      }
+
+      auto inputType = dyn_cast<RankedTensorType>(inputOperand->get().getType());
+      auto truncatedElementType = dyn_cast<FloatType>(resultType);
+      if (!inputType || !truncatedElementType) {
+        continue;
+      }
+
+      newOperands[operandIndex] = createTruncInputGeneric(
+          rewriter, genericOp.getLoc(), inputOperand->get(),
+          truncatedElementType);
+      extractedArgTypes[operandIndex] = truncatedElementType;
+    }
+
+    if (extractedArgTypes.empty()) {
+      return failure();
+    }
+
+    rewriter.setInsertionPoint(genericOp);
+    auto newLinalgOp = cast<linalg::LinalgOp>(mlir::cloneWithoutRegions(
+        rewriter, cast<linalg::LinalgOp>(genericOp.getOperation()),
+        genericOp->getResultTypes(), newOperands));
+    auto newGenericOp = cast<linalg::GenericOp>(newLinalgOp.getOperation());
+
+    SmallVector<Type> newArgTypes;
+    newArgTypes.reserve(body.getNumArguments());
+    for (auto [index, arg] : llvm::enumerate(body.getArguments())) {
+      auto it = extractedArgTypes.find(index);
+      newArgTypes.push_back(it != extractedArgTypes.end() ? it->second
+                                                          : arg.getType());
+    }
+    SmallVector<Location> argLocs(newArgTypes.size(), genericOp.getLoc());
+    Block *newBody =
+        rewriter.createBlock(&newGenericOp.getRegion(), {}, newArgTypes, argLocs);
+
+    IRMapping mapping;
+    for (auto [oldArg, newArg] :
+         llvm::zip_equal(body.getArguments(), newBody->getArguments())) {
+      mapping.map(oldArg, newArg);
+    }
+
+    rewriter.setInsertionPointToStart(newBody);
+    for (Operation &op : body.without_terminator()) {
+      auto truncOp = dyn_cast<arith::TruncFOp>(op);
+      if (truncOp) {
+        auto blockArg = dyn_cast<BlockArgument>(truncOp.getOperand());
+        if (blockArg && blockArg.getOwner() == &body &&
+            extractedArgTypes.contains(blockArg.getArgNumber())) {
+          mapping.map(truncOp.getResult(), mapping.lookup(blockArg));
+          continue;
+        }
+      }
+      rewriter.clone(op, mapping);
+    }
+    rewriter.clone(*body.getTerminator(), mapping);
+
+    rewriter.replaceOp(genericOp, newGenericOp.getResults());
+    return success();
+  }
+};
 
 struct ConvertToMultiMma final : OpInterfaceRewritePattern<linalg::LinalgOp> {
   using OpInterfaceRewritePattern::OpInterfaceRewritePattern;
@@ -281,6 +414,7 @@ void GPUPackToIntrinsicsPass::runOnOperation() {
   // intrinsic kinds.
   {
     RewritePatternSet patterns(context);
+    patterns.add<ExtractTruncFOpsFromGeneric>(context);
     patterns.add<ConvertToMultiMma>(context);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       funcOp.emitError() << "failed to convert linalg to multi-MMA inner_tiled";
