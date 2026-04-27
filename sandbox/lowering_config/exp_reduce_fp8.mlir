@@ -101,11 +101,13 @@ flow.executable private @executable_0 {
           subgroup_basis = [[1, 1, 2, 1, 1], [0, 1, 2, 3, 4]],
           mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F8E4M3FNUZ, col_major=true>
         }>}
-        ins(%S, %V : tensor<4x32x4096x4096xf8E4M3FNUZ>, tensor<4x32x4096x64xf8E4M3FNUZ>)
+        ins(%S, %V : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x64xf8E4M3FNUZ>)
         outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>)
       {
-      ^bb0(%ex : f8E4M3FNUZ, %v : f8E4M3FNUZ, %m : f32, %sum : f32, %acc : f32):
-        %trunc = arith.truncf %ex : f32 to f8E4M3FNUZ
+      ^bb0(%ex : f32, %v : f8E4M3FNUZ, %m : f32, %sum : f32, %acc : f32):
+        %fp8max = arith.constant 240.0 : f32
+        %scaled = arith.mulf %ex, %fp8max : f32
+        %trunc = arith.truncf %scaled : f32 to f8E4M3FNUZ
         %ex_ext = arith.extf %trunc : f8E4M3FNUZ to f32
         %v_ext = arith.extf %v : f8E4M3FNUZ to f32
         %nsum = arith.addf %ex, %sum : f32

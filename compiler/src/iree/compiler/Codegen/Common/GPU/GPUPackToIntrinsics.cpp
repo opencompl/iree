@@ -111,8 +111,14 @@ LogicalResult packToIntrinsic(linalg::LinalgOp linalgOp,
   return success();
 }
 
-static Value createTruncInputGeneric(PatternRewriter &rewriter, Location loc,
-                                     Value input, FloatType resultElementType) {
+static bool isExtractableElementwiseOp(Operation *op) {
+  if (isa<arith::ExtFOp>(op)) return false;
+  return op->getNumOperands() == 1 && op->getNumResults() == 1;
+}
+
+static Value createElementwiseInputGeneric(PatternRewriter &rewriter, Location loc,
+                                           Value input, Type resultElementType,
+                                           Operation *elementwiseOp) {
   auto inputType = cast<RankedTensorType>(input.getType());
   auto resultType = RankedTensorType::get(inputType.getShape(),
                                           resultElementType,
@@ -128,17 +134,17 @@ static Value createTruncInputGeneric(PatternRewriter &rewriter, Location loc,
              rewriter, loc, TypeRange{resultType}, ValueRange{input},
              ValueRange{empty}, maps, iteratorTypes,
              [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-               Value truncated = arith::TruncFOp::create(
-                   b, nestedLoc, resultElementType, args.front());
-               linalg::YieldOp::create(b, nestedLoc, truncated);
+               auto *clonedOp = b.clone(*elementwiseOp);
+               clonedOp->setOperand(0, args.front());
+               linalg::YieldOp::create(b, nestedLoc, clonedOp->getResult(0));
              })
       .getResult(0);
 }
 
-struct ExtractTruncFOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
+struct ExtractElementwiseOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
   using Base::Base;
 
-  ExtractTruncFOpsFromGeneric(MLIRContext *context)
+  ExtractElementwiseOpsFromGeneric(MLIRContext *context)
       : OpRewritePattern(context, /*benefit=*/2) {}
 
   LogicalResult matchAndRewrite(linalg::GenericOp genericOp,
@@ -151,7 +157,8 @@ struct ExtractTruncFOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
     }
 
     Block &body = genericOp.getRegion().front();
-    DenseMap<unsigned, FloatType> extractedArgTypes;
+    DenseMap<unsigned, Type> extractedArgTypes;
+    DenseMap<unsigned, Operation *> extractedOps;
     SmallVector<Value> newOperands(genericOp->getOperands());
 
     for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
@@ -161,36 +168,35 @@ struct ExtractTruncFOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
         continue;
       }
 
-      SmallVector<arith::TruncFOp> truncOps;
+      SmallVector<Operation *> elementwiseOps;
       Type resultType;
-      bool allUsesAreTrunc = true;
+      bool allUsesAreElementwise = true;
       for (Operation *user : arg.getUsers()) {
-        auto truncOp = dyn_cast<arith::TruncFOp>(user);
-        if (!truncOp) {
-          allUsesAreTrunc = false;
+        if (!isExtractableElementwiseOp(user)) {
+          allUsesAreElementwise = false;
           break;
         }
-        if (resultType && truncOp.getType() != resultType) {
-          allUsesAreTrunc = false;
+        if (resultType && user->getResult(0).getType() != resultType) {
+          allUsesAreElementwise = false;
           break;
         }
-        resultType = truncOp.getType();
-        truncOps.push_back(truncOp);
+        resultType = user->getResult(0).getType();
+        elementwiseOps.push_back(user);
       }
-      if (!allUsesAreTrunc || truncOps.empty()) {
+      if (!allUsesAreElementwise || elementwiseOps.empty()) {
         continue;
       }
 
       auto inputType = dyn_cast<RankedTensorType>(inputOperand->get().getType());
-      auto truncatedElementType = dyn_cast<FloatType>(resultType);
-      if (!inputType || !truncatedElementType) {
+      if (!inputType) {
         continue;
       }
 
-      newOperands[operandIndex] = createTruncInputGeneric(
+      newOperands[operandIndex] = createElementwiseInputGeneric(
           rewriter, genericOp.getLoc(), inputOperand->get(),
-          truncatedElementType);
-      extractedArgTypes[operandIndex] = truncatedElementType;
+          resultType, elementwiseOps[0]);
+      extractedArgTypes[operandIndex] = resultType;
+      extractedOps[operandIndex] = elementwiseOps[0];
     }
 
     if (extractedArgTypes.empty()) {
@@ -222,12 +228,11 @@ struct ExtractTruncFOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
 
     rewriter.setInsertionPointToStart(newBody);
     for (Operation &op : body.without_terminator()) {
-      auto truncOp = dyn_cast<arith::TruncFOp>(op);
-      if (truncOp) {
-        auto blockArg = dyn_cast<BlockArgument>(truncOp.getOperand());
+      if (isExtractableElementwiseOp(&op)) {
+        auto blockArg = dyn_cast<BlockArgument>(op.getOperand(0));
         if (blockArg && blockArg.getOwner() == &body &&
             extractedArgTypes.contains(blockArg.getArgNumber())) {
-          mapping.map(truncOp.getResult(), mapping.lookup(blockArg));
+          mapping.map(op.getResult(0), mapping.lookup(blockArg));
           continue;
         }
       }
@@ -414,7 +419,7 @@ void GPUPackToIntrinsicsPass::runOnOperation() {
   // intrinsic kinds.
   {
     RewritePatternSet patterns(context);
-    patterns.add<ExtractTruncFOpsFromGeneric>(context);
+    patterns.add<ExtractElementwiseOpsFromGeneric>(context);
     patterns.add<ConvertToMultiMma>(context);
     if (failed(applyPatternsGreedily(funcOp, std::move(patterns)))) {
       funcOp.emitError() << "failed to convert linalg to multi-MMA inner_tiled";
