@@ -1006,9 +1006,11 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
           linalg::YieldOp::create(b, loc, regionMapping.lookup(result));
         });
 
-    // HACK: Set layout on operation that looks like a contraction.
+    // HACK: Set layout on operation that has contraction indexing. Some
+    // contraction bodies contain elementwise casts/scales that are extracted
+    // later, so do not require the full contraction op interface match here.
     if (loweringConfig) {
-      if (linalg::isaContractionOpInterface(newOp)) {
+      if (succeeded(linalg::inferContractionDims(newOp))) {
         setLoweringConfig(newOp, loweringConfig);
       }
     }

@@ -4,6 +4,7 @@
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+#include <optional>
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/GPULoweringConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
@@ -17,8 +18,8 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Support/LogicalResult.h"
@@ -111,37 +112,78 @@ LogicalResult packToIntrinsic(linalg::LinalgOp linalgOp,
   return success();
 }
 
-static bool isExtractableElementwiseOp(Operation *op) {
-  if (isa<arith::ExtFOp>(op)) return false;
-  return op->getNumOperands() == 1 && op->getNumResults() == 1;
+static std::optional<unsigned>
+getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
+                                         unsigned argNumber) {
+  if (isa<arith::ExtFOp>(op)) {
+    return std::nullopt;
+  }
+  if (op->getNumResults() != 1 || op->getNumOperands() > 2) {
+    return std::nullopt;
+  }
+
+  std::optional<unsigned> blockArgOperandIndex;
+  for (auto [operandIndex, operand] : llvm::enumerate(op->getOperands())) {
+    auto blockArg = dyn_cast<BlockArgument>(operand);
+    if (blockArg && blockArg.getOwner() == &body &&
+        blockArg.getArgNumber() == argNumber) {
+      if (blockArgOperandIndex) {
+        return std::nullopt;
+      }
+      blockArgOperandIndex = operandIndex;
+      continue;
+    }
+
+    if (op->getNumOperands() != 2 ||
+        !operand.getDefiningOp<arith::ConstantOp>()) {
+      return std::nullopt;
+    }
+  }
+
+  return blockArgOperandIndex;
 }
 
-static Value createElementwiseInputGeneric(PatternRewriter &rewriter, Location loc,
-                                           Value input, Type resultElementType,
-                                           Operation *elementwiseOp) {
+static Value createElementwiseInputGeneric(PatternRewriter &rewriter,
+                                           Location loc, Value input,
+                                           Type resultElementType,
+                                           Operation *elementwiseOp,
+                                           unsigned blockArgOperandIndex) {
   auto inputType = cast<RankedTensorType>(input.getType());
-  auto resultType = RankedTensorType::get(inputType.getShape(),
-                                          resultElementType,
-                                          inputType.getEncoding());
+  auto resultType = RankedTensorType::get(
+      inputType.getShape(), resultElementType, inputType.getEncoding());
   auto empty = tensor::EmptyOp::create(
       rewriter, loc, tensor::getMixedSizes(rewriter, loc, input),
       resultElementType);
   SmallVector<AffineMap> maps(
       2, rewriter.getMultiDimIdentityMap(inputType.getRank()));
-  SmallVector<utils::IteratorType> iteratorTypes(
-      inputType.getRank(), utils::IteratorType::parallel);
+  SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
+                                                 utils::IteratorType::parallel);
   return linalg::GenericOp::create(
              rewriter, loc, TypeRange{resultType}, ValueRange{input},
              ValueRange{empty}, maps, iteratorTypes,
              [&](OpBuilder &b, Location nestedLoc, ValueRange args) {
-               auto *clonedOp = b.clone(*elementwiseOp);
-               clonedOp->setOperand(0, args.front());
+               IRMapping mapping;
+               mapping.map(elementwiseOp->getOperand(blockArgOperandIndex),
+                           args.front());
+               for (Value operand : elementwiseOp->getOperands()) {
+                 if (mapping.lookupOrNull(operand)) {
+                   continue;
+                 }
+                 auto constantOp = operand.getDefiningOp<arith::ConstantOp>();
+                 if (constantOp &&
+                     constantOp->getBlock() == elementwiseOp->getBlock()) {
+                   Operation *clonedConstant = b.clone(*constantOp);
+                   mapping.map(operand, clonedConstant->getResult(0));
+                 }
+               }
+               auto *clonedOp = b.clone(*elementwiseOp, mapping);
                linalg::YieldOp::create(b, nestedLoc, clonedOp->getResult(0));
              })
       .getResult(0);
 }
 
-struct ExtractElementwiseOpsFromGeneric final : OpRewritePattern<linalg::GenericOp> {
+struct ExtractElementwiseOpsFromGeneric final
+    : OpRewritePattern<linalg::GenericOp> {
   using Base::Base;
 
   ExtractElementwiseOpsFromGeneric(MLIRContext *context)
@@ -157,8 +199,10 @@ struct ExtractElementwiseOpsFromGeneric final : OpRewritePattern<linalg::Generic
     }
 
     Block &body = genericOp.getRegion().front();
-    DenseMap<unsigned, Type> extractedArgTypes;
-    DenseMap<unsigned, Operation *> extractedOps;
+    unsigned extractedOperandIndex = 0;
+    unsigned extractedBlockArgOperandIndex = 0;
+    Type extractedArgType;
+    Operation *extractedOp = nullptr;
     SmallVector<Value> newOperands(genericOp->getOperands());
 
     for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
@@ -168,38 +212,44 @@ struct ExtractElementwiseOpsFromGeneric final : OpRewritePattern<linalg::Generic
         continue;
       }
 
-      SmallVector<Operation *> elementwiseOps;
-      Type resultType;
-      bool allUsesAreElementwise = true;
+      Operation *singleUser = nullptr;
       for (Operation *user : arg.getUsers()) {
-        if (!isExtractableElementwiseOp(user)) {
-          allUsesAreElementwise = false;
+        if (singleUser) {
+          singleUser = nullptr;
           break;
         }
-        if (resultType && user->getResult(0).getType() != resultType) {
-          allUsesAreElementwise = false;
-          break;
-        }
-        resultType = user->getResult(0).getType();
-        elementwiseOps.push_back(user);
+        singleUser = user;
       }
-      if (!allUsesAreElementwise || elementwiseOps.empty()) {
+      if (!singleUser) {
         continue;
       }
 
-      auto inputType = dyn_cast<RankedTensorType>(inputOperand->get().getType());
+      auto inputType =
+          dyn_cast<RankedTensorType>(inputOperand->get().getType());
       if (!inputType) {
         continue;
       }
 
+      std::optional<unsigned> blockArgOperandIndex =
+          getExtractableElementwiseBlockArgOperand(singleUser, body,
+                                                   operandIndex);
+      if (!blockArgOperandIndex) {
+        continue;
+      }
+
+      rewriter.setInsertionPoint(genericOp);
       newOperands[operandIndex] = createElementwiseInputGeneric(
           rewriter, genericOp.getLoc(), inputOperand->get(),
-          resultType, elementwiseOps[0]);
-      extractedArgTypes[operandIndex] = resultType;
-      extractedOps[operandIndex] = elementwiseOps[0];
+          singleUser->getResult(0).getType(), singleUser,
+          *blockArgOperandIndex);
+      extractedOperandIndex = operandIndex;
+      extractedBlockArgOperandIndex = *blockArgOperandIndex;
+      extractedArgType = singleUser->getResult(0).getType();
+      extractedOp = singleUser;
+      break;
     }
 
-    if (extractedArgTypes.empty()) {
+    if (!extractedOp) {
       return failure();
     }
 
@@ -212,13 +262,12 @@ struct ExtractElementwiseOpsFromGeneric final : OpRewritePattern<linalg::Generic
     SmallVector<Type> newArgTypes;
     newArgTypes.reserve(body.getNumArguments());
     for (auto [index, arg] : llvm::enumerate(body.getArguments())) {
-      auto it = extractedArgTypes.find(index);
-      newArgTypes.push_back(it != extractedArgTypes.end() ? it->second
-                                                          : arg.getType());
+      newArgTypes.push_back(index == extractedOperandIndex ? extractedArgType
+                                                           : arg.getType());
     }
     SmallVector<Location> argLocs(newArgTypes.size(), genericOp.getLoc());
-    Block *newBody =
-        rewriter.createBlock(&newGenericOp.getRegion(), {}, newArgTypes, argLocs);
+    Block *newBody = rewriter.createBlock(&newGenericOp.getRegion(), {},
+                                          newArgTypes, argLocs);
 
     IRMapping mapping;
     for (auto [oldArg, newArg] :
@@ -228,13 +277,10 @@ struct ExtractElementwiseOpsFromGeneric final : OpRewritePattern<linalg::Generic
 
     rewriter.setInsertionPointToStart(newBody);
     for (Operation &op : body.without_terminator()) {
-      if (isExtractableElementwiseOp(&op)) {
-        auto blockArg = dyn_cast<BlockArgument>(op.getOperand(0));
-        if (blockArg && blockArg.getOwner() == &body &&
-            extractedArgTypes.contains(blockArg.getArgNumber())) {
-          mapping.map(op.getResult(0), mapping.lookup(blockArg));
-          continue;
-        }
+      if (&op == extractedOp) {
+        mapping.map(op.getResult(0), mapping.lookup(op.getOperand(
+                                         extractedBlockArgOperandIndex)));
+        continue;
       }
       rewriter.clone(op, mapping);
     }
