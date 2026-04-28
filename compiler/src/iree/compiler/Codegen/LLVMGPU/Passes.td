@@ -60,11 +60,6 @@ def LLVMGPULinkExecutablesPass :
   ];
 }
 
-def LLVMGPUExtractMMAElementwiseInputsPass :
-    InterfacePass<"iree-llvmgpu-extract-mma-elementwise-inputs", "mlir::FunctionOpInterface"> {
-  let summary = "Extract elementwise input operations from linalg ops before MMA layout configuration";
-}
-
 def LLVMGPULowerExecutableTargetPass :
     InterfacePass<"iree-llvmgpu-lower-executable-target", "mlir::FunctionOpInterface"> {
   let summary = "Perform lowering of executable target using one of the IREE::HAL::DispatchLoweringPassPipeline";

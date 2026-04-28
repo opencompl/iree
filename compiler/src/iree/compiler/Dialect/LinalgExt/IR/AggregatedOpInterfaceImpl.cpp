@@ -11,6 +11,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "llvm/ADT/SetOperations.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
@@ -882,6 +883,68 @@ struct UsedOperationsAndBlockArguments {
   SetVector<Operation *> usedOperations;
 };
 
+struct ScalingTruncExtraction {
+  arith::ScalingTruncFOp truncOp;
+  BlockArgument sourceArg;
+  Value scale;
+  SmallPtrSet<Operation *, 4> scaleExpressionOps;
+};
+
+struct ElementwiseInputExtraction {
+  Operation *elementwiseOp = nullptr;
+  unsigned operandIndex = 0;
+  unsigned blockArgOperandIndex = 0;
+};
+
+static bool
+collectBlockLocalScalarExpressionOps(Value value, Block &body,
+                                     SmallPtrSetImpl<Operation *> &ops) {
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getBlock() != &body) {
+    return true;
+  }
+  if (!def->hasTrait<OpTrait::OneResult>() || def->getNumRegions() != 0) {
+    return false;
+  }
+  for (Value operand : def->getOperands()) {
+    if (isa<BlockArgument>(operand)) {
+      return false;
+    }
+    if (!collectBlockLocalScalarExpressionOps(operand, body, ops)) {
+      return false;
+    }
+  }
+  ops.insert(def);
+  return true;
+}
+
+static FailureOr<Value> cloneScalarExpression(OpBuilder &builder, Value value,
+                                              Block &body, IRMapping &mapping) {
+  if (Value mapped = mapping.lookupOrNull(value)) {
+    return mapped;
+  }
+  Operation *def = value.getDefiningOp();
+  if (!def || def->getBlock() != &body) {
+    return value;
+  }
+  if (!def->hasTrait<OpTrait::OneResult>() || def->getNumRegions() != 0) {
+    return failure();
+  }
+
+  IRMapping operandsMapping;
+  for (Value operand : def->getOperands()) {
+    FailureOr<Value> clonedOperand =
+        cloneScalarExpression(builder, operand, body, mapping);
+    if (failed(clonedOperand)) {
+      return failure();
+    }
+    operandsMapping.map(operand, *clonedOperand);
+  }
+  Operation *cloned = builder.clone(*def, operandsMapping);
+  mapping.map(value, cloned->getResult(0));
+  return cloned->getResult(0);
+}
+
 /// For a given `resultNumber` in a linalg::GenericOp, this op scans the
 /// GenericOp's body for the block arguments and operations that are involved
 /// in its computation.
@@ -976,6 +1039,417 @@ dropIteratorDims(AffineMap map,
                         map.getContext());
 }
 
+static llvm::SmallDenseSet<int64_t>
+inferKBDimsForLhsScale(linalg::GenericOp genericOp) {
+  constexpr unsigned lhsOperandIndex = 0;
+  constexpr unsigned rhsOperandIndex = 1;
+  constexpr unsigned rhsScaleOperandIndex = 2;
+  if (genericOp.getNumDpsInputs() <= rhsScaleOperandIndex) {
+    return {};
+  }
+
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators =
+      genericOp.getIteratorTypesArray();
+  llvm::SmallDenseSet<int64_t> lhsRed = getIndexingMapDimsWithIteratorType(
+      maps[lhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsScaleRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsScaleOperandIndex], iterators, utils::IteratorType::reduction);
+
+  llvm::SmallDenseSet<int64_t> kBDims = lhsRed;
+  llvm::set_intersect(kBDims, rhsRed);
+  llvm::set_subtract(kBDims, rhsScaleRed);
+  if (!kBDims.empty()) {
+    return kBDims;
+  }
+
+  // If the flat scaled reduction has already been split, the RHS scale can
+  // still carry both reduction dims. The LHS scale synthesized from the exp
+  // value is shared across the innermost block dimension.
+  llvm::SmallDenseSet<int64_t> commonDataRed = lhsRed;
+  llvm::set_intersect(commonDataRed, rhsRed);
+  if (commonDataRed.size() > 1) {
+    kBDims.insert(*llvm::max_element(commonDataRed));
+  }
+  return kBDims;
+}
+
+static std::optional<unsigned>
+getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
+                                         unsigned argNumber) {
+  if (isa<arith::ExtFOp, arith::ScalingExtFOp, arith::ScalingTruncFOp>(op)) {
+    return std::nullopt;
+  }
+  if (op->getNumResults() != 1 || op->getNumOperands() > 2 ||
+      op->getNumRegions() != 0) {
+    return std::nullopt;
+  }
+
+  std::optional<unsigned> blockArgOperandIndex;
+  for (auto [operandIndex, operand] : llvm::enumerate(op->getOperands())) {
+    auto blockArg = dyn_cast<BlockArgument>(operand);
+    if (blockArg && blockArg.getOwner() == &body &&
+        blockArg.getArgNumber() == argNumber) {
+      if (blockArgOperandIndex) {
+        return std::nullopt;
+      }
+      blockArgOperandIndex = operandIndex;
+      continue;
+    }
+
+    if (op->getNumOperands() != 2 ||
+        !operand.getDefiningOp<arith::ConstantOp>()) {
+      return std::nullopt;
+    }
+  }
+
+  return blockArgOperandIndex;
+}
+
+static std::optional<ElementwiseInputExtraction>
+matchElementwiseInputExtraction(linalg::GenericOp genericOp) {
+  if (!genericOp.hasPureTensorSemantics()) {
+    return std::nullopt;
+  }
+
+  Block &body = genericOp.getRegion().front();
+  for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
+    unsigned operandIndex = inputOperand->getOperandNumber();
+    auto inputType = dyn_cast<RankedTensorType>(inputOperand->get().getType());
+    if (!inputType) {
+      continue;
+    }
+    BlockArgument arg = body.getArgument(operandIndex);
+    if (arg.use_empty()) {
+      continue;
+    }
+
+    Operation *singleUser = nullptr;
+    for (Operation *user : arg.getUsers()) {
+      if (singleUser) {
+        singleUser = nullptr;
+        break;
+      }
+      singleUser = user;
+    }
+    if (!singleUser) {
+      continue;
+    }
+
+    std::optional<unsigned> blockArgOperandIndex =
+        getExtractableElementwiseBlockArgOperand(singleUser, body,
+                                                 operandIndex);
+    if (!blockArgOperandIndex) {
+      continue;
+    }
+    return ElementwiseInputExtraction{singleUser, operandIndex,
+                                      *blockArgOperandIndex};
+  }
+
+  return std::nullopt;
+}
+
+static Value createElementwiseInputGeneric(RewriterBase &rewriter,
+                                           Location loc, Value input,
+                                           Type resultElementType,
+                                           Operation *elementwiseOp,
+                                           unsigned blockArgOperandIndex) {
+  auto inputType = cast<RankedTensorType>(input.getType());
+  auto resultType = RankedTensorType::get(
+      inputType.getShape(), resultElementType, inputType.getEncoding());
+  auto mixedSizes = tensor::getMixedSizes(rewriter, loc, input);
+  Value empty =
+      inputType.getEncoding()
+          ? tensor::EmptyOp::create(rewriter, loc, mixedSizes,
+                                    resultElementType, inputType.getEncoding())
+          : tensor::EmptyOp::create(rewriter, loc, mixedSizes,
+                                    resultElementType);
+  SmallVector<AffineMap> maps(
+      2, rewriter.getMultiDimIdentityMap(inputType.getRank()));
+  SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
+                                                 utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+             rewriter, loc, TypeRange{resultType}, ValueRange{input},
+             ValueRange{empty}, maps, iteratorTypes,
+             [&](OpBuilder &builder, Location nestedLoc, ValueRange args) {
+               IRMapping mapping;
+               mapping.map(elementwiseOp->getOperand(blockArgOperandIndex),
+                           args.front());
+               for (Value operand : elementwiseOp->getOperands()) {
+                 if (mapping.lookupOrNull(operand)) {
+                   continue;
+                 }
+                 auto constantOp = operand.getDefiningOp<arith::ConstantOp>();
+                 if (constantOp &&
+                     constantOp->getBlock() == elementwiseOp->getBlock()) {
+                   Operation *clonedConstant = builder.clone(*constantOp);
+                   mapping.map(operand, clonedConstant->getResult(0));
+                 }
+               }
+               Operation *cloned = builder.clone(*elementwiseOp, mapping);
+               linalg::YieldOp::create(builder, nestedLoc,
+                                       cloned->getResult(0));
+             })
+      .getResult(0);
+}
+
+static FailureOr<linalg::GenericOp>
+extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
+  std::optional<ElementwiseInputExtraction> extraction =
+      matchElementwiseInputExtraction(genericOp);
+  if (!extraction) {
+    return failure();
+  }
+
+  Block &body = genericOp.getRegion().front();
+  SmallVector<Value> newOperands(genericOp->getOperands());
+  OpOperand *inputOperand =
+      genericOp.getDpsInputOperand(extraction->operandIndex);
+  rewriter.setInsertionPoint(genericOp);
+  newOperands[extraction->operandIndex] = createElementwiseInputGeneric(
+      rewriter, genericOp.getLoc(), inputOperand->get(),
+      extraction->elementwiseOp->getResult(0).getType(),
+      extraction->elementwiseOp, extraction->blockArgOperandIndex);
+
+  auto newLinalgOp = cast<linalg::LinalgOp>(mlir::cloneWithoutRegions(
+      rewriter, cast<linalg::LinalgOp>(genericOp.getOperation()),
+      genericOp->getResultTypes(), newOperands));
+  auto newGenericOp = cast<linalg::GenericOp>(newLinalgOp.getOperation());
+
+  SmallVector<Type> newArgTypes;
+  newArgTypes.reserve(body.getNumArguments());
+  for (auto [index, arg] : llvm::enumerate(body.getArguments())) {
+    newArgTypes.push_back(index == extraction->operandIndex
+                              ? extraction->elementwiseOp->getResult(0).getType()
+                              : arg.getType());
+  }
+  SmallVector<Location> argLocs(newArgTypes.size(), genericOp.getLoc());
+  Block *newBody =
+      rewriter.createBlock(&newGenericOp.getRegion(), {}, newArgTypes, argLocs);
+
+  IRMapping mapping;
+  for (auto [oldArg, newArg] :
+       llvm::zip_equal(body.getArguments(), newBody->getArguments())) {
+    mapping.map(oldArg, newArg);
+  }
+
+  rewriter.setInsertionPointToStart(newBody);
+  for (Operation &op : body.without_terminator()) {
+    if (&op == extraction->elementwiseOp) {
+      mapping.map(op.getResult(0),
+                  mapping.lookup(
+                      op.getOperand(extraction->blockArgOperandIndex)));
+      continue;
+    }
+    rewriter.clone(op, mapping);
+  }
+  rewriter.clone(*body.getTerminator(), mapping);
+
+  rewriter.replaceOp(genericOp, newGenericOp.getResults());
+  return newGenericOp;
+}
+
+static AffineMap getScaleAccessMapForInput(
+    MLIRContext *context, AffineMap inputMap,
+    const llvm::SmallDenseSet<int64_t> &droppedIteratorDims) {
+  SmallVector<AffineExpr> results;
+  for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || droppedIteratorDims.contains(dimExpr.getPosition())) {
+      continue;
+    }
+    results.push_back(getAffineDimExpr(inputDim, context));
+  }
+  return AffineMap::get(inputMap.getNumResults(), /*symbolCount=*/0, results,
+                        context);
+}
+
+static std::optional<ScalingTruncExtraction>
+matchLhsScalingTruncExtraction(linalg::GenericOp genericOp) {
+  if (!genericOp.hasPureTensorSemantics() || genericOp.getNumDpsInputs() != 3 ||
+      genericOp.getNumDpsInits() != 1) {
+    return std::nullopt;
+  }
+
+  Block &body = genericOp.getRegion().front();
+  for (Operation &op : body.without_terminator()) {
+    auto truncOp = dyn_cast<arith::ScalingTruncFOp>(&op);
+    if (!truncOp) {
+      continue;
+    }
+
+    auto sourceArg = dyn_cast<BlockArgument>(truncOp.getIn());
+    if (!sourceArg || sourceArg.getOwner() != &body ||
+        sourceArg.getArgNumber() != 0 || !sourceArg.hasOneUse() ||
+        !truncOp->hasOneUse()) {
+      continue;
+    }
+
+    auto extOp = dyn_cast<arith::ScalingExtFOp>(*truncOp->user_begin());
+    if (!extOp || extOp.getScale() != truncOp.getScale()) {
+      continue;
+    }
+
+    ScalingTruncExtraction extraction;
+    extraction.truncOp = truncOp;
+    extraction.sourceArg = sourceArg;
+    extraction.scale = truncOp.getScale();
+    if (!collectBlockLocalScalarExpressionOps(extraction.scale, body,
+                                              extraction.scaleExpressionOps)) {
+      continue;
+    }
+    return extraction;
+  }
+
+  return std::nullopt;
+}
+
+static Value createScaleTensor(
+    RewriterBase &rewriter, Location loc, Value input, AffineMap inputMap,
+    const llvm::SmallDenseSet<int64_t> &droppedIteratorDims, Value scale,
+    Block &sourceBody) {
+  auto inputType = cast<RankedTensorType>(input.getType());
+  Type scaleElementType = getElementTypeOrSelf(scale.getType());
+  SmallVector<int64_t> scaleShape;
+  SmallVector<OpFoldResult> scaleMixedSizes;
+  auto inputMixedSizes = tensor::getMixedSizes(rewriter, loc, input);
+  for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || droppedIteratorDims.contains(dimExpr.getPosition())) {
+      continue;
+    }
+    scaleShape.push_back(inputType.getDimSize(inputDim));
+    scaleMixedSizes.push_back(inputMixedSizes[inputDim]);
+  }
+  auto scaleType = RankedTensorType::get(scaleShape, scaleElementType,
+                                         inputType.getEncoding());
+  Value empty =
+      inputType.getEncoding()
+          ? tensor::EmptyOp::create(rewriter, loc, scaleMixedSizes,
+                                    scaleElementType,
+                                    inputType.getEncoding())
+          : tensor::EmptyOp::create(rewriter, loc, scaleMixedSizes,
+                                    scaleElementType);
+  AffineMap map = rewriter.getMultiDimIdentityMap(scaleType.getRank());
+  SmallVector<utils::IteratorType> iteratorTypes(scaleType.getRank(),
+                                                 utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+             rewriter, loc, TypeRange{scaleType}, ValueRange{},
+             ValueRange{empty}, ArrayRef<AffineMap>{map}, iteratorTypes,
+             [&](OpBuilder &builder, Location nestedLoc, ValueRange args) {
+               IRMapping mapping;
+               FailureOr<Value> clonedScale =
+                   cloneScalarExpression(builder, scale, sourceBody, mapping);
+               if (failed(clonedScale)) {
+                 return;
+               }
+               linalg::YieldOp::create(builder, nestedLoc, *clonedScale);
+             })
+      .getResult(0);
+}
+
+static Value createTruncatedInputTensor(RewriterBase &rewriter, Location loc,
+                                        Value input, Value scaleTensor,
+                                        AffineMap scaleAccessMap,
+                                        arith::ScalingTruncFOp truncOp) {
+  auto inputType = cast<RankedTensorType>(input.getType());
+  Type resultElementType = getElementTypeOrSelf(truncOp.getOut().getType());
+  auto resultType = RankedTensorType::get(
+      inputType.getShape(), resultElementType, inputType.getEncoding());
+  auto mixedSizes = tensor::getMixedSizes(rewriter, loc, input);
+  Value empty =
+      inputType.getEncoding()
+          ? tensor::EmptyOp::create(rewriter, loc, mixedSizes,
+                                    resultElementType, inputType.getEncoding())
+          : tensor::EmptyOp::create(rewriter, loc, mixedSizes,
+                                    resultElementType);
+  AffineMap map = rewriter.getMultiDimIdentityMap(inputType.getRank());
+  SmallVector<AffineMap> maps{map, scaleAccessMap, map};
+  SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
+                                                 utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+             rewriter, loc, TypeRange{resultType},
+             ValueRange{input, scaleTensor}, ValueRange{empty}, maps,
+             iteratorTypes,
+             [&](OpBuilder &builder, Location nestedLoc, ValueRange args) {
+               auto trunc = arith::ScalingTruncFOp::create(
+                   builder, nestedLoc, resultElementType, args[0], args[1],
+                   truncOp.getRoundingmodeAttr(), truncOp.getFastmathAttr());
+               linalg::YieldOp::create(builder, nestedLoc, trunc.getResult());
+             })
+      .getResult(0);
+}
+
+static FailureOr<linalg::GenericOp>
+extractScalingTruncFromExpReductionPV(RewriterBase &rewriter,
+                                      linalg::GenericOp genericOp) {
+  std::optional<ScalingTruncExtraction> extraction =
+      matchLhsScalingTruncExtraction(genericOp);
+  if (!extraction) {
+    return failure();
+  }
+
+  Location loc = genericOp.getLoc();
+  SmallVector<Value> oldInputs = genericOp.getDpsInputs();
+  SmallVector<AffineMap> oldMaps = genericOp.getIndexingMapsArray();
+  llvm::SmallDenseSet<int64_t> droppedIteratorDims =
+      inferKBDimsForLhsScale(genericOp);
+  AffineMap lhsScaleMap = dropIteratorDims(oldMaps[0], droppedIteratorDims);
+  AffineMap scaleAccessMap = getScaleAccessMapForInput(
+      rewriter.getContext(), oldMaps[0], droppedIteratorDims);
+
+  rewriter.setInsertionPoint(genericOp);
+  Value scaleTensor =
+      createScaleTensor(rewriter, loc, oldInputs[0], oldMaps[0],
+                        droppedIteratorDims, extraction->scale,
+                        genericOp.getRegion().front());
+  Value truncatedInput = createTruncatedInputTensor(
+      rewriter, loc, oldInputs[0], scaleTensor, scaleAccessMap,
+      extraction->truncOp);
+
+  SmallVector<Value> newInputs{truncatedInput, oldInputs[1], scaleTensor,
+                               oldInputs[2]};
+  SmallVector<AffineMap> newMaps{oldMaps[0], oldMaps[1], lhsScaleMap,
+                                 oldMaps[2], oldMaps[3]};
+
+  auto newGenericOp = linalg::GenericOp::create(
+      rewriter, loc, genericOp->getResultTypes(), newInputs,
+      genericOp.getDpsInits(), newMaps, genericOp.getIteratorTypesArray());
+
+  Block &oldBody = genericOp.getRegion().front();
+  SmallVector<Type> newArgTypes{
+      getElementTypeOrSelf(truncatedInput.getType()),
+      oldBody.getArgument(1).getType(), getElementTypeOrSelf(scaleTensor),
+      oldBody.getArgument(2).getType(), oldBody.getArgument(3).getType()};
+  SmallVector<Location> argLocs(newArgTypes.size(), loc);
+  Block *newBody =
+      rewriter.createBlock(&newGenericOp.getRegion(), {}, newArgTypes, argLocs);
+
+  IRMapping mapping;
+  mapping.map(oldBody.getArgument(0), newBody->getArgument(0));
+  mapping.map(oldBody.getArgument(1), newBody->getArgument(1));
+  mapping.map(extraction->scale, newBody->getArgument(2));
+  mapping.map(oldBody.getArgument(2), newBody->getArgument(3));
+  mapping.map(oldBody.getArgument(3), newBody->getArgument(4));
+  mapping.map(extraction->truncOp.getResult(), newBody->getArgument(0));
+
+  rewriter.setInsertionPointToStart(newBody);
+  Operation *truncOperation = extraction->truncOp.getOperation();
+  for (Operation &op : oldBody.without_terminator()) {
+    if (&op == truncOperation ||
+        extraction->scaleExpressionOps.contains(&op)) {
+      continue;
+    }
+    rewriter.clone(op, mapping);
+  }
+  rewriter.clone(*oldBody.getTerminator(), mapping);
+
+  rewriter.replaceOp(genericOp, newGenericOp.getResults());
+  return newGenericOp;
+}
+
 static bool isPrePeelScaledContraction(linalg::GenericOp genericOp) {
   constexpr unsigned lhsOperandIndex = 0;
   constexpr unsigned rhsOperandIndex = 1;
@@ -1019,7 +1493,7 @@ static bool isPreSplitScaledContraction(linalg::GenericOp genericOp) {
     return false;
   }
 
-  Block *body = genericOp.getBlock();
+  Block *body = genericOp.getBody();
   bool hasLhsScalingTrunc = llvm::any_of(*body, [&](Operation &op) {
     auto truncOp = dyn_cast<arith::ScalingTruncFOp>(&op);
     if (!truncOp) {
@@ -1116,13 +1590,31 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
           linalg::YieldOp::create(b, loc, regionMapping.lookup(result));
         });
 
+    if (loweringConfig) {
+      FailureOr<linalg::GenericOp> extractedOp =
+          extractScalingTruncFromExpReductionPV(rewriter, newOp);
+      if (succeeded(extractedOp)) {
+        newOp = *extractedOp;
+      }
+
+      while (true) {
+        FailureOr<linalg::GenericOp> elementwiseExtractedOp =
+            extractElementwiseInput(rewriter, newOp);
+        if (failed(elementwiseExtractedOp)) {
+          break;
+        }
+        newOp = *elementwiseExtractedOp;
+      }
+    }
+
     // HACK: Set layout on operation that has contraction indexing. Some
     // contraction bodies contain elementwise casts/scales that are extracted
     // later, so do not require the full contraction op interface match here.
     if (loweringConfig) {
       bool isContraction = succeeded(linalg::inferContractionDims(newOp)) ||
                            succeeded(inferScaledContractionDims(newOp)) ||
-                           isPrePeelScaledContraction(newOp) ||
+                           succeeded(inferScaledContractionDims(
+                               newOp.getIndexingMapsArray())) ||
                            isPreSplitScaledContraction(newOp);
       if (isContraction) {
         setLoweringConfig(newOp, loweringConfig);

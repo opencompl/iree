@@ -810,7 +810,6 @@ void addGPUVectorDistributePassPipeline(OpPassManager &funcPassManager,
   // Set anchors at tensor level for vector distribution later and hoist out
   // loop invariant anchors.
   funcPassManager.addPass(createDecomposeHorizontallyFusedGemmsPass());
-  funcPassManager.addPass(createLLVMGPUExtractMMAElementwiseInputsPass());
   funcPassManager.addPass(createLLVMGPUConfigureTensorLayoutsPass());
   // TODO: Move this pass before layout configuration. We want to do that,
   // but it requires some additional work to figure out the layout conflicting
