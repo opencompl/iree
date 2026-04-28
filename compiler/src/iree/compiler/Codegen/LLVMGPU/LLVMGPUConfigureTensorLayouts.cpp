@@ -10,6 +10,7 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
@@ -330,6 +331,10 @@ struct ContractionLayout {
   VectorLayoutInterface acc;
 };
 
+struct ScaledContractionLayout {
+  SmallVector<VectorLayoutInterface> operands;
+};
+
 // Get the layouts to use for the contraction given the intrinsic to use and
 // number of subgroups on the M and N dimension.
 //
@@ -467,6 +472,118 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
   return ContractionLayout{lhs, rhs, acc};
 }
 
+static FailureOr<ScaledContractionLayout>
+getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
+                           ArrayRef<AffineMap> indexingMaps) {
+  auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(candidate);
+  if (!config) {
+    return failure();
+  }
+
+  auto intrinsic =
+      dyn_cast_if_present<IREE::GPU::ScaledMMAAttr>(getIntrinsic(candidate));
+  if (!intrinsic) {
+    return failure();
+  }
+
+  if (failed(intrinsic.verifyIndexingMaps(indexingMaps))) {
+    return failure();
+  }
+
+  FailureOr<IREE::LinalgExt::ScaledContractionDimensions> maybeDims =
+      IREE::LinalgExt::inferScaledContractionDims(indexingMaps);
+  if (failed(maybeDims)) {
+    return failure();
+  }
+
+  IREE::LinalgExt::ScaledContractionDimensions dims = *maybeDims;
+  if (dims.m.empty() || dims.n.empty() || dims.k.empty() || dims.kB.empty()) {
+    return failure();
+  }
+
+  int64_t rank = bounds.size();
+  int64_t innerMDim = dims.m.back();
+  int64_t innerNDim = dims.n.back();
+  int64_t innerKDim = dims.k.back();
+  int64_t innerKBDim = dims.kB.back();
+
+  SmallVector<int64_t> batchCounts(bounds);
+
+  SmallVector<int64_t> subgroupCounts, subgroupStrides;
+  if (failed(distributeTilingSizes(
+          candidate, config, IREE::GPU::TilingLevel::Subgroup, batchCounts,
+          subgroupCounts, subgroupStrides))) {
+    return failure();
+  }
+
+  auto [mSize, nSize, kSize, kBSize] = intrinsic.getScaledMNKShape();
+  SmallVector<int64_t> subgroupSize(rank, 1);
+  subgroupSize[innerMDim] = mSize;
+  subgroupSize[innerNDim] = nSize;
+  subgroupSize[innerKDim] = kSize;
+  subgroupSize[innerKBDim] = kBSize;
+  for (auto i : llvm::seq<int64_t>(rank)) {
+    batchCounts[i] = llvm::divideCeil(batchCounts[i], subgroupSize[i]);
+  }
+
+  auto getFragmentLayout =
+      [&](int operandIndex, ArrayRef<int64_t> operandDims,
+          AffineMap map) -> FailureOr<VectorLayoutInterface> {
+    IREE::GPU::MMASingleSubgroupLayout subgroupLayout =
+        IREE::GPU::getSingleSubgroupLayout(
+            intrinsic.getIntrinsic(), operandIndex, intrinsic.getColMajor());
+    if (operandDims.size() != subgroupLayout.outer.size()) {
+      return failure();
+    }
+
+    SmallVector<int64_t> outerCounts(rank, 1);
+    SmallVector<int64_t> elementCounts(rank, 1);
+    SmallVector<int64_t> threadCounts(rank, 1);
+    SmallVector<int64_t> threadStrides(rank, 0);
+
+    for (auto [index, dim] : llvm::enumerate(operandDims)) {
+      outerCounts[dim] = subgroupLayout.outer[index];
+      threadCounts[dim] = subgroupLayout.thread[index];
+      threadStrides[dim] = subgroupLayout.tstrides[index];
+      elementCounts[dim] = subgroupLayout.element[index];
+    }
+
+    auto fragmentSpaceLayout = NestedLayoutAttr::get(
+        map.getContext(), subgroupCounts, batchCounts, outerCounts,
+        threadCounts, elementCounts, subgroupStrides, threadStrides);
+    return cast<VectorLayoutInterface>(fragmentSpaceLayout.apply(map));
+  };
+
+  ScaledContractionLayout layout;
+  layout.operands.resize(IREE::GPU::kScaledMMAOperandAcc + 1);
+  FailureOr<VectorLayoutInterface> lhs = getFragmentLayout(
+      IREE::GPU::kScaledMMAOperandLhs, {innerMDim, innerKDim, innerKBDim},
+      indexingMaps[IREE::GPU::kScaledMMAOperandLhs]);
+  FailureOr<VectorLayoutInterface> rhs = getFragmentLayout(
+      IREE::GPU::kScaledMMAOperandRhs, {innerKDim, innerKBDim, innerNDim},
+      indexingMaps[IREE::GPU::kScaledMMAOperandRhs]);
+  FailureOr<VectorLayoutInterface> lhsScale = getFragmentLayout(
+      IREE::GPU::kScaledMMAOperandLhsScale, {innerMDim, innerKDim},
+      indexingMaps[IREE::GPU::kScaledMMAOperandLhsScale]);
+  FailureOr<VectorLayoutInterface> rhsScale = getFragmentLayout(
+      IREE::GPU::kScaledMMAOperandRhsScale, {innerKDim, innerNDim},
+      indexingMaps[IREE::GPU::kScaledMMAOperandRhsScale]);
+  FailureOr<VectorLayoutInterface> acc =
+      getFragmentLayout(IREE::GPU::kScaledMMAOperandAcc, {innerMDim, innerNDim},
+                        indexingMaps[IREE::GPU::kScaledMMAOperandAcc]);
+  if (failed(lhs) || failed(rhs) || failed(lhsScale) || failed(rhsScale) ||
+      failed(acc)) {
+    return failure();
+  }
+
+  layout.operands[IREE::GPU::kScaledMMAOperandLhs] = *lhs;
+  layout.operands[IREE::GPU::kScaledMMAOperandRhs] = *rhs;
+  layout.operands[IREE::GPU::kScaledMMAOperandLhsScale] = *lhsScale;
+  layout.operands[IREE::GPU::kScaledMMAOperandRhsScale] = *rhsScale;
+  layout.operands[IREE::GPU::kScaledMMAOperandAcc] = *acc;
+  return layout;
+}
+
 SmallVector<int64_t> getIterationSpaceBounds(linalg::LinalgOp linalgOp) {
   SmallVector<int64_t> bounds = linalgOp.getStaticLoopRanges();
   std::optional<VectorizationTileSizes> sizes =
@@ -530,6 +647,43 @@ setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
   rewriter.setInsertionPointAfter(contract);
   auto toLayout =
       ToLayoutOp::create(rewriter, loc, contract->getResult(0), cLayout);
+  rewriter.replaceAllUsesExcept(contract->getResult(0), toLayout.getResult(),
+                                toLayout);
+
+  return success();
+}
+
+static LogicalResult
+setScaledContractionAnchor(SmallVector<bool> promotedOperands,
+                           RewriterBase &rewriter, linalg::LinalgOp contract) {
+  SmallVector<int64_t> bounds = getIterationSpaceBounds(contract);
+  FailureOr<ScaledContractionLayout> maybeLayouts = getScaledContractionLayout(
+      contract, bounds, contract.getIndexingMapsArray());
+  if (failed(maybeLayouts)) {
+    return contract->emitError(
+        "cannot get concrete layout for scaled contraction");
+  }
+
+  ScaledContractionLayout layouts = *maybeLayouts;
+  if (layouts.operands.size() != contract->getNumOperands()) {
+    return contract->emitError(
+        "scaled contraction layout does not match operand count");
+  }
+
+  Location loc = contract.getLoc();
+  rewriter.setInsertionPoint(contract);
+  for (OpOperand &operand : contract->getOpOperands()) {
+    unsigned operandNumber = operand.getOperandNumber();
+    auto layoutedOperand = ToLayoutOp::create(rewriter, loc, operand.get(),
+                                              layouts.operands[operandNumber]);
+    layoutedOperand.setSharedMemoryConversion(promotedOperands[operandNumber]);
+    operand.set(layoutedOperand);
+  }
+
+  rewriter.setInsertionPointAfter(contract);
+  auto toLayout =
+      ToLayoutOp::create(rewriter, loc, contract->getResult(0),
+                         layouts.operands[IREE::GPU::kScaledMMAOperandAcc]);
   rewriter.replaceAllUsesExcept(contract->getResult(0), toLayout.getResult(),
                                 toLayout);
 
@@ -626,6 +780,13 @@ static LogicalResult setIntrinsicLoweringConfigLayout(
 
   SmallVector<bool> promotedOperands = getPromotedOperands(candidate);
   IREE::Codegen::InnerTileDescAttrInterface intrinsic = getIntrinsic(candidate);
+
+  if (isa<IREE::GPU::ScaledMMAAttr>(intrinsic)) {
+    if (succeeded(setScaledContractionAnchor(promotedOperands, rewriter,
+                                             candidate))) {
+      return success();
+    }
+  }
 
   if (linalg::isaContractionOpInterface(candidate)) {
     if (succeeded(setContractionAnchor(intrinsic, promotedOperands, rewriter,

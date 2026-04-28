@@ -8,7 +8,9 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/Im2colUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
@@ -938,6 +940,114 @@ captureUsedOperationsAndBlockArguments(linalg::GenericOp genericOp,
   return UsedOperationsAndBlockArguments{usedInputIndices, usedOperations};
 }
 
+static llvm::SmallDenseSet<int64_t>
+getIndexingMapDimsWithIteratorType(AffineMap map,
+                                   ArrayRef<utils::IteratorType> iterators,
+                                   utils::IteratorType iteratorType) {
+  llvm::SmallDenseSet<int64_t> dims;
+  if (!map.isProjectedPermutation()) {
+    return dims;
+  }
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      continue;
+    }
+    int64_t position = dimExpr.getPosition();
+    if (iterators[position] == iteratorType) {
+      dims.insert(position);
+    }
+  }
+  return dims;
+}
+
+static AffineMap
+dropIteratorDims(AffineMap map,
+                 const llvm::SmallDenseSet<int64_t> &droppedDims) {
+  SmallVector<AffineExpr> results;
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || droppedDims.contains(dimExpr.getPosition())) {
+      continue;
+    }
+    results.push_back(expr);
+  }
+  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                        map.getContext());
+}
+
+static bool isPrePeelScaledContraction(linalg::GenericOp genericOp) {
+  constexpr unsigned lhsOperandIndex = 0;
+  constexpr unsigned rhsOperandIndex = 1;
+  constexpr unsigned rhsScaleOperandIndex = 2;
+  if (genericOp.getNumDpsInputs() != 3 || genericOp.getNumDpsInits() != 1) {
+    return false;
+  }
+
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators =
+      genericOp.getIteratorTypesArray();
+  llvm::SmallDenseSet<int64_t> lhsRed = getIndexingMapDimsWithIteratorType(
+      maps[lhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsScaleRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsScaleOperandIndex], iterators, utils::IteratorType::reduction);
+
+  llvm::SmallDenseSet<int64_t> kBDims;
+  for (int64_t dim : lhsRed) {
+    if (rhsRed.contains(dim) && !rhsScaleRed.contains(dim)) {
+      kBDims.insert(dim);
+    }
+  }
+  if (kBDims.empty()) {
+    return false;
+  }
+
+  SmallVector<AffineMap> scaledMaps{
+      maps[lhsOperandIndex], maps[rhsOperandIndex],
+      dropIteratorDims(maps[lhsOperandIndex], kBDims),
+      maps[rhsScaleOperandIndex], maps.back()};
+  return succeeded(inferScaledContractionDims(scaledMaps));
+}
+
+static bool isPreSplitScaledContraction(linalg::GenericOp genericOp) {
+  constexpr unsigned lhsOperandIndex = 0;
+  constexpr unsigned rhsOperandIndex = 1;
+  constexpr unsigned rhsScaleOperandIndex = 2;
+  if (genericOp.getNumDpsInputs() != 3 || genericOp.getNumDpsInits() != 1) {
+    return false;
+  }
+
+  Block *body = genericOp.getBlock();
+  bool hasLhsScalingTrunc = llvm::any_of(*body, [&](Operation &op) {
+    auto truncOp = dyn_cast<arith::ScalingTruncFOp>(&op);
+    if (!truncOp) {
+      return false;
+    }
+    auto sourceArg = dyn_cast<BlockArgument>(truncOp.getIn());
+    return sourceArg && sourceArg.getOwner() == body &&
+           sourceArg.getArgNumber() == lhsOperandIndex;
+  });
+  if (!hasLhsScalingTrunc) {
+    return false;
+  }
+
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators =
+      genericOp.getIteratorTypesArray();
+  llvm::SmallDenseSet<int64_t> lhsRed = getIndexingMapDimsWithIteratorType(
+      maps[lhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsScaleRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsScaleOperandIndex], iterators, utils::IteratorType::reduction);
+
+  llvm::set_intersect(lhsRed, rhsRed);
+  llvm::set_intersect(lhsRed, rhsScaleRed);
+  return lhsRed.size() == 1;
+}
+
 /// Returns a vector of GenericOps with only one output.
 /// Each generic op in the vector corresponds to an output in the input
 /// generic op. However, these resultant ops will only contain the:
@@ -1010,7 +1120,11 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     // contraction bodies contain elementwise casts/scales that are extracted
     // later, so do not require the full contraction op interface match here.
     if (loweringConfig) {
-      if (succeeded(linalg::inferContractionDims(newOp))) {
+      bool isContraction = succeeded(linalg::inferContractionDims(newOp)) ||
+                           succeeded(inferScaledContractionDims(newOp)) ||
+                           isPrePeelScaledContraction(newOp) ||
+                           isPreSplitScaledContraction(newOp);
+      if (isContraction) {
         setLoweringConfig(newOp, loweringConfig);
       }
     }
