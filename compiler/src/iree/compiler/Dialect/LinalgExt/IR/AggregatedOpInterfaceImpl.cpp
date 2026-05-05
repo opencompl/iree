@@ -1039,6 +1039,21 @@ dropIteratorDims(AffineMap map,
                         map.getContext());
 }
 
+static AffineMap groupIteratorDim(AffineMap map, int64_t groupedIteratorDim,
+                                  int64_t groupSize) {
+  SmallVector<AffineExpr> results;
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || dimExpr.getPosition() != groupedIteratorDim) {
+      results.push_back(expr);
+      continue;
+    }
+    results.push_back(expr.floorDiv(groupSize));
+  }
+  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                        map.getContext());
+}
+
 static llvm::SmallDenseSet<int64_t>
 inferKBDimsForLhsScale(linalg::GenericOp genericOp) {
   constexpr unsigned lhsOperandIndex = 0;
@@ -1074,6 +1089,28 @@ inferKBDimsForLhsScale(linalg::GenericOp genericOp) {
     kBDims.insert(*llvm::max_element(commonDataRed));
   }
   return kBDims;
+}
+
+static std::optional<int64_t>
+inferFlatReductionDimForLhsScale(linalg::GenericOp genericOp) {
+  constexpr unsigned lhsOperandIndex = 0;
+  constexpr unsigned rhsOperandIndex = 1;
+  if (genericOp.getNumDpsInputs() <= rhsOperandIndex) {
+    return std::nullopt;
+  }
+
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators =
+      genericOp.getIteratorTypesArray();
+  llvm::SmallDenseSet<int64_t> commonDataRed = getIndexingMapDimsWithIteratorType(
+      maps[lhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::set_intersect(commonDataRed, rhsRed);
+  if (commonDataRed.size() != 1) {
+    return std::nullopt;
+  }
+  return *commonDataRed.begin();
 }
 
 static std::optional<unsigned>
@@ -1253,14 +1290,20 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
 
 static AffineMap getScaleAccessMapForInput(
     MLIRContext *context, AffineMap inputMap,
-    const llvm::SmallDenseSet<int64_t> &droppedIteratorDims) {
+    const llvm::SmallDenseSet<int64_t> &droppedIteratorDims,
+    std::optional<int64_t> groupedIteratorDim = std::nullopt,
+    int64_t groupSize = 1) {
   SmallVector<AffineExpr> results;
   for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
     auto dimExpr = dyn_cast<AffineDimExpr>(expr);
     if (!dimExpr || droppedIteratorDims.contains(dimExpr.getPosition())) {
       continue;
     }
-    results.push_back(getAffineDimExpr(inputDim, context));
+    AffineExpr inputDimExpr = getAffineDimExpr(inputDim, context);
+    if (groupedIteratorDim && dimExpr.getPosition() == *groupedIteratorDim) {
+      inputDimExpr = inputDimExpr.floorDiv(groupSize);
+    }
+    results.push_back(inputDimExpr);
   }
   return AffineMap::get(inputMap.getNumResults(), /*symbolCount=*/0, results,
                         context);
@@ -1309,19 +1352,31 @@ matchLhsScalingTruncExtraction(linalg::GenericOp genericOp) {
 static Value createScaleTensor(
     RewriterBase &rewriter, Location loc, Value input, AffineMap inputMap,
     const llvm::SmallDenseSet<int64_t> &droppedIteratorDims, Value scale,
-    Block &sourceBody) {
+    Block &sourceBody, std::optional<int64_t> groupedIteratorDim = std::nullopt,
+    int64_t groupSize = 1) {
   auto inputType = cast<RankedTensorType>(input.getType());
   Type scaleElementType = getElementTypeOrSelf(scale.getType());
   SmallVector<int64_t> scaleShape;
   SmallVector<OpFoldResult> scaleMixedSizes;
   auto inputMixedSizes = tensor::getMixedSizes(rewriter, loc, input);
+  MLIRContext *context = rewriter.getContext();
   for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
     auto dimExpr = dyn_cast<AffineDimExpr>(expr);
     if (!dimExpr || droppedIteratorDims.contains(dimExpr.getPosition())) {
       continue;
     }
-    scaleShape.push_back(inputType.getDimSize(inputDim));
-    scaleMixedSizes.push_back(inputMixedSizes[inputDim]);
+    OpFoldResult dimSize = inputMixedSizes[inputDim];
+    if (groupedIteratorDim && dimExpr.getPosition() == *groupedIteratorDim) {
+      AffineMap groupedSizeMap =
+          AffineMap::get(0, 1,
+                         rewriter.getAffineSymbolExpr(0).ceilDiv(groupSize),
+                         context);
+      dimSize = affine::makeComposedFoldedAffineApply(
+          rewriter, loc, groupedSizeMap, ArrayRef<OpFoldResult>{dimSize});
+    }
+    scaleMixedSizes.push_back(dimSize);
+    scaleShape.push_back(
+        getConstantIntValue(dimSize).value_or(ShapedType::kDynamic));
   }
   auto scaleType = RankedTensorType::get(scaleShape, scaleElementType,
                                          inputType.getEncoding());
@@ -1396,15 +1451,25 @@ extractScalingTruncFromExpReductionPV(RewriterBase &rewriter,
   SmallVector<AffineMap> oldMaps = genericOp.getIndexingMapsArray();
   llvm::SmallDenseSet<int64_t> droppedIteratorDims =
       inferKBDimsForLhsScale(genericOp);
-  AffineMap lhsScaleMap = dropIteratorDims(oldMaps[0], droppedIteratorDims);
+  constexpr int64_t kScaleBlockSize = 32;
+  std::optional<int64_t> groupedIteratorDim;
+  if (droppedIteratorDims.empty()) {
+    groupedIteratorDim = inferFlatReductionDimForLhsScale(genericOp);
+  }
+  AffineMap lhsScaleMap =
+      groupedIteratorDim
+          ? groupIteratorDim(oldMaps[0], *groupedIteratorDim, kScaleBlockSize)
+          : dropIteratorDims(oldMaps[0], droppedIteratorDims);
   AffineMap scaleAccessMap = getScaleAccessMapForInput(
-      rewriter.getContext(), oldMaps[0], droppedIteratorDims);
+      rewriter.getContext(), oldMaps[0], droppedIteratorDims,
+      groupedIteratorDim, kScaleBlockSize);
 
   rewriter.setInsertionPoint(genericOp);
   Value scaleTensor =
       createScaleTensor(rewriter, loc, oldInputs[0], oldMaps[0],
                         droppedIteratorDims, extraction->scale,
-                        genericOp.getRegion().front());
+                        genericOp.getRegion().front(), groupedIteratorDim,
+                        kScaleBlockSize);
   Value truncatedInput = createTruncatedInputTensor(
       rewriter, loc, oldInputs[0], scaleTensor, scaleAccessMap,
       extraction->truncOp);
@@ -1627,6 +1692,7 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     results.push_back(newOp);
   }
 
+  rewriter.eraseOp(genericOp);
   return results;
 }
 

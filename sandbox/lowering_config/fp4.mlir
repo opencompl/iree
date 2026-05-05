@@ -103,25 +103,26 @@ flow.executable private @executable_0 {
           #iree_linalg_ext.iterator_type<parallel>,
           #iree_linalg_ext.iterator_type<parallel>,
           #iree_linalg_ext.iterator_type<parallel>,
-          #iree_linalg_ext.iterator_type<parallel>,
+          #iree_linalg_ext.iterator_type<reduction>,
           #iree_linalg_ext.iterator_type<reduction>
         ],
         exp_reduced_operands = [1, 2]
       }
         attributes {lowering_config = #iree_gpu.lowering_config<{
           workgroup = [1, 1, 64, 0, 0, 0],
-          reduction = [0, 0, 0, 0, 0, 128],
+          reduction = [0, 0, 0, 0, 0, 64],
           subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 4, 5]],
-          mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_16x16x128_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>
+          mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_32x32x64_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>
         }>}
         ins(%S, %V, %VS : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x2x32xf4E2M1FN>, tensor<4x32x4096x2xf8E8M0FNU>)
         outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x2x32xf32>)
       {
       ^bb0(%ex : f32, %v : f4E2M1FN, %v_scale : f8E8M0FNU, %m : f32, %sum : f32, %acc : f32):
-        %s_scale_f32 = arith.constant 2.500000e-01 : f32
-        %s_scale = arith.truncf %s_scale_f32 : f32 to f8E8M0FNU
-        %ex_trunc = arith.scaling_truncf %ex, %s_scale : f32, f8E8M0FNU to f4E2M1FN
-        %ex_ext = arith.scaling_extf %ex_trunc, %s_scale : f4E2M1FN, f8E8M0FNU to f32
+        %fp4max  = arith.constant 6.0 : f32
+        %fp4maxf8  = arith.constant 1.0 : f8E8M0FNU
+        %ex4m    = arith.mulf %ex, %fp4max : f32
+        %ex_trunc = arith.truncf %ex4m : f32 to f4E2M1FN
+        %ex_ext = arith.scaling_extf %ex_trunc, %fp4maxf8 : f4E2M1FN, f8E8M0FNU to f32
         %v_ext = arith.scaling_extf %v, %v_scale : f4E2M1FN, f8E8M0FNU to f32
         %nsum = arith.addf %ex, %sum : f32
         %mul  = arith.mulf %ex_ext, %v_ext : f32
