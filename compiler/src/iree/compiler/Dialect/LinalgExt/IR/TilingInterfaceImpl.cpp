@@ -9,6 +9,7 @@
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/CommandLine.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
@@ -26,6 +27,23 @@
 #define DEBUG_TYPE "linalg-ext-tiling"
 
 namespace mlir::iree_compiler::IREE::LinalgExt {
+
+enum class ExpReduceReductionStyle {
+  ExpReduce,
+  Add,
+};
+
+static llvm::cl::opt<ExpReduceReductionStyle> clExpReduceReductionStyle(
+    "iree-expreduce-reduction-style",
+    llvm::cl::desc("Select the reduction style for combining partial "
+                   "iree_linalg_ext.exp_reduction results."),
+    llvm::cl::values(
+        clEnumValN(ExpReduceReductionStyle::ExpReduce, "expreduce",
+                   "Combine partial reductions by renormalizing with the "
+                   "merged max before reducing."),
+        clEnumValN(ExpReduceReductionStyle::Add, "add",
+                   "Combine partial reduction result tensors with add.")),
+    llvm::cl::init(ExpReduceReductionStyle::ExpReduce));
 
 //===----------------------------------------------------------------------===//
 // Utils.
@@ -381,6 +399,98 @@ getPartialResultAffineMaps(ExpReductionOp linalgOp,
         return map;
       });
   return partialReductionMaps;
+}
+
+struct ExpReductionInitSliceInfo {
+  SmallVector<int64_t> resultShape;
+  SmallVector<OpFoldResult> offsets;
+  SmallVector<OpFoldResult> sizes;
+  SmallVector<OpFoldResult> strides;
+};
+
+static std::optional<unsigned>
+getReductionDimPosition(const SetVector<unsigned> &reductionDims,
+                        unsigned dim) {
+  for (auto [idx, reductionDim] : llvm::enumerate(reductionDims)) {
+    if (reductionDim == dim) {
+      return idx;
+    }
+  }
+  return std::nullopt;
+}
+
+/// Return the result shape, offsets, sizes and strides of the slice of the
+/// partial reduction init tensor used by an exp_reduction tile.
+static ExpReductionInitSliceInfo getExpReductionInitSliceInfo(
+    MLIRContext *context, ReductionTilingStrategy strategy,
+    ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+    const SetVector<unsigned> &reductionDims,
+    ArrayRef<OpFoldResult> splitReductionIvs, AffineMap partialReductionMap,
+    ArrayRef<OpFoldResult> initOperandShape) {
+  Attribute zero = IntegerAttr::get(IndexType::get(context), 0);
+  Attribute one = IntegerAttr::get(IndexType::get(context), 1);
+  SmallVector<OpFoldResult> initOffsets, initSizes;
+  SmallVector<OpFoldResult> resultShape;
+  SmallVector<OpFoldResult> initStrides(partialReductionMap.getNumResults(),
+                                        one);
+
+  for (auto [resultIdx, dimExpr] :
+       llvm::enumerate(partialReductionMap.getResults())) {
+    if (isa<AffineConstantExpr>(dimExpr)) {
+      initOffsets.push_back(zero);
+      initSizes.push_back(initOperandShape[resultIdx]);
+      resultShape.push_back(initOperandShape[resultIdx]);
+      continue;
+    }
+
+    unsigned dim = cast<AffineDimExpr>(dimExpr).getPosition();
+    std::optional<unsigned> dimPos =
+        getReductionDimPosition(reductionDims, dim);
+    if (strategy == ReductionTilingStrategy::PartialReductionOuterParallel &&
+        dimPos) {
+      initOffsets.push_back(splitReductionIvs[*dimPos]);
+      initSizes.push_back(one);
+      continue;
+    }
+
+    initOffsets.push_back(dimPos ? zero : offsets[dim]);
+    initSizes.push_back(sizes[dim]);
+    resultShape.push_back(sizes[dim]);
+  }
+
+  SmallVector<int64_t> staticResultShape;
+  std::tie(staticResultShape, std::ignore) =
+      decomposeMixedValues(resultShape);
+  return {staticResultShape, initOffsets, initSizes, initStrides};
+}
+
+static SmallVector<OpFoldResult> getExpReductionPartialResultShape(
+    OpBuilder &b, Location loc, Value init, AffineMap partialReductionMap,
+    ArrayRef<OpFoldResult> sizes) {
+  SmallVector<OpFoldResult> initShape = tensor::getMixedSizes(b, loc, init);
+  SmallVector<OpFoldResult> partialResultShape;
+  for (auto [resultIdx, dimExpr] :
+       llvm::enumerate(partialReductionMap.getResults())) {
+    if (isa<AffineConstantExpr>(dimExpr)) {
+      partialResultShape.push_back(initShape[resultIdx]);
+      continue;
+    }
+    unsigned dim = cast<AffineDimExpr>(dimExpr).getPosition();
+    partialResultShape.push_back(sizes[dim]);
+  }
+  return partialResultShape;
+}
+
+static LogicalResult
+verifyExpReductionPartialReductionIsSupported(ExpReductionOp op) {
+  for (int64_t resultIdx = 1; resultIdx < op.getNumDpsInits(); ++resultIdx) {
+    if (!llvm::is_contained(op.getExpReducedOperands(), resultIdx)) {
+      return op.emitOpError(
+          "partial reduction expects every non-max output to be listed in "
+          "exp_reduced_operands");
+    }
+  }
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2424,6 +2534,145 @@ ExpReductionOp::generateResultTileValue(OpBuilder &b, unsigned resultNumber,
       tilingResult->generatedSlices};
 }
 
+FailureOr<SmallVector<Value>>
+ExpReductionOp::generateInitialTensorForPartialReduction(
+    OpBuilder &b, Location loc, ArrayRef<OpFoldResult> sizes,
+    const llvm::SetVector<unsigned> &reductionDims) {
+  if (failed(verifyExpReductionPartialReductionIsSupported(*this))) {
+    return failure();
+  }
+
+  SmallVector<AffineMap> partialResultMaps =
+      getPartialResultAffineMaps(*this, reductionDims);
+
+  SmallVector<Value> inits;
+  for (auto [initIdx, init, partialMap] :
+       llvm::enumerate(getDpsInits(), partialResultMaps)) {
+    SmallVector<OpFoldResult> partialResultShape =
+        getExpReductionPartialResultShape(b, loc, init, partialMap, sizes);
+    Type elType = getElementTypeOrSelf(init.getType());
+    Value emptyTensor =
+        tensor::EmptyOp::create(b, loc, partialResultShape, elType);
+
+    Value identity;
+    if (initIdx == getReducingOpIndex()) {
+      identity = arith::getIdentityValue(arith::AtomicRMWKind::maximumf,
+                                         elType, b, loc,
+                                         /*useOnlyFiniteValue=*/true);
+    } else {
+      identity = arith::getIdentityValue(arith::AtomicRMWKind::addf, elType, b,
+                                         loc);
+    }
+
+    inits.push_back(linalg::FillOp::create(b, loc, identity, emptyTensor)
+                        .getResult(0));
+  }
+
+  return inits;
+}
+
+FailureOr<TilingResult> ExpReductionOp::tileToPartialReduction(
+    OpBuilder &b, Location loc, ReductionTilingStrategy strategy,
+    ValueRange init, ArrayRef<OpFoldResult> offsets,
+    ArrayRef<OpFoldResult> sizes,
+    const llvm::SetVector<unsigned> &reductionDims,
+    ArrayRef<OpFoldResult> splitReductionIvs) {
+  if (failed(verifyExpReductionPartialReductionIsSupported(*this))) {
+    return failure();
+  }
+
+  assert(
+      (strategy == ReductionTilingStrategy::PartialReductionOuterParallel ||
+       strategy == ReductionTilingStrategy::PartialReductionOuterReduction) &&
+      "Unexpected partial reduction tiling strategy");
+
+  SmallVector<AffineMap> partialResultMaps =
+      getPartialResultAffineMaps(*this, reductionDims);
+
+  SmallVector<Value> tiledOperands;
+  SmallVector<Operation *> generatedSlices;
+  for (OpOperand *opOperand : getDpsInputOperands()) {
+    AffineMap map = getMatchingIndexingMap(opOperand);
+    SmallVector<Range> slice = getPermutedRange(map, offsets, sizes);
+    Operation *sliceOp = getSlice(b, loc, opOperand->get(), slice);
+    tiledOperands.push_back(sliceOp->getResult(0));
+    generatedSlices.push_back(sliceOp);
+  }
+
+  SmallVector<Value> tiledInits;
+  for (auto [initValue, opOperand, partialMap] :
+       llvm::zip_equal(init, getDpsInitsMutable(), partialResultMaps)) {
+    SmallVector<OpFoldResult> initOperandShape =
+        tensor::getMixedSizes(b, loc, opOperand.get());
+    ExpReductionInitSliceInfo sliceInfo = getExpReductionInitSliceInfo(
+        b.getContext(), strategy, offsets, sizes, reductionDims,
+        splitReductionIvs, partialMap, initOperandShape);
+
+    auto initType = cast<RankedTensorType>(initValue.getType());
+    auto resultType = RankedTensorType::get(
+        sliceInfo.resultShape, initType.getElementType(),
+        initType.getEncoding());
+    auto sliceOp = tensor::ExtractSliceOp::create(
+        b, loc, resultType, initValue, sliceInfo.offsets, sliceInfo.sizes,
+        sliceInfo.strides);
+    tiledInits.push_back(sliceOp.getResult());
+    tiledOperands.push_back(sliceOp.getResult());
+    generatedSlices.push_back(sliceOp);
+  }
+
+  SmallVector<Type> resultTypes(ValueRange(tiledInits).getTypes());
+  Operation *tiledOp =
+      mlir::clone(b, getOperation(), resultTypes, tiledOperands);
+  auto tiledExpReductionOp = cast<ExpReductionOp>(tiledOp);
+
+  SmallVector<AffineMap> newMaps = getIndexingMapsArray();
+  for (auto [initOperand, partialMap] :
+       llvm::zip_equal(getDpsInitsMutable(), partialResultMaps)) {
+    AffineMap newMap = strategy ==
+                               ReductionTilingStrategy::
+                                   PartialReductionOuterReduction
+                           ? partialMap
+                           : getMatchingIndexingMap(&initOperand);
+    newMaps[initOperand.getOperandNumber()] = newMap;
+  }
+  tiledExpReductionOp.setIndexingMapsAttr(b.getAffineMapArrayAttr(newMaps));
+
+  if (strategy == ReductionTilingStrategy::PartialReductionOuterReduction) {
+    SmallVector<Attribute> newIteratorTypes;
+    for (auto [idx, iteratorType] : llvm::enumerate(getLoopIteratorTypes())) {
+      if (reductionDims.contains(idx)) {
+        iteratorType = utils::IteratorType::parallel;
+      }
+      newIteratorTypes.push_back(IteratorTypeAttr::get(b.getContext(),
+                                                       iteratorType));
+    }
+    tiledExpReductionOp.setIteratorTypesAttr(b.getArrayAttr(newIteratorTypes));
+  }
+
+  return TilingResult{
+      {tiledOp}, SmallVector<Value>(tiledOp->getResults()), generatedSlices};
+}
+
+LogicalResult ExpReductionOp::getPartialResultTilePosition(
+    OpBuilder &b, unsigned resultNumber, ReductionTilingStrategy strategy,
+    ArrayRef<OpFoldResult> offsets, ArrayRef<OpFoldResult> sizes,
+    const llvm::SetVector<unsigned> &reductionDims,
+    ArrayRef<OpFoldResult> splitReductionIvs,
+    SmallVector<OpFoldResult> &resultOffsets,
+    SmallVector<OpFoldResult> &resultSizes) {
+  SmallVector<AffineMap> partialResultMaps =
+      getPartialResultAffineMaps(*this, reductionDims);
+  Value initOperandValue = getDpsInits()[resultNumber];
+  SmallVector<OpFoldResult> initOperandShape =
+      tensor::getMixedSizes(b, getLoc(), initOperandValue);
+  ExpReductionInitSliceInfo sliceInfo = getExpReductionInitSliceInfo(
+      b.getContext(), strategy, offsets, sizes, reductionDims,
+      splitReductionIvs, partialResultMaps[resultNumber], initOperandShape);
+  resultOffsets = std::move(sliceInfo.offsets);
+  resultSizes = std::move(sliceInfo.sizes);
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Im2colOp
 //===----------------------------------------------------------------------===//
@@ -3534,6 +3783,81 @@ static Value computeSubAndExp2(OpBuilder &builder, Location loc,
         linalg::YieldOp::create(b, loc, weight);
       });
   return genericOp.getResult(0);
+}
+
+template <typename CombinerOp>
+static linalg::ReduceOp reduceExpReductionPartialResult(
+    AffineMap partialMap, OpBuilder &b, Location loc, Value partialResult,
+    Value init,
+    const llvm::SetVector<unsigned> &reductionDims) {
+  SmallVector<int64_t> partialReductionDims;
+  for (auto [resultNum, dimExpr] : llvm::enumerate(partialMap.getResults())) {
+    if (isa<AffineConstantExpr>(dimExpr)) {
+      continue;
+    }
+    unsigned dim = cast<AffineDimExpr>(dimExpr).getPosition();
+    if (reductionDims.contains(dim)) {
+      partialReductionDims.push_back(resultNum);
+    }
+  }
+
+  return linalg::ReduceOp::create(
+      b, loc, partialResult, init, partialReductionDims,
+      [&](OpBuilder &b, Location loc, ValueRange inputs) {
+        Value reduced = CombinerOp::create(b, loc, inputs[0], inputs[1]);
+        linalg::YieldOp::create(b, loc, reduced);
+      });
+}
+
+FailureOr<MergeResult> ExpReductionOp::mergeReductions(
+    OpBuilder &b, Location loc, ValueRange partialReduce,
+    const llvm::SetVector<unsigned> &reductionDims) {
+  if (failed(verifyExpReductionPartialReductionIsSupported(*this))) {
+    return failure();
+  }
+
+  SmallVector<AffineMap> partialResultMaps =
+      getPartialResultAffineMaps(*this, reductionDims);
+
+  if (clExpReduceReductionStyle == ExpReduceReductionStyle::Add) {
+    SmallVector<Operation *> mergeOperations;
+    SmallVector<Value> replacements;
+    for (auto [partialResult, init, partialMap] :
+         llvm::zip_equal(partialReduce, getDpsInits(), partialResultMaps)) {
+      linalg::ReduceOp reduced = reduceExpReductionPartialResult<arith::AddFOp>(
+          partialMap, b, loc, partialResult, init, reductionDims);
+      mergeOperations.push_back(reduced);
+      replacements.push_back(reduced.getResult(0));
+    }
+    return MergeResult{mergeOperations, replacements};
+  }
+
+  AffineMap maxMap = getMatchingIndexingMap(getDpsInitOperand(0));
+  AffineMap partialMaxMap = partialResultMaps[0];
+
+  linalg::ReduceOp reducedMax =
+      reduceExpReductionPartialResult<arith::MaximumFOp>(
+          partialMaxMap, b, loc, partialReduce[0], getDpsInits()[0],
+          reductionDims);
+
+  Value norm = computeSubAndExp2(b, loc, maxMap, partialMaxMap,
+                                 reducedMax.getResult(0), partialReduce[0]);
+
+  SmallVector<Operation *> mergeOperations{reducedMax};
+  SmallVector<Value> replacements{reducedMax.getResult(0)};
+
+  for (int64_t resultIdx = 1; resultIdx < getNumDpsInits(); ++resultIdx) {
+    AffineMap partialMap = partialResultMaps[resultIdx];
+    Value normalizedPartial = elementwiseValueInPlace<arith::MulFOp>(
+        b, loc, partialMap, partialMaxMap, partialReduce[resultIdx], norm);
+    linalg::ReduceOp reduced = reduceExpReductionPartialResult<arith::AddFOp>(
+        partialMap, b, loc, normalizedPartial, getDpsInits()[resultIdx],
+        reductionDims);
+    mergeOperations.push_back(reduced);
+    replacements.push_back(reduced.getResult(0));
+  }
+
+  return MergeResult{mergeOperations, replacements};
 }
 
 FailureOr<MergeResult> OnlineAttentionOp::mergeReductions(
