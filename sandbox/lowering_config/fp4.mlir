@@ -119,10 +119,10 @@ flow.executable private @executable_0 {
       {
       ^bb0(%ex : f32, %v : f4E2M1FN, %v_scale : f8E8M0FNU, %m : f32, %sum : f32, %acc : f32):
         %fp4max  = arith.constant 6.0 : f32
-        %fp4maxf8  = arith.constant 1.0 : f8E8M0FNU
         %ex4m    = arith.mulf %ex, %fp4max : f32
-        %ex_trunc = arith.truncf %ex4m : f32 to f4E2M1FN
-        %ex_ext = arith.scaling_extf %ex_trunc, %fp4maxf8 : f4E2M1FN, f8E8M0FNU to f32
+        // %ex_trunc = arith.scaling_truncf %ex4m, %ex_scale : f32, f8E8M0FNU to f4E2M1FN
+        %ex_trunc, %ex_scale = iree_linalg_ext.scaling_truncf %ex4m : f32 to f4E2M1FN, f8E8M0FNU
+        %ex_ext = arith.scaling_extf %ex_trunc, %ex_scale : f4E2M1FN, f8E8M0FNU to f32
         %v_ext = arith.scaling_extf %v, %v_scale : f4E2M1FN, f8E8M0FNU to f32
         %nsum = arith.addf %ex, %sum : f32
         %mul  = arith.mulf %ex_ext, %v_ext : f32
