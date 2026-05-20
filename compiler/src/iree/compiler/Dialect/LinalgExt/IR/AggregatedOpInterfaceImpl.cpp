@@ -894,6 +894,12 @@ struct ElementwiseInputExtraction {
   Operation *elementwiseOp = nullptr;
   unsigned operandIndex = 0;
   unsigned blockArgOperandIndex = 0;
+  SmallVector<unsigned> extraInputOperandIndices;
+};
+
+struct ExtractableElementwiseOperands {
+  unsigned blockArgOperandIndex = 0;
+  SmallVector<unsigned> extraInputOperandIndices;
 };
 
 struct IreeScalingTruncExtraction {
@@ -1118,9 +1124,47 @@ inferFlatReductionDimForLhsScale(linalg::GenericOp genericOp) {
   return *commonDataRed.begin();
 }
 
-static std::optional<unsigned>
+static FailureOr<AffineMap>
+projectIndexingMapThroughInputMap(AffineMap inputMap, AffineMap map) {
+  if (inputMap.getNumSymbols() != 0 || map.getNumSymbols() != 0) {
+    return failure();
+  }
+
+  SmallVector<int64_t> loopDimToInputDim(inputMap.getNumDims(), -1);
+  for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return failure();
+    }
+    int64_t loopDim = dimExpr.getPosition();
+    if (loopDimToInputDim[loopDim] != -1) {
+      return failure();
+    }
+    loopDimToInputDim[loopDim] = inputDim;
+  }
+
+  SmallVector<AffineExpr> projectedResults;
+  MLIRContext *context = inputMap.getContext();
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return failure();
+    }
+    int64_t inputDim = loopDimToInputDim[dimExpr.getPosition()];
+    if (inputDim == -1) {
+      return failure();
+    }
+    projectedResults.push_back(getAffineDimExpr(inputDim, context));
+  }
+
+  return AffineMap::get(inputMap.getNumResults(), /*symbolCount=*/0,
+                        projectedResults, context);
+}
+
+static std::optional<ExtractableElementwiseOperands>
 getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
-                                         unsigned argNumber) {
+                                         unsigned argNumber,
+                                         unsigned numDpsInputs) {
   if (isa<arith::ExtFOp, arith::ScalingExtFOp, arith::ScalingTruncFOp>(op)) {
     return std::nullopt;
   }
@@ -1130,6 +1174,7 @@ getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
   }
 
   std::optional<unsigned> blockArgOperandIndex;
+  SmallVector<unsigned> extraInputOperandIndices;
   for (auto [operandIndex, operand] : llvm::enumerate(op->getOperands())) {
     auto blockArg = dyn_cast<BlockArgument>(operand);
     if (blockArg && blockArg.getOwner() == &body &&
@@ -1141,13 +1186,26 @@ getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
       continue;
     }
 
-    if (op->getNumOperands() != 2 ||
-        !operand.getDefiningOp<arith::ConstantOp>()) {
+    if (op->getNumOperands() != 2) {
       return std::nullopt;
     }
+    if (operand.getDefiningOp<arith::ConstantOp>()) {
+      continue;
+    }
+    if (blockArg && blockArg.getOwner() == &body &&
+        blockArg.getArgNumber() < numDpsInputs) {
+      extraInputOperandIndices.push_back(blockArg.getArgNumber());
+      continue;
+    }
+    return std::nullopt;
   }
 
-  return blockArgOperandIndex;
+  if (!blockArgOperandIndex) {
+    return std::nullopt;
+  }
+
+  return ExtractableElementwiseOperands{*blockArgOperandIndex,
+                                        extraInputOperandIndices};
 }
 
 static std::optional<ElementwiseInputExtraction>
@@ -1180,24 +1238,41 @@ matchElementwiseInputExtraction(linalg::GenericOp genericOp) {
       continue;
     }
 
-    std::optional<unsigned> blockArgOperandIndex =
-        getExtractableElementwiseBlockArgOperand(singleUser, body,
-                                                 operandIndex);
-    if (!blockArgOperandIndex) {
+    std::optional<ExtractableElementwiseOperands> extractableOperands =
+        getExtractableElementwiseBlockArgOperand(singleUser, body, operandIndex,
+                                                 genericOp.getNumDpsInputs());
+    if (!extractableOperands) {
       continue;
     }
-    return ElementwiseInputExtraction{singleUser, operandIndex,
-                                      *blockArgOperandIndex};
+
+    AffineMap inputMap = genericOp.getIndexingMapsArray()[operandIndex];
+    bool canProjectExtraInputs = true;
+    for (unsigned extraOperandIndex :
+         extractableOperands->extraInputOperandIndices) {
+      if (failed(projectIndexingMapThroughInputMap(
+              inputMap, genericOp.getIndexingMapsArray()[extraOperandIndex]))) {
+        canProjectExtraInputs = false;
+        break;
+      }
+    }
+    if (!canProjectExtraInputs) {
+      continue;
+    }
+    return ElementwiseInputExtraction{
+        singleUser, operandIndex, extractableOperands->blockArgOperandIndex,
+        extractableOperands->extraInputOperandIndices};
   }
 
   return std::nullopt;
 }
 
-static Value createElementwiseInputGeneric(RewriterBase &rewriter,
-                                           Location loc, Value input,
+static Value createElementwiseInputGeneric(RewriterBase &rewriter, Location loc,
+                                           ValueRange inputs,
+                                           ArrayRef<AffineMap> indexingMaps,
                                            Type resultElementType,
                                            Operation *elementwiseOp,
-                                           unsigned blockArgOperandIndex) {
+                                           ValueRange mappedOperands) {
+  Value input = inputs.front();
   auto inputType = cast<RankedTensorType>(input.getType());
   auto resultType = RankedTensorType::get(
       inputType.getShape(), resultElementType, inputType.getEncoding());
@@ -1208,17 +1283,18 @@ static Value createElementwiseInputGeneric(RewriterBase &rewriter,
                                     resultElementType, inputType.getEncoding())
           : tensor::EmptyOp::create(rewriter, loc, mixedSizes,
                                     resultElementType);
-  SmallVector<AffineMap> maps(
-      2, rewriter.getMultiDimIdentityMap(inputType.getRank()));
   SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
                                                  utils::IteratorType::parallel);
   return linalg::GenericOp::create(
-             rewriter, loc, TypeRange{resultType}, ValueRange{input},
-             ValueRange{empty}, maps, iteratorTypes,
+             rewriter, loc, TypeRange{resultType}, inputs, ValueRange{empty},
+             indexingMaps, iteratorTypes,
              [&](OpBuilder &builder, Location nestedLoc, ValueRange args) {
                IRMapping mapping;
-               mapping.map(elementwiseOp->getOperand(blockArgOperandIndex),
-                           args.front());
+               for (auto [oldOperand, newArg] :
+                    llvm::zip_equal(mappedOperands,
+                                    args.take_front(mappedOperands.size()))) {
+                 mapping.map(oldOperand, newArg);
+               }
                for (Value operand : elementwiseOp->getOperands()) {
                  if (mapping.lookupOrNull(operand)) {
                    continue;
@@ -1250,10 +1326,32 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   OpOperand *inputOperand =
       genericOp.getDpsInputOperand(extraction->operandIndex);
   rewriter.setInsertionPoint(genericOp);
+
+  auto inputType = cast<RankedTensorType>(inputOperand->get().getType());
+  AffineMap identityMap = rewriter.getMultiDimIdentityMap(inputType.getRank());
+  SmallVector<Value> extractedInputs{inputOperand->get()};
+  SmallVector<Value> mappedOperands{
+      extraction->elementwiseOp->getOperand(extraction->blockArgOperandIndex)};
+  SmallVector<AffineMap> extractedMaps{identityMap};
+  AffineMap inputMap =
+      genericOp.getIndexingMapsArray()[extraction->operandIndex];
+  for (unsigned extraOperandIndex : extraction->extraInputOperandIndices) {
+    extractedInputs.push_back(
+        genericOp.getDpsInputOperand(extraOperandIndex)->get());
+    mappedOperands.push_back(body.getArgument(extraOperandIndex));
+    FailureOr<AffineMap> projectedMap = projectIndexingMapThroughInputMap(
+        inputMap, genericOp.getIndexingMapsArray()[extraOperandIndex]);
+    if (failed(projectedMap)) {
+      return failure();
+    }
+    extractedMaps.push_back(*projectedMap);
+  }
+  extractedMaps.push_back(identityMap);
+
   newOperands[extraction->operandIndex] = createElementwiseInputGeneric(
-      rewriter, genericOp.getLoc(), inputOperand->get(),
+      rewriter, genericOp.getLoc(), extractedInputs, extractedMaps,
       extraction->elementwiseOp->getResult(0).getType(),
-      extraction->elementwiseOp, extraction->blockArgOperandIndex);
+      extraction->elementwiseOp, mappedOperands);
 
   auto newLinalgOp = cast<linalg::LinalgOp>(mlir::cloneWithoutRegions(
       rewriter, cast<linalg::LinalgOp>(genericOp.getOperation()),

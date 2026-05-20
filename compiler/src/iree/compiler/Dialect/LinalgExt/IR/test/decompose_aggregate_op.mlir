@@ -527,9 +527,9 @@ func.func @exp_reduction(
 // CHECK-LABEL: @exp_reduction
 // CHECK-SAME:    %[[S:[0-9A-Za-z]*]]: tensor<20x4096x4096xf32>
 // CHECK-SAME:    %[[V:[0-9A-Za-z]*]]: tensor<20x4096x64xf32>
-// CHECK:       %[[M:.*]]       = linalg.generic
-// CHECK-SAME:                      ins(%[[S]]
-// CHECK-SAME:                      outs(
+// CHECK:       %[[SCALED_S:.*]] = linalg.generic {{.*}} ins(%[[S]]
+// CHECK:                             arith.mulf
+// CHECK:       %[[M:.*]]       = linalg.generic {{.*}}iterator_types = ["parallel", "parallel", "reduction"]{{.*}} ins(%[[SCALED_S]]
 // CHECK:                             arith.maximumf
 // CHECK:       %[[sub:.*]]     = linalg.generic
 // CHECK-SAME:                      ins(%[[M]]
@@ -556,3 +556,63 @@ func.func @exp_reduction(
 // CHECK:                             arith.mulf
 // CHECK:                             arith.addf
 // CHECK:      return %[[M]], %[[SUM]], %[[PV]]
+
+// -----
+
+// Spec to decompose exp reduction op.
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["iree_linalg_ext.exp_reduction"]} in %module_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.decompose_aggregate_op %0 : (!transform.any_op) -> ()
+    transform.yield
+  }
+}
+
+func.func @exp_reduction_peel_input_block_arg(
+  %s_in: tensor<20x128x256xf32>,
+  %v_in: tensor<20x256x64xf32>,
+  %scale: tensor<20x256xf32>,
+  %max_init: tensor<20x128xf32>,
+  %sum_init: tensor<20x128xf32>,
+  %acc_init: tensor<20x128x64xf32>
+) -> (tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x64xf32>)
+  {
+  %max, %sumt, %pv = iree_linalg_ext.exp_reduction {
+    indexing_maps = [
+      affine_map<(B, M, N, K) -> (B, M, K)>,
+      affine_map<(B, M, N, K) -> (B, K, N)>,
+      affine_map<(B, M, N, K) -> (B, K)>,
+      affine_map<(B, M, N, K) -> (B, M)>,
+      affine_map<(B, M, N, K) -> (B, M)>,
+      affine_map<(B, M, N, K) -> (B, M, N)>
+    ],
+    iterator_types = [
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<reduction>
+    ],
+    exp_reduced_operands = [1, 2]
+  } attributes {lowering_config = #iree_codegen.lowering_config<tile_sizes = []>}
+    ins(%s_in, %v_in, %scale : tensor<20x128x256xf32>, tensor<20x256x64xf32>, tensor<20x256xf32>)
+    outs(%max_init, %sum_init, %acc_init : tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x64xf32>)
+  {
+  ^bb0(%ex : f32, %v : f32, %scale_arg : f32, %m : f32, %sum : f32, %acc : f32):
+    %nsum = arith.addf %ex, %sum : f32
+    %scaled_v = arith.mulf %v, %scale_arg : f32
+    %mul  = arith.mulf %ex, %scaled_v : f32
+    %nacc = arith.addf %mul, %acc : f32
+    iree_linalg_ext.yield %m, %nsum, %nacc : f32, f32, f32
+  } -> tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x64xf32>
+
+  return %max, %sumt, %pv : tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x64xf32>
+}
+// CHECK-LABEL: @exp_reduction_peel_input_block_arg
+// CHECK-SAME:    %[[V:[0-9A-Za-z]*]]: tensor<20x256x64xf32>
+// CHECK-SAME:    %[[SCALE:[0-9A-Za-z]*]]: tensor<20x256xf32>
+// CHECK:       %[[SCALED_V:.*]] = linalg.generic {{.*}} ins(%[[V]], %[[SCALE]] : tensor<20x256x64xf32>, tensor<20x256xf32>)
+// CHECK:           arith.mulf
+// CHECK:       %[[PV:.*]] = linalg.generic {{.*}} ins(%[[SCALED_V]]
+// CHECK:           arith.mulf
+// CHECK:           arith.addf
+// CHECK:       return {{.*}}%[[PV]]

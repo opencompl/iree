@@ -11,4 +11,4 @@ cd $SCRIPT_DIR
 
 # python3 $BASE_DIR/third_party/llvm-project/llvm/utils/lit/lit.py -v \
 #     "$INPUT_FILE" > "${BASE_NAME}.out" 2>"${BASE_NAME}.err"
-iree-opt --pass-pipeline="builtin.module(func.func(iree-linalg-ext-decompose-aggregated-ops{filter-ops=iree_linalg_ext.exp_reduction}), canonicalize, cse)" "$INPUT_FILE" > "${BASE_NAME}.out" 2>"${BASE_NAME}.err"
+iree-opt --pass-pipeline="builtin.module(func.func(iree-linalg-ext-repack-scaling-trunc-scales, iree-linalg-ext-decompose-aggregated-ops{filter-ops=iree_linalg_ext.exp_reduction}), canonicalize, cse)" "$INPUT_FILE" > "${BASE_NAME}.out" 2>"${BASE_NAME}.err"

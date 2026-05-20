@@ -59,7 +59,8 @@ func.func @dispatch_scaled_matmul_like_4x32x4096x4096x2x32_f4E2M1FNxf4E2M1FNxf8E
       %38:3 = iree_linalg_ext.exp_reduction{indexing_maps = [affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d5)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d5, d3, d4)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d5, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3, d4)>], iterator_types = [#iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<reduction>, #iree_linalg_ext.iterator_type<reduction>], exp_reduced_operands = [1, 2]} attributes {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_32x32x64_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>, reduction = [0, 0, 0, 0, 0, 64], subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 4, 5]], workgroup = [1, 1, 64, 0, 0, 0]}>} ins(%37, %extracted_slice_6, %extracted_slice_7 : tensor<1x1x64x64xf32>, tensor<1x1x64x2x32xf4E2M1FN>, tensor<1x1x64x2xf8E8M0FNU>) outs(%arg5, %arg6, %arg7 : tensor<1x1x64xf32>, tensor<1x1x64xf32>, tensor<1x1x64x2x32xf32>) {
       ^bb0(%arg8: f32, %arg9: f4E2M1FN, %arg10: f8E8M0FNU, %arg11: f32, %arg12: f32, %arg13: f32):
         %39 = arith.mulf %arg8, %cst_1 : f32
-        %result, %scale = iree_linalg_ext.scaling_truncf %39 : f32 to f4E2M1FN, f8E8M0FNU
+        // %result, %scale = iree_linalg_ext.scaling_truncf %39 : f32 to f4E2M1FN, f8E8M0FNU
+        %result = arith.scaling_truncf %39, %scale:  f32, f8E8M0FNU to f4E2M1FN
         %40 = arith.scaling_extf %result, %scale : f4E2M1FN, f8E8M0FNU to f32
         %41 = arith.scaling_extf %arg9, %arg10 : f4E2M1FN, f8E8M0FNU to f32
         %42 = arith.addf %arg8, %arg12 : f32
