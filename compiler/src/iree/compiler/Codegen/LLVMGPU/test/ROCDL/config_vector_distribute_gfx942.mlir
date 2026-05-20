@@ -288,6 +288,83 @@ func.func @attention_20x4096x64x4096x64() {
 // -----
 
 // CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute>
+// CHECK-LABEL: func.func @explicit_attention_20x4096x64x4096x64()
+
+#qk_q = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+#qk_k = affine_map<(d0, d1, d2, d3) -> (d0, d2, d3)>
+#qk_s = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+#er_s = affine_map<(d0, d1, d2, d3) -> (d0, d1, d3)>
+#er_v = affine_map<(d0, d1, d2, d3) -> (d0, d3, d2)>
+#er_m = affine_map<(d0, d1, d2, d3) -> (d0, d1)>
+#er_o = affine_map<(d0, d1, d2, d3) -> (d0, d1, d2)>
+#pipeline_layout = #hal.pipeline.layout<bindings = [
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>,
+  #hal.pipeline.binding<storage_buffer>
+]>
+func.func @explicit_attention_20x4096x64x4096x64() {
+  %c0 = arith.constant 0 : index
+  %cst = arith.constant 0.000000e+00 : f32
+  %max_cst = arith.constant -3.40282347E+38 : f32
+  %0 = hal.interface.binding.subspan layout(#pipeline_layout) binding(0) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf16>>
+  %1 = hal.interface.binding.subspan layout(#pipeline_layout) binding(1) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf16>>
+  %2 = hal.interface.binding.subspan layout(#pipeline_layout) binding(2) alignment(64) offset(%c0) flags(ReadOnly) : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf16>>
+  %3 = hal.interface.binding.subspan layout(#pipeline_layout) binding(3) alignment(64) offset(%c0) : !iree_tensor_ext.dispatch.tensor<writeonly:tensor<20x4096x64xf32>>
+  %q = iree_tensor_ext.dispatch.tensor.load %0, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf16>> -> tensor<20x4096x64xf16>
+  %k = iree_tensor_ext.dispatch.tensor.load %1, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf16>> -> tensor<20x4096x64xf16>
+  %v = iree_tensor_ext.dispatch.tensor.load %2, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<20x4096x64xf16>> -> tensor<20x4096x64xf16>
+  %s_empty = tensor.empty() : tensor<20x4096x4096xf32>
+  %s_init = linalg.fill ins(%cst : f32) outs(%s_empty : tensor<20x4096x4096xf32>) -> tensor<20x4096x4096xf32>
+  %s = linalg.generic {indexing_maps = [#qk_q, #qk_k, #qk_s], iterator_types = ["parallel", "parallel", "parallel", "reduction"]} ins(%q, %k : tensor<20x4096x64xf16>, tensor<20x4096x64xf16>) outs(%s_init : tensor<20x4096x4096xf32>) {
+  ^bb0(%q_in: f16, %k_in: f16, %s_out: f32):
+    %q_f32 = arith.extf %q_in : f16 to f32
+    %k_f32 = arith.extf %k_in : f16 to f32
+    %mul = arith.mulf %q_f32, %k_f32 : f32
+    %sum = arith.addf %mul, %s_out : f32
+    linalg.yield %sum : f32
+  } -> tensor<20x4096x4096xf32>
+  %max_empty = tensor.empty() : tensor<20x4096xf32>
+  %out_empty = tensor.empty() : tensor<20x4096x64xf32>
+  %max_init = linalg.fill ins(%max_cst : f32) outs(%max_empty : tensor<20x4096xf32>) -> tensor<20x4096xf32>
+  %sum_init = linalg.fill ins(%cst : f32) outs(%max_empty : tensor<20x4096xf32>) -> tensor<20x4096xf32>
+  %acc_init = linalg.fill ins(%cst : f32) outs(%out_empty : tensor<20x4096x64xf32>) -> tensor<20x4096x64xf32>
+  %exp:3 = iree_linalg_ext.exp_reduction {
+    indexing_maps = [#er_s, #er_v, #er_m, #er_m, #er_o],
+    iterator_types = [
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<reduction>
+    ],
+    exp_reduced_operands = [1, 2]
+  } ins(%s, %v : tensor<20x4096x4096xf32>, tensor<20x4096x64xf16>)
+    outs(%max_init, %sum_init, %acc_init : tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>) {
+  ^bb0(%score: f32, %v_in: f16, %max: f32, %sum: f32, %acc: f32):
+    %v_f32 = arith.extf %v_in : f16 to f32
+    %new_sum = arith.addf %score, %sum : f32
+    %mul = arith.mulf %score, %v_f32 : f32
+    %new_acc = arith.addf %mul, %acc : f32
+    iree_linalg_ext.yield %max, %new_sum, %new_acc : f32, f32, f32
+  } -> tensor<20x4096xf32>, tensor<20x4096xf32>, tensor<20x4096x64xf32>
+  iree_tensor_ext.dispatch.tensor.store %exp#2, %3, offsets = [0, 0, 0], sizes = [20, 4096, 64], strides = [1, 1, 1] : tensor<20x4096x64xf32> -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<20x4096x64xf32>>
+  return
+}
+
+// CHECK:      linalg.generic
+// CHECK-SAME: lowering_config = #iree_gpu.lowering_config
+// CHECK-SAME: mma_kind = #iree_gpu.virtual_mma_layout<VMFMA_F32_16x16x32_F16
+// CHECK-SAME{LITERAL}: subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 2, 3]]
+// CHECK:      iree_linalg_ext.exp_reduction
+// CHECK-SAME: lowering_config = #iree_gpu.lowering_config
+// CHECK-SAME: mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16
+// CHECK-SAME: reduction = [0, 0, 0, 64]
+// CHECK-SAME{LITERAL}: subgroup_basis = [[1, 4, 1, 1, 1], [0, 1, 4, 2]]
+// CHECK-SAME: workgroup = [1, 64, 64, 0]
+
+// -----
+
+// CHECK:       #iree_codegen.translation_info<pipeline = #iree_gpu.pipeline<VectorDistribute>
 // CHECK-NOT:   prefetch_num_stages = 2
 
 // CHECK-LABEL: func.func @attention_20x4096x64x4096x64_f8()

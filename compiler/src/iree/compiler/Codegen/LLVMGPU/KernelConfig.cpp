@@ -235,19 +235,164 @@ getMatmulConfig(IREE::GPU::TargetAttr target) {
 // Vector Distribution Contraction/Convolution Pipeline Configuration
 //====---------------------------------------------------------------------===//
 
-static IREE::GPU::Basis projectBasis(const IREE::GPU::Basis &basis,
-                                     ArrayRef<int64_t> projectedDims) {
-  // Projection simply involves projecting the mapping and keeping the counts.
+static int64_t getProjectedRank(ArrayRef<int64_t> aggregateToOpDim) {
+  int64_t rank = 0;
+  for (int64_t dim : aggregateToOpDim) {
+    if (dim >= 0) {
+      rank = std::max(rank, dim + 1);
+    }
+  }
+  return rank;
+}
+
+static SmallVector<int64_t>
+projectTileSizes(ArrayRef<int64_t> tileSizes,
+                 ArrayRef<int64_t> aggregateToOpDim) {
+  SmallVector<int64_t> projected(getProjectedRank(aggregateToOpDim), 0);
+  for (auto [aggregateDim, opDim] : llvm::enumerate(aggregateToOpDim)) {
+    if (opDim >= 0) {
+      projected[opDim] = tileSizes[aggregateDim];
+    }
+  }
+  return projected;
+}
+
+static IREE::GPU::Basis projectBasisToOp(const IREE::GPU::Basis &basis,
+                                         ArrayRef<int64_t> aggregateToOpDim) {
   IREE::GPU::Basis projectedBasis;
   projectedBasis.counts = basis.counts;
-  SetVector<int64_t> projected(projectedDims.begin(), projectedDims.end());
-  for (auto [dim, map] : llvm::enumerate(basis.mapping)) {
-    if (projected.contains(dim)) {
-      continue;
+  projectedBasis.mapping.resize(getProjectedRank(aggregateToOpDim));
+  for (auto [aggregateDim, opDim] : llvm::enumerate(aggregateToOpDim)) {
+    if (opDim >= 0) {
+      projectedBasis.mapping[opDim] = basis.mapping[aggregateDim];
     }
-    projectedBasis.mapping.push_back(map);
   }
   return projectedBasis;
+}
+
+static SmallVector<int64_t> getIdentityProjectionMap(int64_t rank) {
+  SmallVector<int64_t> projection(rank);
+  std::iota(projection.begin(), projection.end(), 0);
+  return projection;
+}
+
+static SmallVector<int64_t>
+getDropDimsProjectionMap(int64_t rank, ArrayRef<int64_t> dropDims) {
+  llvm::SmallDenseSet<int64_t> dropped(dropDims.begin(), dropDims.end());
+  SmallVector<int64_t> projection(rank, -1);
+  int64_t nextDim = 0;
+  for (int64_t dim : llvm::seq<int64_t>(0, rank)) {
+    if (!dropped.contains(dim)) {
+      projection[dim] = nextDim++;
+    }
+  }
+  return projection;
+}
+
+struct AttentionConfigInfo {
+  IREE::LinalgExt::AttentionOpDetail opInfo;
+  SmallVector<int64_t> bounds;
+  Value query;
+  Value key;
+  Value value;
+  AffineMap queryMap;
+  AffineMap keyMap;
+  AffineMap valueMap;
+  Operation *rootOp = nullptr;
+  IREE::LinalgExt::OnlineAttentionOp onlineAttentionOp;
+  linalg::LinalgOp qkMatmulOp;
+  SmallVector<int64_t> aggregateToRoot;
+  SmallVector<int64_t> aggregateToQK;
+  SmallVector<int64_t> aggregateToPV;
+
+  bool isExplicitExpReduction() const { return qkMatmulOp != nullptr; }
+};
+
+static LogicalResult reconcileBounds(int64_t &bound, int64_t newBound) {
+  if (ShapedType::isDynamic(newBound)) {
+    return success();
+  }
+  if (ShapedType::isDynamic(bound)) {
+    bound = newBound;
+    return success();
+  }
+  return success(bound == newBound);
+}
+
+static FailureOr<SmallVector<int64_t>>
+inferStaticLoopRangesFromIndexingMaps(ArrayRef<Value> values,
+                                      ArrayRef<AffineMap> indexingMaps) {
+  if (indexingMaps.empty()) {
+    return failure();
+  }
+  int64_t domainRank = indexingMaps.front().getNumDims();
+  SmallVector<int64_t> bounds(domainRank, ShapedType::kDynamic);
+  for (auto [value, indexingMap] : llvm::zip_equal(values, indexingMaps)) {
+    auto shapedType = dyn_cast<ShapedType>(value.getType());
+    if (!shapedType || !indexingMap.isProjectedPermutation()) {
+      return failure();
+    }
+    ArrayRef<int64_t> shape = shapedType.getShape();
+    if (shape.size() != indexingMap.getNumResults()) {
+      return failure();
+    }
+    for (auto [result, size] :
+         llvm::zip_equal(indexingMap.getResults(), shape)) {
+      auto dim = dyn_cast<AffineDimExpr>(result);
+      if (!dim || failed(reconcileBounds(bounds[dim.getPosition()], size))) {
+        return failure();
+      }
+    }
+  }
+  return bounds;
+}
+
+static FailureOr<AffineMap>
+remapProjectedPermutationMap(AffineMap map, ArrayRef<int64_t> dimMap,
+                             int64_t newDomainRank) {
+  SmallVector<AffineExpr> results;
+  MLIRContext *context = map.getContext();
+  for (AffineExpr result : map.getResults()) {
+    auto dim = dyn_cast<AffineDimExpr>(result);
+    if (!dim) {
+      return failure();
+    }
+    int64_t newDim = dimMap[dim.getPosition()];
+    if (newDim < 0) {
+      return failure();
+    }
+    results.push_back(getAffineDimExpr(newDim, context));
+  }
+  return AffineMap::get(newDomainRank, /*symbolCount=*/0, results, context);
+}
+
+static bool isSingleInputElementwise(linalg::GenericOp op) {
+  if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1 ||
+      op->getNumResults() != 1 || op.getNumReductionLoops() != 0) {
+    return false;
+  }
+  return op.getMatchingIndexingMap(op.getDpsInputOperand(0)) ==
+         op.getMatchingIndexingMap(op.getDpsInitOperand(0));
+}
+
+static linalg::LinalgOp findContractionProducer(Value value) {
+  while (Operation *producer = value.getDefiningOp()) {
+    if (auto linalgOp = dyn_cast<linalg::LinalgOp>(producer)) {
+      if (linalg::isaContractionOpInterface(linalgOp) &&
+          linalgOp.getNumDpsInputs() >= 2 && linalgOp.getNumDpsInits() == 1 &&
+          linalgOp->getNumResults() == 1) {
+        return linalgOp;
+      }
+      if (auto genericOp = dyn_cast<linalg::GenericOp>(producer)) {
+        if (isSingleInputElementwise(genericOp)) {
+          value = genericOp.getDpsInputOperand(0)->get();
+          continue;
+        }
+      }
+    }
+    return nullptr;
+  }
+  return nullptr;
 }
 
 static LogicalResult
@@ -749,9 +894,208 @@ setAttentionPipelineAttributes(IREE::GPU::TargetAttr target,
           target.getContext(), IREE::Codegen::DenormalFpMath::PreserveSign));
 }
 
+static LogicalResult setAttentionConfigsAndEntryPointFnTranslation(
+    AttentionConfigInfo &configInfo, FunctionOpInterface entryPoint,
+    IREE::GPU::LoweringConfigAttr rootLoweringConfig,
+    IREE::GPU::LoweringConfigAttr qkLoweringConfig,
+    IREE::GPU::LoweringConfigAttr pvLoweringConfig,
+    IREE::Codegen::TranslationInfoAttr translationInfo) {
+  if (configInfo.isExplicitExpReduction()) {
+    setLoweringConfig(configInfo.qkMatmulOp, qkLoweringConfig);
+  } else {
+    OpBuilder b(configInfo.rootOp);
+    SmallVector<NamedAttribute, 2> qkAttrs;
+    SmallVector<NamedAttribute, 2> pvAttrs;
+    qkAttrs.emplace_back("lowering_config", qkLoweringConfig);
+    pvAttrs.emplace_back("lowering_config", pvLoweringConfig);
+
+    SmallVector<NamedAttribute, 2> decompositionConfig;
+    decompositionConfig.emplace_back(
+        IREE::LinalgExt::OnlineAttentionOp::getQKAttrStr(),
+        b.getDictionaryAttr(qkAttrs));
+    decompositionConfig.emplace_back(
+        IREE::LinalgExt::OnlineAttentionOp::getPVAttrStr(),
+        b.getDictionaryAttr(pvAttrs));
+    configInfo.onlineAttentionOp.setDecompositionConfigAttr(
+        b.getDictionaryAttr(decompositionConfig));
+  }
+
+  return setOpConfigAndEntryPointFnTranslation(
+      entryPoint, configInfo.rootOp, rootLoweringConfig, translationInfo);
+}
+
+static FailureOr<AttentionConfigInfo>
+getOnlineAttentionConfigInfo(IREE::LinalgExt::OnlineAttentionOp op) {
+  FailureOr<SmallVector<int64_t>> maybeBounds = op.getStaticLoopRanges();
+  if (failed(maybeBounds)) {
+    return failure();
+  }
+
+  FailureOr<IREE::LinalgExt::AttentionOpDetail> maybeOpInfo =
+      IREE::LinalgExt::AttentionOpDetail::get(op.getQueryMap(), op.getKeyMap(),
+                                              op.getValueMap(),
+                                              op.getOutputMap());
+  if (failed(maybeOpInfo)) {
+    return failure();
+  }
+
+  AttentionConfigInfo configInfo;
+  configInfo.opInfo = *maybeOpInfo;
+  configInfo.bounds = *maybeBounds;
+  configInfo.query = op.getQuery();
+  configInfo.key = op.getKey();
+  configInfo.value = op.getValue();
+  configInfo.queryMap = op.getQueryMap();
+  configInfo.keyMap = op.getKeyMap();
+  configInfo.valueMap = op.getValueMap();
+  configInfo.rootOp = op;
+  configInfo.onlineAttentionOp = op;
+  int64_t domainRank = configInfo.opInfo.getDomainRank();
+  configInfo.aggregateToRoot = getIdentityProjectionMap(domainRank);
+  configInfo.aggregateToQK =
+      getDropDimsProjectionMap(domainRank, configInfo.opInfo.getNDims());
+  configInfo.aggregateToPV =
+      getDropDimsProjectionMap(domainRank, configInfo.opInfo.getK1Dims());
+  return configInfo;
+}
+
+static FailureOr<AttentionConfigInfo>
+getExplicitAttentionConfigInfo(IREE::LinalgExt::ExpReductionOp op) {
+  if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() < 3) {
+    return failure();
+  }
+
+  Value scoreValue = op.getDpsInputOperand(0)->get();
+  linalg::LinalgOp qkOp = findContractionProducer(scoreValue);
+  if (!qkOp) {
+    return failure();
+  }
+
+  // The explicit form has two loop domains:
+  //   QK:  batch x M x K2 x K1 -> batch x M x K2
+  //   PV:  batch x M x N x K2  -> batch x M x N
+  // Match them through the shared score tensor and rebuild the aggregate
+  // attention domain expected by the existing attention heuristics.
+  SmallVector<Value> expValues = llvm::to_vector(op.getDpsInputs());
+  llvm::append_range(expValues, op.getDpsInits());
+  SmallVector<AffineMap> expIndexingMaps = op.getIndexingMapsArray();
+  FailureOr<SmallVector<int64_t>> maybeExpBounds =
+      inferStaticLoopRangesFromIndexingMaps(expValues, expIndexingMaps);
+  if (failed(maybeExpBounds)) {
+    return failure();
+  }
+
+  SmallVector<int64_t> qkBounds = qkOp.getStaticLoopRanges();
+  int64_t qkDomainRank = qkOp.getNumLoops();
+  int64_t expDomainRank = expIndexingMaps.front().getNumDims();
+
+  AffineMap qkOutputMap =
+      qkOp.getMatchingIndexingMap(qkOp.getDpsInitOperand(0));
+  AffineMap expScoreMap = op.getMatchingIndexingMap(op.getDpsInputOperand(0));
+  if (!qkOutputMap.isProjectedPermutation() ||
+      !expScoreMap.isProjectedPermutation() ||
+      qkOutputMap.getNumResults() != expScoreMap.getNumResults()) {
+    return failure();
+  }
+
+  SmallVector<int64_t> expToAggregate(expDomainRank, -1);
+  SmallVector<int64_t> aggregateToQK = getIdentityProjectionMap(qkDomainRank);
+  SmallVector<int64_t> aggregateToExp(qkDomainRank, -1);
+
+  for (auto [qkExpr, expExpr] :
+       llvm::zip_equal(qkOutputMap.getResults(), expScoreMap.getResults())) {
+    auto qkDim = dyn_cast<AffineDimExpr>(qkExpr);
+    auto expDim = dyn_cast<AffineDimExpr>(expExpr);
+    if (!qkDim || !expDim) {
+      return failure();
+    }
+    int64_t qkDimPos = qkDim.getPosition();
+    int64_t expDimPos = expDim.getPosition();
+    if (expToAggregate[expDimPos] >= 0 &&
+        expToAggregate[expDimPos] != qkDimPos) {
+      return failure();
+    }
+    if (aggregateToExp[qkDimPos] >= 0 &&
+        aggregateToExp[qkDimPos] != expDimPos) {
+      return failure();
+    }
+    expToAggregate[expDimPos] = qkDimPos;
+    aggregateToExp[qkDimPos] = expDimPos;
+  }
+
+  int64_t aggregateDomainRank = qkDomainRank;
+  for (int64_t expDim : llvm::seq<int64_t>(0, expDomainRank)) {
+    if (expToAggregate[expDim] >= 0) {
+      continue;
+    }
+    expToAggregate[expDim] = aggregateDomainRank++;
+    aggregateToExp.push_back(expDim);
+    aggregateToQK.push_back(-1);
+  }
+
+  SmallVector<int64_t> bounds(aggregateDomainRank, ShapedType::kDynamic);
+  for (auto [qkDim, qkBound] : llvm::enumerate(qkBounds)) {
+    bounds[qkDim] = qkBound;
+  }
+  for (auto [expDim, expBound] : llvm::enumerate(*maybeExpBounds)) {
+    if (failed(reconcileBounds(bounds[expToAggregate[expDim]], expBound))) {
+      return failure();
+    }
+  }
+
+  SmallVector<int64_t> qkToAggregate = getIdentityProjectionMap(qkDomainRank);
+  FailureOr<AffineMap> maybeQMap = remapProjectedPermutationMap(
+      qkOp.getMatchingIndexingMap(qkOp.getDpsInputOperand(0)), qkToAggregate,
+      aggregateDomainRank);
+  FailureOr<AffineMap> maybeKMap = remapProjectedPermutationMap(
+      qkOp.getMatchingIndexingMap(qkOp.getDpsInputOperand(1)), qkToAggregate,
+      aggregateDomainRank);
+  FailureOr<AffineMap> maybeQKSMap = remapProjectedPermutationMap(
+      qkOutputMap, qkToAggregate, aggregateDomainRank);
+  FailureOr<AffineMap> maybeScoreMap = remapProjectedPermutationMap(
+      expScoreMap, expToAggregate, aggregateDomainRank);
+  FailureOr<AffineMap> maybeVMap = remapProjectedPermutationMap(
+      op.getMatchingIndexingMap(op.getDpsInputOperand(1)), expToAggregate,
+      aggregateDomainRank);
+  FailureOr<AffineMap> maybeOMap = remapProjectedPermutationMap(
+      op.getMatchingIndexingMap(op.getDpsInitOperand(op.getNumDpsInits() - 1)),
+      expToAggregate, aggregateDomainRank);
+  if (failed(maybeQMap) || failed(maybeKMap) || failed(maybeQKSMap) ||
+      failed(maybeScoreMap) || failed(maybeVMap) || failed(maybeOMap) ||
+      *maybeQKSMap != *maybeScoreMap) {
+    return failure();
+  }
+
+  FailureOr<IREE::LinalgExt::AttentionOpDetail> maybeOpInfo =
+      IREE::LinalgExt::AttentionOpDetail::get(*maybeQMap, *maybeKMap,
+                                              *maybeVMap, *maybeOMap);
+  if (failed(maybeOpInfo) || maybeOpInfo->getMDims().empty() ||
+      maybeOpInfo->getK1Dims().empty() || maybeOpInfo->getK2Dims().empty() ||
+      maybeOpInfo->getNDims().empty() ||
+      maybeOpInfo->getSMap() != *maybeScoreMap) {
+    return failure();
+  }
+
+  AttentionConfigInfo configInfo;
+  configInfo.opInfo = *maybeOpInfo;
+  configInfo.bounds = std::move(bounds);
+  configInfo.query = qkOp.getDpsInputOperand(0)->get();
+  configInfo.key = qkOp.getDpsInputOperand(1)->get();
+  configInfo.value = op.getDpsInputOperand(1)->get();
+  configInfo.queryMap = *maybeQMap;
+  configInfo.keyMap = *maybeKMap;
+  configInfo.valueMap = *maybeVMap;
+  configInfo.rootOp = op;
+  configInfo.qkMatmulOp = qkOp;
+  configInfo.aggregateToRoot = aggregateToExp;
+  configInfo.aggregateToPV = aggregateToExp;
+  configInfo.aggregateToQK = aggregateToQK;
+  return configInfo;
+}
+
 static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
-    IREE::LinalgExt::OnlineAttentionOp op) {
+    AttentionConfigInfo &configInfo) {
   if (target.getWgp().getMma().empty()) {
     return failure();
   }
@@ -759,17 +1103,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
 
   // Get iteration domain bounds.
-  OpBuilder b(op);
-  FailureOr<SmallVector<int64_t>> maybeBounds = op.getStaticLoopRanges();
-  if (failed(maybeBounds)) {
-    return failure();
-  }
-  ArrayRef<int64_t> bounds = maybeBounds.value();
-
-  auto opInfo =
-      IREE::LinalgExt::AttentionOpDetail::get(
-          op.getQueryMap(), op.getKeyMap(), op.getValueMap(), op.getOutputMap())
-          .value();
+  OpBuilder b(configInfo.rootOp);
+  ArrayRef<int64_t> bounds = configInfo.bounds;
+  IREE::LinalgExt::AttentionOpDetail &opInfo = configInfo.opInfo;
 
   auto getDimBounds = [&](ArrayRef<int64_t> dims) -> SmallVector<int64_t> {
     return llvm::map_to_vector(dims, [&](int64_t dim) { return bounds[dim]; });
@@ -819,9 +1155,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   k1Dims = getStaticDims(opInfo.getK1Dims());
   nDims = getStaticDims(opInfo.getNDims());
 
-  Value qMatrix = op.getQuery();
-  Value kMatrix = op.getKey();
-  Value vMatrix = op.getValue();
+  Value qMatrix = configInfo.query;
+  Value kMatrix = configInfo.key;
+  Value vMatrix = configInfo.value;
 
   // Helper fn to store mma information.
   auto storeMmaInfo = [](IREE::GPU::MmaInterfaceAttr mma,
@@ -833,7 +1169,7 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
 
   SmallVector<GPUIntrinsicType> intrinsics;
   intrinsics.reserve(target.getWgp().getMma().size());
-  MLIRContext *context = op.getContext();
+  MLIRContext *context = configInfo.rootOp->getContext();
   for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
     if (mma.getSubgroupSize() != targetSubgroupSize) {
       continue;
@@ -893,13 +1229,15 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   // Infer if Q, K and V are transposed to help generate better schedule.
   bool transposedQ =
       k1Dims.back() !=
-      cast<AffineDimExpr>(op.getQueryMap().getResults().back()).getPosition();
+      cast<AffineDimExpr>(configInfo.queryMap.getResults().back())
+          .getPosition();
   bool transposedK =
       k1Dims.back() !=
-      cast<AffineDimExpr>(op.getKeyMap().getResults().back()).getPosition();
+      cast<AffineDimExpr>(configInfo.keyMap.getResults().back()).getPosition();
   bool transposedV =
       k2Dims.back() !=
-      cast<AffineDimExpr>(op.getValueMap().getResults().back()).getPosition();
+      cast<AffineDimExpr>(configInfo.valueMap.getResults().back())
+          .getPosition();
 
   int64_t maxSharedMemoryBytes = target.getWgp().getMaxWorkgroupMemoryBytes();
   // First try to find a schedule with an exactly matching intrinsic.
@@ -984,11 +1322,6 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     }
   }
 
-  SmallVector<NamedAttribute, 2> attrs = {
-      NamedAttribute("workgroup", b.getI64ArrayAttr(workgroupTileSizes)),
-      NamedAttribute("reduction", b.getI64ArrayAttr(reductionTileSizes))};
-  IREE::GPU::appendPromotedOperandsList(context, attrs, {0, 1, 2});
-
   // Check if transposing both intrinsics eliminates the layout conflict
   // between QK output and PV LHS input.
   auto matchLayout = [](IREE::GPU::MMASingleSubgroupLayout a,
@@ -1027,44 +1360,41 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   IREE::GPU::appendPromotedOperandsList(context, qkConfig, {0, 1});
   IREE::GPU::setMmaKind(context, qkConfig,
                         getIntrinsic(qkSchedule.mmaKind, useColMajor));
-  IREE::GPU::setBasis(context, qkConfig, IREE::GPU::TilingLevel::Subgroup,
-                      projectBasis(subgroupBasis, opInfo.getNDims()));
+  IREE::GPU::setBasis(
+      context, qkConfig, IREE::GPU::TilingLevel::Subgroup,
+      projectBasisToOp(subgroupBasis, configInfo.aggregateToQK));
 
   // Configuring for pv matmul.
   IREE::GPU::appendPromotedOperandsList(context, pvConfig, {1});
   IREE::GPU::setMmaKind(context, pvConfig,
                         getIntrinsic(pvSchedule.mmaKind, useColMajor));
-  IREE::GPU::setBasis(context, pvConfig, IREE::GPU::TilingLevel::Subgroup,
-                      projectBasis(subgroupBasis, opInfo.getK1Dims()));
+  IREE::GPU::setBasis(
+      context, pvConfig, IREE::GPU::TilingLevel::Subgroup,
+      projectBasisToOp(subgroupBasis, configInfo.aggregateToPV));
 
-  SmallVector<NamedAttribute, 2> qkAttrs;
-  SmallVector<NamedAttribute, 2> pvAttrs;
+  SmallVector<NamedAttribute, 4> rootAttrs = {
+      NamedAttribute("workgroup",
+                     b.getI64ArrayAttr(projectTileSizes(
+                         workgroupTileSizes, configInfo.aggregateToRoot))),
+      NamedAttribute("reduction",
+                     b.getI64ArrayAttr(projectTileSizes(
+                         reductionTileSizes, configInfo.aggregateToRoot)))};
+  if (configInfo.isExplicitExpReduction()) {
+    llvm::append_range(rootAttrs, pvConfig);
+  } else {
+    IREE::GPU::appendPromotedOperandsList(context, rootAttrs, {0, 1, 2});
+  }
 
   auto qkConfigDict = b.getDictionaryAttr(qkConfig);
   auto pvConfigDict = b.getDictionaryAttr(pvConfig);
+  auto rootConfigDict = b.getDictionaryAttr(rootAttrs);
 
   auto qkLoweringConfig =
       IREE::GPU::LoweringConfigAttr::get(context, qkConfigDict);
   auto pvLoweringConfig =
       IREE::GPU::LoweringConfigAttr::get(context, pvConfigDict);
-
-  qkAttrs.emplace_back("lowering_config", qkLoweringConfig);
-  pvAttrs.emplace_back("lowering_config", pvLoweringConfig);
-
-  auto qkAttrDict = b.getDictionaryAttr(qkAttrs);
-  auto pvAttrDict = b.getDictionaryAttr(pvAttrs);
-
-  SmallVector<NamedAttribute, 2> decompositionConfig;
-  decompositionConfig.emplace_back(
-      IREE::LinalgExt::OnlineAttentionOp::getQKAttrStr(), qkAttrDict);
-  decompositionConfig.emplace_back(
-      IREE::LinalgExt::OnlineAttentionOp::getPVAttrStr(), pvAttrDict);
-
-  DictionaryAttr decompositionConfigDict =
-      b.getDictionaryAttr(decompositionConfig);
-
-  auto configDict = b.getDictionaryAttr(attrs);
-  auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
+  auto rootLoweringConfig =
+      IREE::GPU::LoweringConfigAttr::get(context, rootConfigDict);
 
   SmallVector<NamedAttribute, 1> pipelineAttrs;
 
@@ -1076,11 +1406,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
 
   auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
 
-  // Set attention decomposition control config.
-  op.setDecompositionConfigAttr(decompositionConfigDict);
-
-  return setOpConfigAndEntryPointFnTranslation(
-      entryPoint, op, loweringConfig,
+  return setAttentionConfigsAndEntryPointFnTranslation(
+      configInfo, entryPoint, rootLoweringConfig, qkLoweringConfig,
+      pvLoweringConfig,
       getGPUTranslationInfo(context, GPUPipeline::VectorDistribute,
                             workgroupSize, targetSubgroupSize, pipelineConfig));
 }
@@ -1095,23 +1423,14 @@ struct AttentionReductionHeuristicSeeds {
 
 static LogicalResult setAttentionReductionConfig(
     AttentionReductionHeuristicSeeds &seeds, IREE::GPU::TargetAttr target,
-    FunctionOpInterface entryPoint, IREE::LinalgExt::OnlineAttentionOp op) {
+    FunctionOpInterface entryPoint, AttentionConfigInfo &configInfo) {
 
   const int64_t targetSubgroupSize = target.getPreferredSubgroupSize();
 
   // Get iteration domain bounds.
-  OpBuilder b(op);
-  FailureOr<SmallVector<int64_t>> maybeBounds = op.getStaticLoopRanges();
-  if (failed(maybeBounds)) {
-    return failure();
-  }
-
-  SmallVector<int64_t> bounds = maybeBounds.value();
-
-  auto opInfo =
-      IREE::LinalgExt::AttentionOpDetail::get(
-          op.getQueryMap(), op.getKeyMap(), op.getValueMap(), op.getOutputMap())
-          .value();
+  OpBuilder b(configInfo.rootOp);
+  SmallVector<int64_t> bounds = configInfo.bounds;
+  IREE::LinalgExt::AttentionOpDetail &opInfo = configInfo.opInfo;
 
   // Distribute the 'available' resource to the basis on the given dimensions.
   // `currDim` tracks number of dims on which resources have already been
@@ -1289,78 +1608,60 @@ static LogicalResult setAttentionReductionConfig(
       targetSubgroupSize * ShapedType::getNumElements(subgroupBasis.counts);
   std::array<int64_t, 3> workgroupSize{flatWorkgroupSize, 1, 1};
 
-  MLIRContext *context = op.getContext();
+  MLIRContext *context = configInfo.rootOp->getContext();
 
-  SmallVector<NamedAttribute, 2> attrs = {
-      NamedAttribute("workgroup", b.getI64ArrayAttr(workgroupTileSizes)),
-      NamedAttribute("partial_reduction",
-                     b.getI64ArrayAttr(reductionTileSizes))};
-
-  // Create projected QK thread tile sizes by removing N dimensions.
-  SmallVector<int64_t> qkThreadTileSizes;
-  for (auto [i, tile] : llvm::enumerate(threadTileSizes)) {
-    if (llvm::find(opInfo.getNDims(), i) != opInfo.getNDims().end()) {
-      continue;
-    }
-    qkThreadTileSizes.push_back(tile);
-  }
+  SmallVector<int64_t> qkThreadTileSizes =
+      projectTileSizes(threadTileSizes, configInfo.aggregateToQK);
   SmallVector<NamedAttribute> qkConfig = {
       NamedAttribute("thread", b.getI64ArrayAttr(qkThreadTileSizes))};
-  IREE::GPU::setBasis(context, qkConfig, IREE::GPU::TilingLevel::Subgroup,
-                      projectBasis(subgroupBasis, opInfo.getNDims()));
-  IREE::GPU::setBasis(context, qkConfig, IREE::GPU::TilingLevel::Thread,
-                      projectBasis(qkThreadBasis, opInfo.getNDims()));
+  IREE::GPU::setBasis(
+      context, qkConfig, IREE::GPU::TilingLevel::Subgroup,
+      projectBasisToOp(subgroupBasis, configInfo.aggregateToQK));
+  IREE::GPU::setBasis(
+      context, qkConfig, IREE::GPU::TilingLevel::Thread,
+      projectBasisToOp(qkThreadBasis, configInfo.aggregateToQK));
 
-  // Create projected QK thread tile sizes by removing N dimensions.
-  SmallVector<int64_t> pvThreadTileSizes;
-  for (auto [i, tile] : llvm::enumerate(threadTileSizes)) {
-    if (llvm::find(opInfo.getK1Dims(), i) != opInfo.getK1Dims().end()) {
-      continue;
-    }
-    pvThreadTileSizes.push_back(tile);
-  }
+  SmallVector<int64_t> pvThreadTileSizes =
+      projectTileSizes(threadTileSizes, configInfo.aggregateToPV);
   SmallVector<NamedAttribute> pvConfig = {
       NamedAttribute("thread", b.getI64ArrayAttr(pvThreadTileSizes))};
-  IREE::GPU::setBasis(context, pvConfig, IREE::GPU::TilingLevel::Subgroup,
-                      projectBasis(subgroupBasis, opInfo.getK1Dims()));
-  IREE::GPU::setBasis(context, pvConfig, IREE::GPU::TilingLevel::Thread,
-                      projectBasis(pvThreadBasis, opInfo.getK1Dims()));
+  IREE::GPU::setBasis(
+      context, pvConfig, IREE::GPU::TilingLevel::Subgroup,
+      projectBasisToOp(subgroupBasis, configInfo.aggregateToPV));
+  IREE::GPU::setBasis(
+      context, pvConfig, IREE::GPU::TilingLevel::Thread,
+      projectBasisToOp(pvThreadBasis, configInfo.aggregateToPV));
 
-  SmallVector<NamedAttribute, 2> qkAttrs;
-  SmallVector<NamedAttribute, 2> pvAttrs;
+  SmallVector<NamedAttribute, 4> rootAttrs = {
+      NamedAttribute("workgroup",
+                     b.getI64ArrayAttr(projectTileSizes(
+                         workgroupTileSizes, configInfo.aggregateToRoot))),
+      NamedAttribute("partial_reduction",
+                     b.getI64ArrayAttr(projectTileSizes(
+                         reductionTileSizes, configInfo.aggregateToRoot)))};
+  if (configInfo.isExplicitExpReduction()) {
+    llvm::append_range(rootAttrs, pvConfig);
+  }
 
   auto qkConfigDict = b.getDictionaryAttr(qkConfig);
   auto pvConfigDict = b.getDictionaryAttr(pvConfig);
+  auto rootConfigDict = b.getDictionaryAttr(rootAttrs);
 
   auto qkLoweringConfig =
       IREE::GPU::LoweringConfigAttr::get(context, qkConfigDict);
   auto pvLoweringConfig =
       IREE::GPU::LoweringConfigAttr::get(context, pvConfigDict);
-
-  qkAttrs.emplace_back("lowering_config", qkLoweringConfig);
-  pvAttrs.emplace_back("lowering_config", pvLoweringConfig);
-
-  auto qkAttrDict = b.getDictionaryAttr(qkAttrs);
-  auto pvAttrDict = b.getDictionaryAttr(pvAttrs);
-
-  SmallVector<NamedAttribute, 2> decompositionConfig;
-  decompositionConfig.emplace_back(
-      IREE::LinalgExt::OnlineAttentionOp::getQKAttrStr(), qkAttrDict);
-  decompositionConfig.emplace_back(
-      IREE::LinalgExt::OnlineAttentionOp::getPVAttrStr(), pvAttrDict);
+  auto rootLoweringConfig =
+      IREE::GPU::LoweringConfigAttr::get(context, rootConfigDict);
 
   SmallVector<NamedAttribute, 1> pipelineAttrs;
   setAttentionPipelineAttributes(target, pipelineAttrs);
 
-  // Set attention decomposition control config.
-  op.setDecompositionConfigAttr(b.getDictionaryAttr(decompositionConfig));
-
-  auto configDict = b.getDictionaryAttr(attrs);
-  auto loweringConfig = IREE::GPU::LoweringConfigAttr::get(context, configDict);
   auto pipelineConfig = DictionaryAttr::get(context, pipelineAttrs);
 
-  return setOpConfigAndEntryPointFnTranslation(
-      entryPoint, op, loweringConfig,
+  return setAttentionConfigsAndEntryPointFnTranslation(
+      configInfo, entryPoint, rootLoweringConfig, qkLoweringConfig,
+      pvLoweringConfig,
       getGPUTranslationInfo(context, GPUPipeline::VectorDistribute,
                             workgroupSize, targetSubgroupSize, pipelineConfig));
 }
@@ -1368,7 +1669,7 @@ static LogicalResult setAttentionReductionConfig(
 static LogicalResult
 setAttentionVectorDistributionConfig(IREE::GPU::TargetAttr target,
                                      FunctionOpInterface entryPoint,
-                                     IREE::LinalgExt::OnlineAttentionOp op) {
+                                     AttentionConfigInfo &configInfo) {
 
   // This configuration is not really smart right now. It just makes sure that
   // attention always compiles and tries to distribute workload on threads,
@@ -1407,10 +1708,10 @@ setAttentionVectorDistributionConfig(IREE::GPU::TargetAttr target,
   // V : ... X K2_inner K N
 
   // Make thread tile sizes for K1 and N read 128bits.
-  int64_t keyBitwidth =
-      IREE::Util::getTypeBitWidth(getElementTypeOrSelf(op.getKey().getType()));
+  int64_t keyBitwidth = IREE::Util::getTypeBitWidth(
+      getElementTypeOrSelf(configInfo.key.getType()));
   int64_t valueBitwidth = IREE::Util::getTypeBitWidth(
-      getElementTypeOrSelf(op.getValue().getType()));
+      getElementTypeOrSelf(configInfo.value.getType()));
 
   // TODO: Support more exotic bitwidths.
   assert(128 % keyBitwidth == 0);
@@ -1425,7 +1726,7 @@ setAttentionVectorDistributionConfig(IREE::GPU::TargetAttr target,
                                          /*keyVectorSize=*/keyVectorSize,
                                          /*valueVectorSize=*/valueVectorSize};
 
-  return setAttentionReductionConfig(seeds, target, entryPoint, op);
+  return setAttentionReductionConfig(seeds, target, entryPoint, configInfo);
 }
 
 static LogicalResult
@@ -1457,11 +1758,34 @@ setVectorDistributionConfig(IREE::GPU::TargetAttr target,
   if (auto attnOp = dyn_cast<IREE::LinalgExt::OnlineAttentionOp>(computeOp)) {
     LDBG() << "VectorDistribution: trying to find a suitable online attention "
               "config";
+    FailureOr<AttentionConfigInfo> maybeConfigInfo =
+        getOnlineAttentionConfigInfo(attnOp);
+    if (failed(maybeConfigInfo)) {
+      return failure();
+    }
     if (succeeded(setAttentionIntrinsicBasedVectorDistributionConfig(
-            target, entryPoint, attnOp))) {
+            target, entryPoint, *maybeConfigInfo))) {
       return success();
     }
-    return setAttentionVectorDistributionConfig(target, entryPoint, attnOp);
+    return setAttentionVectorDistributionConfig(target, entryPoint,
+                                                *maybeConfigInfo);
+  }
+
+  if (auto expReductionOp =
+          dyn_cast<IREE::LinalgExt::ExpReductionOp>(computeOp)) {
+    LDBG() << "VectorDistribution: trying to find a suitable explicit "
+              "attention config";
+    FailureOr<AttentionConfigInfo> maybeConfigInfo =
+        getExplicitAttentionConfigInfo(expReductionOp);
+    if (failed(maybeConfigInfo)) {
+      return failure();
+    }
+    if (succeeded(setAttentionIntrinsicBasedVectorDistributionConfig(
+            target, entryPoint, *maybeConfigInfo))) {
+      return success();
+    }
+    return setAttentionVectorDistributionConfig(target, entryPoint,
+                                                *maybeConfigInfo);
   }
 
   LDBG() << "VectorDistribution: failed to find a suitable config";
