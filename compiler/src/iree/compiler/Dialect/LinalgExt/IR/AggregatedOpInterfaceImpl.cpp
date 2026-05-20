@@ -896,6 +896,11 @@ struct ElementwiseInputExtraction {
   unsigned blockArgOperandIndex = 0;
 };
 
+struct IreeScalingTruncExtraction {
+  IREE::LinalgExt::ScalingTruncFOp truncOp;
+  unsigned operandIndex;
+};
+
 static bool
 collectBlockLocalScalarExpressionOps(Value value, Block &body,
                                      SmallPtrSetImpl<Operation *> &ops) {
@@ -1288,6 +1293,186 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   return newGenericOp;
 }
 
+static std::optional<IreeScalingTruncExtraction>
+matchIreeScalingTruncExtraction(linalg::GenericOp genericOp) {
+  if (!genericOp.hasPureTensorSemantics()) {
+    return std::nullopt;
+  }
+
+  Block &body = genericOp.getRegion().front();
+  for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
+    unsigned operandIndex = inputOperand->getOperandNumber();
+    auto inputType = dyn_cast<RankedTensorType>(inputOperand->get().getType());
+    if (!inputType) {
+      continue;
+    }
+    BlockArgument arg = body.getArgument(operandIndex);
+    if (arg.use_empty()) {
+      continue;
+    }
+
+    // Check if the only user is iree_linalg_ext.scaling_truncf.
+    Operation *singleUser = nullptr;
+    for (Operation *user : arg.getUsers()) {
+      if (singleUser) {
+        singleUser = nullptr;
+        break;
+      }
+      singleUser = user;
+    }
+    if (!singleUser) {
+      continue;
+    }
+
+    auto truncOp = dyn_cast<IREE::LinalgExt::ScalingTruncFOp>(singleUser);
+    if (!truncOp || truncOp.getInput() != arg) {
+      continue;
+    }
+
+    return IreeScalingTruncExtraction{truncOp, operandIndex};
+  }
+
+  return std::nullopt;
+}
+
+static FailureOr<linalg::GenericOp>
+extractIreeScalingTruncInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
+  std::optional<IreeScalingTruncExtraction> extraction =
+      matchIreeScalingTruncExtraction(genericOp);
+  if (!extraction) {
+    return failure();
+  }
+
+  Block &body = genericOp.getRegion().front();
+  IREE::LinalgExt::ScalingTruncFOp truncOp = extraction->truncOp;
+  unsigned operandIndex = extraction->operandIndex;
+
+  OpOperand *inputOperand = genericOp.getDpsInputOperand(operandIndex);
+  auto inputType = cast<RankedTensorType>(inputOperand->get().getType());
+
+  Type truncElementType = truncOp.getResult().getType();
+  Type scaleElementType = truncOp.getScale().getType();
+  Location loc = genericOp.getLoc();
+
+  rewriter.setInsertionPoint(genericOp);
+
+  // Create the extracted generic that produces trunc and scale tensors.
+  auto mixedSizes = tensor::getMixedSizes(rewriter, loc, inputOperand->get());
+  auto truncTensorType = RankedTensorType::get(
+      inputType.getShape(), truncElementType, inputType.getEncoding());
+  auto scaleTensorType = RankedTensorType::get(
+      inputType.getShape(), scaleElementType, inputType.getEncoding());
+
+  Value emptyTrunc =
+      inputType.getEncoding()
+          ? tensor::EmptyOp::create(rewriter, loc, mixedSizes, truncElementType,
+                                    inputType.getEncoding())
+          : tensor::EmptyOp::create(rewriter, loc, mixedSizes, truncElementType);
+  Value emptyScale =
+      inputType.getEncoding()
+          ? tensor::EmptyOp::create(rewriter, loc, mixedSizes, scaleElementType,
+                                    inputType.getEncoding())
+          : tensor::EmptyOp::create(rewriter, loc, mixedSizes, scaleElementType);
+
+  AffineMap idMap = rewriter.getMultiDimIdentityMap(inputType.getRank());
+  SmallVector<AffineMap> extractedMaps{idMap, idMap, idMap};
+  SmallVector<utils::IteratorType> extractedIterators(
+      inputType.getRank(), utils::IteratorType::parallel);
+
+  auto extractedGeneric = linalg::GenericOp::create(
+      rewriter, loc, TypeRange{truncTensorType, scaleTensorType},
+      ValueRange{inputOperand->get()}, ValueRange{emptyTrunc, emptyScale},
+      extractedMaps, extractedIterators,
+      [&](OpBuilder &builder, Location nestedLoc, ValueRange args) {
+        mlir::OperationState state(nestedLoc,
+                                   "iree_linalg_ext.scaling_truncf");
+        state.addTypes({truncElementType, scaleElementType});
+        state.addOperands(args[0]);
+        auto newTrunc = IREE::LinalgExt::ScalingTruncFOp::create(builder,
+            nestedLoc, truncElementType, scaleElementType, args[0]);
+        linalg::YieldOp::create(builder, nestedLoc,
+                                mlir::ValueRange{newTrunc.getResults()});
+      });
+
+  // Build new inputs: replace operand at operandIndex with trunc,
+  // and insert scale tensor right after it.
+  SmallVector<Value> newInputs;
+  SmallVector<AffineMap> newMaps;
+  unsigned numDpsInputs = genericOp.getNumDpsInputs();
+  for (unsigned i = 0; i < numDpsInputs; i++) {
+    if (i == operandIndex) {
+      newInputs.push_back(extractedGeneric.getResult(0));
+      newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+      // Insert scale tensor right after the trunc tensor.
+      newInputs.push_back(extractedGeneric.getResult(1));
+      newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+    } else {
+      newInputs.push_back(genericOp.getDpsInputOperand(i)->get());
+      newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+    }
+  }
+
+  // Inits stay the same, with their original maps.
+  SmallVector<Value> newInits(genericOp.getDpsInits());
+  for (unsigned i = numDpsInputs;
+       i < static_cast<unsigned>(genericOp.getIndexingMapsArray().size()); i++) {
+    newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+  }
+
+  // Build new body argument types and locations.
+  // The original argument at operandIndex is replaced by two arguments:
+  // one for the trunc result and one for the scale result.
+  SmallVector<Type> newArgTypes;
+  SmallVector<Location> newArgLocs;
+  newArgTypes.reserve(body.getNumArguments() + 1);
+  for (auto [idx, arg] : llvm::enumerate(body.getArguments())) {
+    if (idx == operandIndex) {
+      newArgTypes.push_back(truncElementType);
+      newArgLocs.push_back(arg.getLoc());
+      newArgTypes.push_back(scaleElementType);
+      newArgLocs.push_back(arg.getLoc());
+    } else {
+      newArgTypes.push_back(arg.getType());
+      newArgLocs.push_back(arg.getLoc());
+    }
+  }
+
+  auto newGenericOp = linalg::GenericOp::create(
+      rewriter, loc, genericOp->getResultTypes(), newInputs, newInits,
+      newMaps, genericOp.getIteratorTypesArray());
+
+  Block *newBody = rewriter.createBlock(&newGenericOp.getRegion(), {},
+                                        newArgTypes, newArgLocs);
+
+  // Build mapping from old body values to new body values.
+  IRMapping mapping;
+  // Map the truncOp results to the new block arguments.
+  mapping.map(truncOp.getResult(), newBody->getArgument(operandIndex));
+  mapping.map(truncOp.getScale(), newBody->getArgument(operandIndex + 1));
+
+  // Map other block arguments (skip the original arg at operandIndex
+  // since it was consumed by truncOp which is the only user).
+  for (auto [idx, arg] : llvm::enumerate(body.getArguments())) {
+    if (idx == operandIndex) {
+      continue;
+    }
+    unsigned newIdx = idx < operandIndex ? idx : idx + 1;
+    mapping.map(arg, newBody->getArgument(newIdx));
+  }
+
+  rewriter.setInsertionPointToStart(newBody);
+  for (Operation &op : body.without_terminator()) {
+    if (&op == truncOp.getOperation()) {
+      continue;
+    }
+    rewriter.clone(op, mapping);
+  }
+  rewriter.clone(*body.getTerminator(), mapping);
+
+  rewriter.replaceOp(genericOp, newGenericOp.getResults());
+  return newGenericOp;
+}
+
 static AffineMap getScaleAccessMapForInput(
     MLIRContext *context, AffineMap inputMap,
     const llvm::SmallDenseSet<int64_t> &droppedIteratorDims,
@@ -1663,6 +1848,15 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
       }
 
       while (true) {
+        // Try to peel iree_linalg_ext.scaling_truncf first.
+        // This replaces one BlockArg with two BlockArgs (trunc + scale).
+        FailureOr<linalg::GenericOp> ireeScalingTruncExtractedOp =
+            extractIreeScalingTruncInput(rewriter, newOp);
+        if (succeeded(ireeScalingTruncExtractedOp)) {
+          newOp = *ireeScalingTruncExtractedOp;
+          continue;
+        }
+
         FailureOr<linalg::GenericOp> elementwiseExtractedOp =
             extractElementwiseInput(rewriter, newOp);
         if (failed(elementwiseExtractedOp)) {
