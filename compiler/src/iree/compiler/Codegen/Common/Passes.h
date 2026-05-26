@@ -20,6 +20,8 @@
 #include "iree/compiler/Codegen/Utils/Utils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
+#include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
+#include "llvm/ADT/DenseMap.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/BufferizableOpInterface.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -204,6 +206,20 @@ void registerCodegenCommonPasses();
 /// Converts a ConstraintsOp into a new ModuleOp containing an smt.solver op.
 mlir::OwningOpRef<mlir::ModuleOp>
 convertConstraintsToSMTModule(IREE::Codegen::ConstraintsOp op);
+
+/// Materializes a CompilationInfoAttr from a ConstraintsOp knobs dictionary and
+/// a flat mapping from knob name to concrete integer assignment.
+FailureOr<IREE::Codegen::CompilationInfoAttr>
+materializeCompilationInfoFromConstraints(
+    IREE::Codegen::ConstraintsOp op,
+    const DenseMap<StringRef, int64_t> &assignments);
+
+/// Materializes a named configuration attr from a ConstraintsOp and a flat knob
+/// assignment mapping. The pipeline decides whether the attr name is special
+/// (for example `compilation_info`) or generic.
+FailureOr<Attribute> materializeConfigurationAttrFromConstraints(
+    IREE::Codegen::ConstraintsOp op, StringRef attrName,
+    const DenseMap<StringRef, int64_t> &assignments);
 
 } // namespace mlir::iree_compiler
 

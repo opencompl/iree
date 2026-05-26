@@ -116,6 +116,32 @@ calculateResultSharedMemoryUsedInBytes(const GPUMMASchedule &schedule,
   return (numRes * tileM * tileN * resultBitwidth) / 8;
 }
 
+int64_t calculateTotalSharedMemoryUsedInBytes(const GPUMMASchedule &schedule,
+                                              const GPUMatmulShapeType &problem,
+                                              bool useDirectLoad,
+                                              int64_t prefetchNumStages,
+                                              bool doCPromotion) {
+  int64_t lhsBitwidth = problem.aType.getIntOrFloatBitWidth();
+  int64_t rhsBitwidth = problem.bType.getIntOrFloatBitWidth();
+  int64_t lhsScaleBitwidth =
+      problem.aScaleType ? problem.aScaleType.getIntOrFloatBitWidth() : 0;
+  int64_t rhsScaleBitwidth =
+      problem.bScaleType ? problem.bScaleType.getIntOrFloatBitWidth() : 0;
+
+  int64_t sharedMemoryUsed = calculateOperandsSharedMemoryUsedInBytes(
+      schedule, lhsBitwidth, rhsBitwidth, lhsScaleBitwidth, rhsScaleBitwidth,
+      problem.numHorizontallyFusedOps, useDirectLoad, prefetchNumStages);
+
+  if (doCPromotion) {
+    int64_t resultBitwidth = problem.cType.getIntOrFloatBitWidth();
+    sharedMemoryUsed += calculateResultSharedMemoryUsedInBytes(
+        schedule, resultBitwidth, problem.numHorizontallyFusedOps);
+  }
+
+  sharedMemoryUsed *= schedule.getTotalWorkgroupBatchSize();
+  return sharedMemoryUsed;
+}
+
 /// Check that a GPUMMASchedule fits alignment restrictions. To be aligned,
 /// the problem must be evenly divisible by the number of elements in the
 /// schedule for each dimension. If `mustBeAligned` is false, then the problem
@@ -260,10 +286,10 @@ static FailureOr<GPUMMASchedule> fitScheduleInSharedMemory(
   return schedule;
 }
 
-static LogicalResult canTargetIntrinsic(const GPUMatmulShapeType &problem,
-                                        const GPUMatmulShapeType &intrinsic,
-                                        int64_t preferredSubgroupSize,
-                                        bool canUpcastAcc, bool mustBeAligned) {
+LogicalResult canTargetIntrinsic(const GPUMatmulShapeType &problem,
+                                 const GPUMatmulShapeType &intrinsic,
+                                 int64_t preferredSubgroupSize,
+                                 bool canUpcastAcc, bool mustBeAligned) {
   assert(intrinsic.mSizes.size() == 1 && intrinsic.nSizes.size() == 1 &&
          intrinsic.kSizes.size() <= 2 &&
          "expected intrinsic to have a single M, N, and K <= 2 dimensions");
@@ -995,33 +1021,11 @@ FailureOr<GPUMMASchedule> deduceMMASchedule(
     LDBG() << "Chosen MMA schedule:\n" << schedule;
 
     auto isValidSchedule = [&](const GPUMMASchedule &schedule) -> bool {
-      int64_t lhsBitwidth = problem.aType.getIntOrFloatBitWidth();
-      int64_t rhsBitwidth = problem.bType.getIntOrFloatBitWidth();
-      int64_t resultBitwidth = problem.cType.getIntOrFloatBitWidth();
-      int64_t lhsScaleBitwidth =
-          problem.aScaleType ? problem.aScaleType.getIntOrFloatBitWidth() : 0;
-      int64_t rhsScaleBitwidth =
-          problem.bScaleType ? problem.bScaleType.getIntOrFloatBitWidth() : 0;
       bool isAligned =
           isValidMMASchedule(problem, schedule, mustBeAligned, subgroupSize,
                              transposedLhs, transposedRhs);
-      int64_t sharedMemoryUsed = calculateOperandsSharedMemoryUsedInBytes(
-          schedule, lhsBitwidth, rhsBitwidth, lhsScaleBitwidth,
-          rhsScaleBitwidth, problem.numHorizontallyFusedOps, useDirectLoad,
-          prefetchNumStages);
-      // Add accumulator/result memory when it uses shared memory (LDS):
-      // - Result needs padding in shared memory, OR
-      // - matmul_accumulate loads accumulator from global memory via shared mem
-      // For zero-initialized GEMMs without C promotion, the accumulator stays
-      // in registers and doesn't need shared memory.
-      if (doCPromotion) {
-        sharedMemoryUsed += calculateResultSharedMemoryUsedInBytes(
-            schedule, resultBitwidth, problem.numHorizontallyFusedOps);
-      }
-
-      // Batch tiling multiplies the promoted operand sizes: each batch slice
-      // uses separate shared memory, so total usage scales linearly.
-      sharedMemoryUsed *= totalBatchTile;
+      int64_t sharedMemoryUsed = calculateTotalSharedMemoryUsedInBytes(
+          schedule, problem, useDirectLoad, prefetchNumStages, doCPromotion);
 
       LDBG() << "Available Shared Memory: " << sharedMemLimitInBytes << " bytes"
              << "Predicted Shared Memory Used by Schedule: " << sharedMemoryUsed
@@ -1206,10 +1210,22 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     int64_t intrinsicAN = intrinsicA.nSizes[0];
     int64_t intrinsicAK = intrinsicA.kSizes[0];
     auto isValidSchedule = [&](const GPUMMASchedule &schedule) -> bool {
+      // The output of the QK matmul must be a valid LHS of the PV matmul.
+      // The total LHS tile (M x K) of the PV matmul must be a multiple of
+      // the output tile (M x N) of the intrinsic used for the QK matmul.
+      int64_t pvMTile = schedule.getTotalMTileSize() *
+                        schedule.getTotalMSize() *
+                        schedule.getTotalMSubgroupCount();
+      int64_t pvKTile = schedule.getTotalKTileSize() * schedule.getTotalKSize();
+      if (pvMTile % intrinsicAM != 0 || pvKTile % intrinsicAN != 0) {
+        return false;
+      }
+
       // Create a mma schedule for qkMatmul in attention.
       // qkMatmul.M = pvMatmul.M
       // qkMatmul.N = pvMatmul.K
-      // qkMatmul.K = problem.K
+      // qkMatmul.K = problem.K1
+      int64_t qkNTiles = pvKTile / intrinsicAN;
       SmallVector<int64_t, 2> qkKSizes = qkMatmul.kSizes;
       qkKSizes.back() = qkMatmul.kSizes.back() / intrinsicAK;
       GPUMMASchedule qkSchedule{
@@ -1220,7 +1236,7 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
           /*mSubgroupCount=*/schedule.mSubgroupCounts,
           /*nSubgroupCount=*/SmallVector<int64_t>(qkMatmul.nSizes.size(), 1),
           schedule.mTileSizes,
-          schedule.kTileSizes,
+          {qkNTiles},
           qkKSizes};
 
       bool isQKAligned =
@@ -1262,18 +1278,21 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     // Create a mma schedule for qkMatmul in attention.
     // qkMatmul.M = pvMatmul.M
     // qkMatmul.N = pvMatmul.K
-    // qkMatmul.K = problem.K
+    // qkMatmul.K = problem.K1
+    int64_t pvKTile =
+        pvSchedule->getTotalKTileSize() * pvSchedule->getTotalKSize();
+    int64_t qkNTiles = pvKTile / intrinsicAN;
     SmallVector<int64_t, 2> qkKSizes = qkMatmul.kSizes;
     qkKSizes.back() = qkMatmul.kSizes.back() / intrinsicAK;
     GPUMMASchedule qkSchedule{
         intrinsicA.mmaKind,
         pvSchedule->mSizes,
-        pvSchedule->kSizes,
+        {intrinsicAN},
         {intrinsicAK},
         /*mSubgroupCount=*/pvSchedule->mSubgroupCounts,
         /*nSubgroupCount=*/SmallVector<int64_t>(qkMatmul.nSizes.size(), 1),
         pvSchedule->mTileSizes,
-        pvSchedule->kTileSizes,
+        {qkNTiles},
         qkKSizes};
 
     return std::pair(qkSchedule, pvSchedule.value());
