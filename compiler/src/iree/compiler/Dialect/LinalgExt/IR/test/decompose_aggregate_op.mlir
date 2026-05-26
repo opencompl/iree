@@ -616,3 +616,74 @@ func.func @exp_reduction_peel_input_block_arg(
 // CHECK:           arith.mulf
 // CHECK:           arith.addf
 // CHECK:       return {{.*}}%[[PV]]
+
+// -----
+
+// Spec to decompose exp reduction op.
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["iree_linalg_ext.exp_reduction"]} in %module_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.decompose_aggregate_op %0 : (!transform.any_op) -> ()
+    transform.yield
+  }
+}
+
+func.func @exp_reduction_peel_extf_like_chain(
+  %s_in: tensor<20x128x256xf32>,
+  %v_in: tensor<20x256x2x32xf4E2M1FN>,
+  %v_scale: tensor<20x256x2xf8E8M0FNU>,
+  %max_init: tensor<20x128xf32>,
+  %sum_init: tensor<20x128xf32>,
+  %acc_init: tensor<20x128x2x32xf32>
+) -> (tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x2x32xf32>)
+  {
+  %max, %sumt, %pv = iree_linalg_ext.exp_reduction {
+    indexing_maps = [
+      affine_map<(B, M, DG, DB, K) -> (B, M, K)>,
+      affine_map<(B, M, DG, DB, K) -> (B, K, DG, DB)>,
+      affine_map<(B, M, DG, DB, K) -> (B, K, DG)>,
+      affine_map<(B, M, DG, DB, K) -> (B, M)>,
+      affine_map<(B, M, DG, DB, K) -> (B, M)>,
+      affine_map<(B, M, DG, DB, K) -> (B, M, DG, DB)>
+    ],
+    iterator_types = [
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<reduction>
+    ],
+    exp_reduced_operands = [1, 2]
+  } attributes {lowering_config = #iree_codegen.lowering_config<tile_sizes = []>}
+    ins(%s_in, %v_in, %v_scale : tensor<20x128x256xf32>, tensor<20x256x2x32xf4E2M1FN>, tensor<20x256x2xf8E8M0FNU>)
+    outs(%max_init, %sum_init, %acc_init : tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x2x32xf32>)
+  {
+  ^bb0(%ex : f32, %v : f4E2M1FN, %v_scale_arg : f8E8M0FNU, %m : f32, %sum : f32, %acc : f32):
+    %fp4max = arith.constant 6.0 : f32
+    %ex4m = arith.mulf %ex, %fp4max : f32
+    %ex_trunc, %ex_scale = iree_linalg_ext.scaling_truncf %ex4m : f32 to f4E2M1FN, f8E8M0FNU
+    %ex_f16 = arith.scaling_extf %ex_trunc, %ex_scale : f4E2M1FN, f8E8M0FNU to f16
+    %ex_f32 = arith.extf %ex_f16 : f16 to f32
+    %v_f16 = arith.scaling_extf %v, %v_scale_arg : f4E2M1FN, f8E8M0FNU to f16
+    %v_f32 = arith.extf %v_f16 : f16 to f32
+    %nsum = arith.addf %ex, %sum : f32
+    %mul  = arith.mulf %ex_f32, %v_f32 : f32
+    %nacc = arith.addf %mul, %acc : f32
+    iree_linalg_ext.yield %m, %nsum, %nacc : f32, f32, f32
+  } -> tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x2x32xf32>
+
+  return %max, %sumt, %pv : tensor<20x128xf32>, tensor<20x128xf32>, tensor<20x128x2x32xf32>
+}
+// CHECK-LABEL: @exp_reduction_peel_extf_like_chain
+// CHECK:       %[[P_F16:[0-9]+]] = linalg.generic {{.*}} outs(%{{.*}} : tensor<20x128x256xf16>)
+// CHECK:         arith.scaling_extf {{.*}} : f4E2M1FN, f8E8M0FNU to f16
+// CHECK:       %[[V_F16:[0-9]+]] = linalg.generic {{.*}} outs(%{{.*}} : tensor<20x256x2x32xf16>)
+// CHECK:         arith.scaling_extf {{.*}} : f4E2M1FN, f8E8M0FNU to f16
+// CHECK:       %[[PV:[0-9]+]] = linalg.generic
+// CHECK-SAME:    ins(%[[P_F16]], %[[V_F16]]
+// CHECK-NOT:     arith.scaling_extf
+// CHECK:         arith.extf {{.*}} : f16 to f32
+// CHECK:         arith.extf {{.*}} : f16 to f32
+// CHECK-NOT:     arith.scaling_extf
+// CHECK:         arith.mulf
+// CHECK:       return {{.*}}%[[PV]]

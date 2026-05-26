@@ -59,7 +59,7 @@ flow.executable private @executable_0 {
             subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 4, 5]],
             mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_16x16x128_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>,
             promote_operands = [0, 1, 2, 3]
-          }>
+          }>;
         }
         ins(%Q, %K, %QS, %KS : tensor<4x32x4096x2x32xf4E2M1FN>, tensor<4x32x4096x2x32xf4E2M1FN>, tensor<4x32x4096x2xf8E8M0FNU>, tensor<4x32x4096x2xf8E8M0FNU>)
         outs(%S_fill : tensor<4x32x4096x4096xf32>)
@@ -111,19 +111,17 @@ flow.executable private @executable_0 {
         attributes {lowering_config = #iree_gpu.lowering_config<{
           workgroup = [1, 1, 64, 0, 0, 0],
           reduction = [0, 0, 0, 0, 0, 64],
-          subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 4, 5]],
-          mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_32x32x64_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>
+          subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 5]],
+          mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16, col_major = true>
         }>}
         ins(%S, %V, %VS : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x2x32xf4E2M1FN>, tensor<4x32x4096x2xf8E8M0FNU>)
         outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x2x32xf32>)
       {
       ^bb0(%ex : f32, %v : f4E2M1FN, %v_scale : f8E8M0FNU, %m : f32, %sum : f32, %acc : f32):
-        %fp4max  = arith.constant 6.0 : f32
-        %ex4m    = arith.mulf %ex, %fp4max : f32
-        // %ex_trunc = arith.scaling_truncf %ex4m, %ex_scale : f32, f8E8M0FNU to f4E2M1FN
-        %ex_trunc, %ex_scale = iree_linalg_ext.scaling_truncf %ex4m : f32 to f4E2M1FN, f8E8M0FNU
-        %ex_ext = arith.scaling_extf %ex_trunc, %ex_scale : f4E2M1FN, f8E8M0FNU to f32
-        %v_ext = arith.scaling_extf %v, %v_scale : f4E2M1FN, f8E8M0FNU to f32
+        %ex_ext_f16 = arith.truncf %ex : f32 to f16
+        %ex_ext = arith.extf %ex_ext_f16 : f16 to f32
+        %v_ext_f16 = arith.scaling_extf %v, %v_scale : f4E2M1FN, f8E8M0FNU to f16
+        %v_ext = arith.extf %v_ext_f16 : f16 to f32
         %nsum = arith.addf %ex, %sum : f32
         %mul  = arith.mulf %ex_ext, %v_ext : f32
         %nacc = arith.addf %mul, %acc : f32

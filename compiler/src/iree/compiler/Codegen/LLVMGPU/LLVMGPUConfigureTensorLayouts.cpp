@@ -19,6 +19,7 @@
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include <optional>
 
@@ -66,6 +67,141 @@ static IREE::Codegen::InnerTileDescAttrInterface getIntrinsic(Operation *op) {
   IREE::Codegen::InnerTileDescAttrInterface mmaIntrinsic = getMmaKind(config);
   assert(mmaIntrinsic && "Cannot find intrinsic in lowering config.");
   return mmaIntrinsic;
+}
+
+static std::string formatIntArray(ArrayRef<int64_t> values) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << "[";
+  for (auto [index, value] : llvm::enumerate(values)) {
+    if (index != 0) {
+      os << ", ";
+    }
+    os << value;
+  }
+  os << "]";
+  return storage;
+}
+
+static std::string formatUnsignedArray(ArrayRef<unsigned> values) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << "[";
+  for (auto [index, value] : llvm::enumerate(values)) {
+    if (index != 0) {
+      os << ", ";
+    }
+    os << value;
+  }
+  os << "]";
+  return storage;
+}
+
+static std::string formatAffineMaps(ArrayRef<AffineMap> maps) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << "[";
+  for (auto [index, map] : llvm::enumerate(maps)) {
+    if (index != 0) {
+      os << ", ";
+    }
+    os << map;
+  }
+  os << "]";
+  return storage;
+}
+
+static std::string formatAffineMap(AffineMap map) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << map;
+  return storage;
+}
+
+static std::string
+formatScaledDims(IREE::LinalgExt::ScaledContractionDimensions dims) {
+  std::string storage;
+  llvm::raw_string_ostream os(storage);
+  os << "{batch=" << formatUnsignedArray(dims.batch)
+     << ", m=" << formatUnsignedArray(dims.m)
+     << ", n=" << formatUnsignedArray(dims.n)
+     << ", k=" << formatUnsignedArray(dims.k)
+     << ", kB=" << formatUnsignedArray(dims.kB) << "}";
+  return storage;
+}
+
+static FailureOr<IREE::GPU::Basis>
+getBasisWithFullRankMapping(IREE::GPU::Basis basis, int64_t rank) {
+  if (static_cast<int64_t>(basis.mapping.size()) == rank) {
+    return basis;
+  }
+  if (static_cast<int64_t>(basis.counts.size()) != rank ||
+      static_cast<int64_t>(basis.mapping.size()) > rank) {
+    return failure();
+  }
+
+  llvm::SmallBitVector seen(rank);
+  for (int64_t dim : basis.mapping) {
+    if (dim < 0 || dim >= rank || seen.test(dim)) {
+      return failure();
+    }
+    seen.set(dim);
+  }
+
+  for (int64_t dim = 0; dim < rank; ++dim) {
+    if (seen.test(dim)) {
+      continue;
+    }
+    // Projected basis mappings are recoverable only when the dropped dimension
+    // did not distribute resources. This is the case after operand DCE removes
+    // an operand whose indexing map had projected-out unit-count dimensions.
+    if (basis.counts[dim] != 1) {
+      return failure();
+    }
+    auto insertIt = llvm::find_if(
+        basis.mapping, [&](int64_t mappedDim) { return mappedDim > dim; });
+    basis.mapping.insert(insertIt, dim);
+  }
+
+  return basis;
+}
+
+static void setBasisAttr(MLIRContext *context, NamedAttrList &attrs,
+                         StringRef name, IREE::GPU::Basis basis) {
+  Builder b(context);
+  attrs.set(name, b.getArrayAttr({b.getI64ArrayAttr(basis.counts),
+                                  b.getI64ArrayAttr(basis.mapping)}));
+}
+
+static IREE::GPU::LoweringConfigAttr
+getConfigWithFullRankBasisMappings(IREE::GPU::LoweringConfigAttr config,
+                                   int64_t rank) {
+  MLIRContext *context = config.getContext();
+  NamedAttrList attrs(config.getAttributes());
+  bool changed = false;
+
+  auto updateBasis = [&](IREE::GPU::TilingLevel level, StringRef name) {
+    FailureOr<IREE::GPU::Basis> basis = getBasis(config, level);
+    if (failed(basis)) {
+      return;
+    }
+    FailureOr<IREE::GPU::Basis> fullRankBasis =
+        getBasisWithFullRankMapping(*basis, rank);
+    if (failed(fullRankBasis) || fullRankBasis->mapping == basis->mapping) {
+      return;
+    }
+    setBasisAttr(context, attrs, name, *fullRankBasis);
+    changed = true;
+  };
+
+  updateBasis(IREE::GPU::TilingLevel::Subgroup, "subgroup_basis");
+  updateBasis(IREE::GPU::TilingLevel::Thread, "lane_basis");
+
+  if (!changed) {
+    return config;
+  }
+  return IREE::GPU::LoweringConfigAttr::get(
+      context, attrs.getDictionary(context));
 }
 
 static std::optional<unsigned>
@@ -475,29 +611,44 @@ getContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
 static FailureOr<ScaledContractionLayout>
 getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
                            ArrayRef<AffineMap> indexingMaps) {
+  auto emitRemark = [&](StringRef reason) {
+    candidate->emitRemark()
+        << "scaled-contraction-layout: " << reason
+        << "; bounds=" << formatIntArray(bounds)
+        << "; indexing_maps=" << formatAffineMaps(indexingMaps);
+  };
+
   auto config = getLoweringConfig<IREE::GPU::LoweringConfigAttr>(candidate);
   if (!config) {
+    emitRemark("missing lowering_config");
     return failure();
   }
 
   auto intrinsic =
       dyn_cast_if_present<IREE::GPU::ScaledMMAAttr>(getIntrinsic(candidate));
   if (!intrinsic) {
+    emitRemark("lowering_config does not contain a scaled MMA intrinsic");
     return failure();
   }
 
   if (failed(intrinsic.verifyIndexingMaps(indexingMaps))) {
+    emitRemark("scaled MMA intrinsic rejected indexing maps");
     return failure();
   }
 
   FailureOr<IREE::LinalgExt::ScaledContractionDimensions> maybeDims =
       IREE::LinalgExt::inferScaledContractionDims(indexingMaps);
   if (failed(maybeDims)) {
+    emitRemark("failed to infer scaled contraction dimensions");
     return failure();
   }
 
   IREE::LinalgExt::ScaledContractionDimensions dims = *maybeDims;
   if (dims.m.empty() || dims.n.empty() || dims.k.empty() || dims.kB.empty()) {
+    candidate->emitRemark()
+        << "scaled-contraction-layout: inferred incomplete dimensions "
+        << formatScaledDims(dims) << "; bounds=" << formatIntArray(bounds)
+        << "; indexing_maps=" << formatAffineMaps(indexingMaps);
     return failure();
   }
 
@@ -513,6 +664,11 @@ getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
   if (failed(distributeTilingSizes(
           candidate, config, IREE::GPU::TilingLevel::Subgroup, batchCounts,
           subgroupCounts, subgroupStrides))) {
+    candidate->emitRemark()
+        << "scaled-contraction-layout: failed to distribute subgroup tiling"
+        << "; dims=" << formatScaledDims(dims)
+        << "; bounds=" << formatIntArray(bounds)
+        << "; batch_counts=" << formatIntArray(batchCounts);
     return failure();
   }
 
@@ -533,6 +689,14 @@ getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
         IREE::GPU::getSingleSubgroupLayout(
             intrinsic.getIntrinsic(), operandIndex, intrinsic.getColMajor());
     if (operandDims.size() != subgroupLayout.outer.size()) {
+      candidate->emitRemark()
+          << "scaled-contraction-layout: operand " << operandIndex
+          << " fragment rank mismatch"
+          << "; operand_dims=" << formatIntArray(operandDims)
+          << "; subgroup_outer=" << formatIntArray(subgroupLayout.outer)
+          << "; subgroup_thread=" << formatIntArray(subgroupLayout.thread)
+          << "; subgroup_element=" << formatIntArray(subgroupLayout.element)
+          << "; map=" << formatAffineMap(map);
       return failure();
     }
 
@@ -551,7 +715,24 @@ getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
     auto fragmentSpaceLayout = NestedLayoutAttr::get(
         map.getContext(), subgroupCounts, batchCounts, outerCounts,
         threadCounts, elementCounts, subgroupStrides, threadStrides);
-    return cast<VectorLayoutInterface>(fragmentSpaceLayout.apply(map));
+    VectorLayoutInterface layout =
+        cast<VectorLayoutInterface>(fragmentSpaceLayout.apply(map));
+    if (!layout) {
+      candidate->emitRemark()
+          << "scaled-contraction-layout: operand " << operandIndex
+          << " failed to project fragment layout"
+          << "; operand_dims=" << formatIntArray(operandDims)
+          << "; map=" << formatAffineMap(map)
+          << "; subgroup_counts=" << formatIntArray(subgroupCounts)
+          << "; batch_counts=" << formatIntArray(batchCounts)
+          << "; outer_counts=" << formatIntArray(outerCounts)
+          << "; thread_counts=" << formatIntArray(threadCounts)
+          << "; element_counts=" << formatIntArray(elementCounts)
+          << "; subgroup_strides=" << formatIntArray(subgroupStrides)
+          << "; thread_strides=" << formatIntArray(threadStrides);
+      return failure();
+    }
+    return layout;
   };
 
   ScaledContractionLayout layout;
@@ -573,6 +754,13 @@ getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
                         indexingMaps[IREE::GPU::kScaledMMAOperandAcc]);
   if (failed(lhs) || failed(rhs) || failed(lhsScale) || failed(rhsScale) ||
       failed(acc)) {
+    candidate->emitRemark()
+        << "scaled-contraction-layout: failed to build one or more operand "
+           "layouts"
+        << "; dims=" << formatScaledDims(dims)
+        << "; subgroup_counts=" << formatIntArray(subgroupCounts)
+        << "; subgroup_strides=" << formatIntArray(subgroupStrides)
+        << "; post_mma_batch_counts=" << formatIntArray(batchCounts);
     return failure();
   }
 
@@ -777,6 +965,8 @@ static LogicalResult setDerivedThreadConfigLayout(
 static LogicalResult setIntrinsicLoweringConfigLayout(
     IREE::GPU::LoweringConfigAttr config, linalg::LinalgOp candidate,
     ArrayRef<int64_t> workgroupSize, RewriterBase &rewriter) {
+  config = getConfigWithFullRankBasisMappings(config, candidate.getNumLoops());
+  setLoweringConfig(candidate, config);
 
   SmallVector<bool> promotedOperands = getPromotedOperands(candidate);
   IREE::Codegen::InnerTileDescAttrInterface intrinsic = getIntrinsic(candidate);

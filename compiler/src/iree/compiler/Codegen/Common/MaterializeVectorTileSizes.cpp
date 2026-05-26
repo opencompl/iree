@@ -330,6 +330,155 @@ static TileSizes getTileSizesFor(Value val, const TileSizeLattice *lattice) {
   return tileSizes;
 }
 
+static TileSizes getRawTileSizes(const TileSizeLattice *lattice) {
+  if (!lattice) {
+    return {};
+  }
+  return lattice->getValue();
+}
+
+static std::string stringifyTileSizes(const TileSizes &tileSizes) {
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  tileSizes.print(os);
+  return str;
+}
+
+static std::string stringifyAffineMap(AffineMap map) {
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  map.print(os);
+  return str;
+}
+
+static std::string stringifyType(Type type) {
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  type.print(os);
+  return str;
+}
+
+static std::string stringifyAttr(Attribute attr) {
+  if (!attr) {
+    return "<none>";
+  }
+  std::string str;
+  llvm::raw_string_ostream os(str);
+  attr.print(os);
+  return str;
+}
+
+static void emitValueUserDebug(Operation *anchor, StringRef label, Value value,
+                               const DataFlowSolver &solver,
+                               unsigned depth = 0) {
+  const TileSizeLattice *lattice = solver.lookupState<TileSizeLattice>(value);
+  TileSizes rawTileSizes = getRawTileSizes(lattice);
+  TileSizes filteredTileSizes = getTileSizesFor(value, lattice);
+  anchor->emitRemark()
+      << "materialize-vector-tile-sizes: " << label
+      << " type = " << stringifyType(value.getType())
+      << ", raw tile sizes = " << stringifyTileSizes(rawTileSizes)
+      << ", filtered tile sizes = " << stringifyTileSizes(filteredTileSizes);
+
+  if (depth >= 2) {
+    return;
+  }
+
+  for (Operation *user : value.getUsers()) {
+    anchor->emitRemark()
+        << "materialize-vector-tile-sizes: " << label
+        << " user = " << user->getName()
+        << ", lowering_config = "
+        << stringifyAttr(user->getAttr("lowering_config"));
+    if (auto toLayout = dyn_cast<ToLayoutOp>(user)) {
+      anchor->emitRemark()
+          << "materialize-vector-tile-sizes: " << label
+          << " user to_layout layout = "
+          << stringifyAttr(toLayout.getLayout());
+    }
+    for (OpResult result : user->getResults()) {
+      std::string nestedLabel;
+      llvm::raw_string_ostream os(nestedLabel);
+      os << label << " user result #" << result.getResultNumber();
+      emitValueUserDebug(anchor, os.str(), result, solver, depth + 1);
+    }
+  }
+}
+
+static void emitTileSizeFailureDebug(Operation *op,
+                                     const TileSizes &iterationTileSizes,
+                                     const DataFlowSolver &solver) {
+  op->emitRemark() << "materialize-vector-tile-sizes: overdefined iteration "
+                      "tile sizes = "
+                   << stringifyTileSizes(iterationTileSizes);
+  op->emitRemark() << "materialize-vector-tile-sizes: lowering_config = "
+                   << stringifyAttr(op->getAttr("lowering_config"));
+
+  if (auto linalgOp = dyn_cast<linalg::LinalgOp>(op)) {
+    op->emitRemark() << "materialize-vector-tile-sizes: linalg op has "
+                     << linalgOp.getNumLoops() << " loops, "
+                     << linalgOp.getNumDpsInputs() << " inputs, "
+                     << linalgOp.getNumDpsInits() << " inits";
+    for (OpOperand &operand : linalgOp->getOpOperands()) {
+      const TileSizeLattice *lattice =
+          solver.lookupState<TileSizeLattice>(operand.get());
+      TileSizes rawTileSizes = getRawTileSizes(lattice);
+      TileSizes filteredTileSizes = getTileSizesFor(operand.get(), lattice);
+      AffineMap map = linalgOp.getMatchingIndexingMap(&operand);
+      TileSizes mappedTileSizes = filteredTileSizes.mapToIterationSpace(map);
+      op->emitRemark()
+          << "materialize-vector-tile-sizes: operand #"
+          << operand.getOperandNumber() << " type = "
+          << stringifyType(operand.get().getType())
+          << ", raw tile sizes = " << stringifyTileSizes(rawTileSizes)
+          << ", filtered tile sizes = "
+          << stringifyTileSizes(filteredTileSizes)
+          << ", indexing map = " << stringifyAffineMap(map)
+          << ", mapped iteration tile sizes = "
+          << stringifyTileSizes(mappedTileSizes);
+    }
+    for (OpResult result : linalgOp->getResults()) {
+      std::string label;
+      llvm::raw_string_ostream os(label);
+      os << "result #" << result.getResultNumber();
+      emitValueUserDebug(op, os.str(), result, solver);
+    }
+    return;
+  }
+
+  if (auto innerTiledOp = dyn_cast<IREE::Codegen::InnerTiledOp>(op)) {
+    SmallVector<AffineMap> indexingMaps = innerTiledOp.getIndexingMapsArray();
+    op->emitRemark() << "materialize-vector-tile-sizes: inner tiled op has "
+                     << indexingMaps[0].getNumDims() << " loops, "
+                     << innerTiledOp.getNumInputs() << " inputs, "
+                     << innerTiledOp.getNumOutputs() << " outputs";
+    for (OpOperand &operand : op->getOpOperands()) {
+      const TileSizeLattice *lattice =
+          solver.lookupState<TileSizeLattice>(operand.get());
+      TileSizes rawTileSizes = getRawTileSizes(lattice);
+      TileSizes filteredTileSizes = getTileSizesFor(operand.get(), lattice);
+      AffineMap map = indexingMaps[operand.getOperandNumber()];
+      TileSizes mappedTileSizes = filteredTileSizes.mapToIterationSpace(map);
+      op->emitRemark()
+          << "materialize-vector-tile-sizes: operand #"
+          << operand.getOperandNumber() << " type = "
+          << stringifyType(operand.get().getType())
+          << ", raw tile sizes = " << stringifyTileSizes(rawTileSizes)
+          << ", filtered tile sizes = "
+          << stringifyTileSizes(filteredTileSizes)
+          << ", indexing map = " << stringifyAffineMap(map)
+          << ", mapped iteration tile sizes = "
+          << stringifyTileSizes(mappedTileSizes);
+    }
+    for (OpResult result : op->getResults()) {
+      std::string label;
+      llvm::raw_string_ostream os(label);
+      os << "result #" << result.getResultNumber();
+      emitValueUserDebug(op, os.str(), result, solver);
+    }
+  }
+}
+
 /// Forward analysis: propagates tile sizes from operands to results.
 /// Control flow through scf.for/scf.if is handled automatically by the
 /// framework via RegionBranchOpInterface.
@@ -670,8 +819,10 @@ public:
       return signalPassFailure();
     }
 
-    auto materialize = [](Operation *op, TileSizes tileSizes) -> LogicalResult {
+    auto materialize = [&](Operation *op,
+                           TileSizes tileSizes) -> LogicalResult {
       if (tileSizes.isOverdefined()) {
+        emitTileSizeFailureDebug(op, tileSizes, solver);
         op->emitOpError()
             << "tile size analysis did not determine a valid tile size";
         return failure();

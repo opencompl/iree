@@ -1161,11 +1161,43 @@ projectIndexingMapThroughInputMap(AffineMap inputMap, AffineMap map) {
                         projectedResults, context);
 }
 
+static bool isExtfLike(Operation *op) {
+  return isa<arith::ExtFOp, arith::ScalingExtFOp>(op);
+}
+
+static bool hasMultipleExtfLikesInSingleUseChain(Operation *op, Block &body) {
+  if (!isExtfLike(op)) {
+    return false;
+  }
+
+  unsigned extfLikeCount = 0;
+  Operation *currentOp = op;
+  while (currentOp && currentOp->getBlock() == &body &&
+         isExtfLike(currentOp)) {
+    if (++extfLikeCount > 1) {
+      return true;
+    }
+    if (!currentOp->hasTrait<OpTrait::OneResult>() ||
+        !currentOp->getResult(0).hasOneUse()) {
+      return false;
+    }
+    currentOp = *currentOp->getResult(0).user_begin();
+  }
+
+  return false;
+}
+
 static std::optional<ExtractableElementwiseOperands>
 getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
                                          unsigned argNumber,
                                          unsigned numDpsInputs) {
-  if (isa<arith::ExtFOp, arith::ScalingExtFOp, arith::ScalingTruncFOp>(op)) {
+  if (isa<arith::ScalingTruncFOp>(op)) {
+    return std::nullopt;
+  }
+  // Keep one extf-like op in the contraction body so it still matches the
+  // expected input type for the chosen matmul-like lowering. Peel only when a
+  // chain has multiple extf-like ops, e.g. scaling_extf(...)->extf.
+  if (isExtfLike(op) && !hasMultipleExtfLikesInSingleUseChain(op, body)) {
     return std::nullopt;
   }
   if (op->getNumResults() != 1 || op->getNumOperands() > 2 ||
@@ -1322,7 +1354,6 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   }
 
   Block &body = genericOp.getRegion().front();
-  SmallVector<Value> newOperands(genericOp->getOperands());
   OpOperand *inputOperand =
       genericOp.getDpsInputOperand(extraction->operandIndex);
   rewriter.setInsertionPoint(genericOp);
@@ -1348,31 +1379,71 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   }
   extractedMaps.push_back(identityMap);
 
-  newOperands[extraction->operandIndex] = createElementwiseInputGeneric(
+  Value extractedInput = createElementwiseInputGeneric(
       rewriter, genericOp.getLoc(), extractedInputs, extractedMaps,
       extraction->elementwiseOp->getResult(0).getType(),
       extraction->elementwiseOp, mappedOperands);
 
-  auto newLinalgOp = cast<linalg::LinalgOp>(mlir::cloneWithoutRegions(
-      rewriter, cast<linalg::LinalgOp>(genericOp.getOperation()),
-      genericOp->getResultTypes(), newOperands));
-  auto newGenericOp = cast<linalg::GenericOp>(newLinalgOp.getOperation());
+  llvm::SmallDenseSet<unsigned> droppedInputIndices;
+  for (unsigned extraOperandIndex : extraction->extraInputOperandIndices) {
+    BlockArgument extraArg = body.getArgument(extraOperandIndex);
+    if (extraArg.hasOneUse() &&
+        *extraArg.user_begin() == extraction->elementwiseOp) {
+      droppedInputIndices.insert(extraOperandIndex);
+    }
+  }
+
+  SmallVector<Value> newInputs;
+  SmallVector<AffineMap> newMaps;
+  llvm::SmallDenseMap<unsigned, unsigned> oldInputToNewArg;
+  unsigned numDpsInputs = genericOp.getNumDpsInputs();
+  for (unsigned i = 0; i < numDpsInputs; ++i) {
+    if (droppedInputIndices.contains(i)) {
+      continue;
+    }
+    oldInputToNewArg[i] = newInputs.size();
+    newInputs.push_back(i == extraction->operandIndex
+                            ? extractedInput
+                            : genericOp.getDpsInputOperand(i)->get());
+    newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+  }
+
+  SmallVector<Value> newInits(genericOp.getDpsInits());
+  for (unsigned i = numDpsInputs;
+       i < static_cast<unsigned>(genericOp.getIndexingMapsArray().size()); ++i) {
+    newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+  }
+
+  auto newGenericOp = linalg::GenericOp::create(
+      rewriter, genericOp.getLoc(), genericOp->getResultTypes(), newInputs,
+      newInits, newMaps, genericOp.getIteratorTypesArray());
 
   SmallVector<Type> newArgTypes;
-  newArgTypes.reserve(body.getNumArguments());
+  newArgTypes.reserve(body.getNumArguments() - droppedInputIndices.size());
   for (auto [index, arg] : llvm::enumerate(body.getArguments())) {
-    newArgTypes.push_back(index == extraction->operandIndex
-                              ? extraction->elementwiseOp->getResult(0).getType()
-                              : arg.getType());
+    if (index < numDpsInputs && droppedInputIndices.contains(index)) {
+      continue;
+    }
+    newArgTypes.push_back(
+        index == extraction->operandIndex
+            ? extraction->elementwiseOp->getResult(0).getType()
+            : arg.getType());
   }
   SmallVector<Location> argLocs(newArgTypes.size(), genericOp.getLoc());
   Block *newBody =
       rewriter.createBlock(&newGenericOp.getRegion(), {}, newArgTypes, argLocs);
 
   IRMapping mapping;
-  for (auto [oldArg, newArg] :
-       llvm::zip_equal(body.getArguments(), newBody->getArguments())) {
-    mapping.map(oldArg, newArg);
+  for (auto [index, oldArg] : llvm::enumerate(body.getArguments())) {
+    if (index < numDpsInputs) {
+      if (droppedInputIndices.contains(index)) {
+        continue;
+      }
+      mapping.map(oldArg, newBody->getArgument(oldInputToNewArg[index]));
+      continue;
+    }
+    unsigned initIndex = index - numDpsInputs;
+    mapping.map(oldArg, newBody->getArgument(newInputs.size() + initIndex));
   }
 
   rewriter.setInsertionPointToStart(newBody);
