@@ -5,11 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/FormattingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/Im2colUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
+#include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SetOperations.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -200,12 +204,25 @@ static Value applyPostQKMatmulElementwise(OpBuilder &builder, Location loc,
                                 value, indexingMaps, iteratorTypes);
   auto &dstRegion = genericOp.getRegion();
   builder.cloneRegionBefore(region, dstRegion, dstRegion.end());
+
+  // Convert iree_linalg_ext.index -> linalg.index in the cloned region.
+  Block &block = dstRegion.back();
+  for (auto &op : llvm::make_early_inc_range(block)) {
+    if (auto indexOp = dyn_cast<IREE::LinalgExt::IndexOp>(&op)) {
+      OpBuilder::InsertionGuard g(builder);
+      builder.setInsertionPoint(&op);
+      Value replacement =
+          linalg::IndexOp::create(builder, op.getLoc(), indexOp.getDim());
+      indexOp.replaceAllUsesWith(replacement);
+      op.erase();
+    }
+  }
+
   {
     OpBuilder::InsertionGuard withinRegion(builder);
-    builder.setInsertionPoint(dstRegion.back().getTerminator());
-    linalg::YieldOp::create(builder, loc,
-                            dstRegion.back().getTerminator()->getOperands());
-    dstRegion.back().getTerminator()->erase();
+    builder.setInsertionPoint(block.getTerminator());
+    linalg::YieldOp::create(builder, loc, block.getTerminator()->getOperands());
+    block.getTerminator()->erase();
   }
   return genericOp.getResult(0);
 }
@@ -608,58 +625,140 @@ OnlineAttentionOp::decomposeOperation(OpBuilder &b) {
 // Im2colOp
 //===----------------------------------------------------------------------===//
 
+/// Structural precondition check for async-copy decomposition mode.
+static bool canDecomposeIm2colAsyncCopyImpl(Im2colOp im2colOp) {
+  // Not padded.
+  if (im2colOp.hasPadding()) {
+    return false;
+  }
+
+  // Identity output_perm and input_k_perm.
+  if (!isIdentityPermutation(im2colOp.getOutputPerm()) ||
+      !isIdentityPermutation(im2colOp.getInputKPerm())) {
+    return false;
+  }
+
+  // Output shape must be static.
+  auto outputType = cast<RankedTensorType>(im2colOp.getOutputType());
+  if (!outputType.hasStaticShape()) {
+    return false;
+  }
+
+  // Input shape must be static too: decomposeOperationAsyncCopyImpl
+  // linearizes per-input-dim offsets using inputShape as the basis,
+  // and cannot emit correct IR when any outer input dim is dynamic.
+  auto inputType = cast<RankedTensorType>(im2colOp.getInputType());
+  if (!inputType.hasStaticShape()) {
+    return false;
+  }
+
+  // Innermost k_pos channel size C must be static.
+  ArrayRef<int64_t> kPos = im2colOp.getKPos();
+  if (kPos.empty()) {
+    return false;
+  }
+  int64_t C = inputType.getShape()[kPos.back()];
+  if (ShapedType::isDynamic(C)) {
+    return false;
+  }
+
+  // Compile-time constant k_off must be channel-aligned. This check is
+  // done before chooseDimToVectorize because the latter's
+  // willBeContiguousSlice helper does not tolerate a non-aligned constant
+  // offset; keeping this guard first ensures we reject cleanly rather
+  // than relying on chooseDimToVectorize's behavior.
+  SmallVector<OpFoldResult> mixedOffsets = im2colOp.getMixedOffsets();
+  int64_t numBatchDims = im2colOp.getBatchPos().size();
+  int64_t numMDims = im2colOp.getNumMOutputDims();
+  int64_t kCanonicalIdx = numBatchDims + numMDims;
+  if (kCanonicalIdx < static_cast<int64_t>(mixedOffsets.size())) {
+    OpFoldResult kOff = mixedOffsets[kCanonicalIdx];
+    if (auto constVal = getConstantIntValue(kOff)) {
+      if (*constVal % C != 0) {
+        return false;
+      }
+    }
+  }
+
+  // Vectorizable dim must exist AND be the innermost output dim.
+  OpBuilder b(im2colOp);
+  SmallVector<Range> iterDomain(im2colOp.getIterationDomain(b));
+  std::optional<int64_t> vecDim = chooseDimToVectorize(
+      b, im2colOp.getLoc(), im2colOp, iterDomain, mixedOffsets);
+  if (!vecDim.has_value()) {
+    return false;
+  }
+  if (*vecDim != static_cast<int64_t>(outputType.getRank() - 1)) {
+    return false;
+  }
+
+  // All K output dims other than the vectorized (innermost) one must
+  // have size 1 — rules out expanded-K layouts.
+  ArrayRef<int64_t> outputShape = outputType.getShape();
+  for (int64_t kOutDim : im2colOp.getKOutputDims()) {
+    if (kOutDim == *vecDim) {
+      continue;
+    }
+    if (outputShape[kOutDim] != 1) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool Im2colOp::canDecomposeAsyncCopy() {
+  return canDecomposeIm2colAsyncCopyImpl(*this);
+}
+
 /// Decomposition implementation for iree_linalg_ext.im2col op.
 /// The im2col op is decomposed into serial loops of `insert->extract->copy`.
-/// The decomposition supports leaving either the `batch` or `K` dimension
-/// untiled when the corresponding slice in the input tensor is contiguous.
-/// If the entire `K` dimension maps to a contiguous slice, the loop over `K`
-/// is left untiled to enable more efficient data transfer. Likewise, if the
-/// `batch` dimension is contiguous, it is left untiled instead. All other
-/// dimensions, including any non-contiguous `batch` or `K`, are tiled to 1.
+/// The decomposition supports leaving a contiguous `batch`, unit-window M,
+/// or K dimension untiled when the corresponding slice in the input tensor is
+/// contiguous. All other dimensions are tiled to 1.
 /// TODO(Max191): Fallback to larger tile sizes instead of immediately tiling K
 ///               dimension to 1 when non-contiguous.
 ///
 /// The simple decomposition (with K tiled to 1) will look like:
 /// ```
 ///   %im2col = iree_linalg_ext.im2col
-///       strides = [1, 1] dilations = [1, 1] kernel_size = [3, 3]
-///       offsets = [0, %m_off, %k_off]
-///       output_sizes = [[2], [32, 32], [3, 3, 640]]
-///       batch_pos = [0] m_pos = [1, 2] k_pos = [3]
-///       input_k_perm = [0, 1, 2] output_perm = [0, 1, 2]
+///       strides = [1, 1, 1] dilations = [1, 1, 1] kernel_size = [1, 3, 3]
+///       offsets = [%m_off, %k_off]
+///       output_sizes = [[2, 32, 32], [1, 3, 3, 640]]
+///       batch_pos = [] m_pos = [0, 1, 2] k_pos = [3]
+///       input_k_perm = [0, 1, 2, 3] output_perm = [0, 1]
 ///       ins(%in : tensor<2x34x34x640xf32>)
-///       outs(%out : tensor<2x4x8xf32>) -> tensor<2x4x8xf32>
+///       outs(%out : tensor<4x8xf32>) -> tensor<4x8xf32>
 /// ```
 /// Decomposes to:
 /// ```
-/// scf.for %B = %c0 to %c2 step %c1
-///   scf.for %M = %c0 to %c4 step %c1
-///     scf.for %K = %c0 to %c8 step %c1
-///       %slice = tensor.extract_slice %in[%B, %h, %w, %k] ... to tensor<1xf32>
-///       %copy = linalg.copy ins(%slice) outs(%out)
-///       %insert = tensor.insert_slice %copy into %loop_arg
+/// scf.for %M = %c0 to %c4 step %c1
+///   scf.for %K = %c0 to %c8 step %c1
+///     %slice = tensor.extract_slice %in[%n, %h, %w, %k] ... to tensor<1xf32>
+///     %copy = linalg.copy ins(%slice) outs(%out)
+///     %insert = tensor.insert_slice %copy into %loop_arg
 /// ```
 /// Where the offsets are computed as:
-///   `%h` = `(%m_off + %M) / 32 + ((%k_off + %K) / 640) / 3`
+///   `%n` = `(%m_off + %M) / (32 * 32)`
+///   `%h` = `((%m_off + %M) / 32) mod 32 + ((%k_off + %K) / (3 * 640)) mod 3`
 ///   `%w` = `(%m_off + %M) mod 32 + ((%k_off + %K) / 640) mod 3`
 ///   `%k` = `(%k_off + %K) mod 640`
 ///
-FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
-  Location loc = getLoc();
-  Value inputSlice = getInput();
-  SmallVector<OpFoldResult> mixedOffsets = getMixedOffsets();
+static FailureOr<SmallVector<Value>>
+decomposeOperationStreamCopy(Im2colOp im2colOp, OpBuilder &b) {
+  Location loc = im2colOp.getLoc();
+  Value inputSlice = im2colOp.getInput();
+  SmallVector<OpFoldResult> mixedOffsets = im2colOp.getMixedOffsets();
   SmallVector<SmallVector<OpFoldResult>> mixedOutputSizes =
-      getMixedOutputSizes();
+      im2colOp.getMixedOutputSizes();
 
-  int64_t outputRank = getOutputRank();
-  int64_t inputRank = getInputRank();
+  int64_t outputRank = im2colOp.getOutputRank();
+  int64_t inputRank = im2colOp.getInputRank();
 
   // Step 1: Choose the vectorization dimension.
-  SmallVector<Range> iterationDomain(getIterationDomain(b));
-  SmallVector<OpFoldResult> inputSizes =
-      tensor::getMixedSizes(b, loc, getInput());
+  SmallVector<Range> iterationDomain(im2colOp.getIterationDomain(b));
   std::optional<int64_t> maybeOutputDimToVectorize =
-      chooseDimToVectorize(b, loc, *this, iterationDomain, mixedOffsets);
+      chooseDimToVectorize(b, loc, im2colOp, iterationDomain, mixedOffsets);
 
   OpFoldResult innerInputTileSize;
   if (maybeOutputDimToVectorize.has_value()) {
@@ -678,7 +777,7 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
     steps.push_back(getValueOrCreateConstantIndexOp(b, loc, range.stride));
   }
   scf::LoopNest loopNest = scf::buildLoopNest(
-      b, loc, lbs, ubs, steps, getOutput(),
+      b, loc, lbs, ubs, steps, im2colOp.getOutput(),
       [&](OpBuilder &nestedBuilder, Location loc, ValueRange outputIvs,
           ValueRange iterArgs) -> scf::ValueVector { return iterArgs; });
   SmallVector<Value> ivs;
@@ -698,13 +797,13 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
       loopNest.loops.back().getBody()->getTerminator()->getLoc();
   b.setInsertionPointToStart(loopNest.loops.back().getBody());
 
-  Im2colSourceIndices srcIndices =
-      computeIm2colSourceIndices(b, nestedLoc, *this, ivs, innerInputTileSize);
+  Im2colSourceIndices srcIndices = computeIm2colSourceIndices(
+      b, nestedLoc, im2colOp, ivs, innerInputTileSize);
 
   // The slice is always 1D — just a flat slice along the vectorized input
   // dimension. With a 1D slice, no transpose is needed regardless of
   // which output dimension is being vectorized.
-  ShapedType outputType = getOutputType();
+  ShapedType outputType = im2colOp.getOutputType();
   OpFoldResult zero = b.getIndexAttr(0);
   OpFoldResult one = b.getIndexAttr(1);
   int64_t vecInputDim = inputRank - 1;
@@ -735,12 +834,12 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   Value sliceToInsert;
 
   SmallVector<OpFoldResult> padLow(inputRank, b.getIndexAttr(0));
-  SmallVector<OpFoldResult> inputPadLow = getMixedInputPadLow();
+  SmallVector<OpFoldResult> inputPadLow = im2colOp.getMixedInputPadLow();
   if (!inputPadLow.empty()) {
     padLow = inputPadLow;
   }
   SmallVector<OpFoldResult> inputDimSizes =
-      tensor::getMixedSizes(b, nestedLoc, getInput());
+      tensor::getMixedSizes(b, nestedLoc, im2colOp.getInput());
   MLIRContext *clampCtx = b.getContext();
   AffineExpr cd0 = getAffineDimExpr(0, clampCtx);
   AffineExpr cd1 = getAffineDimExpr(1, clampCtx);
@@ -750,7 +849,7 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   for (int64_t d = 0; d < inputRank; ++d) {
     OpFoldResult adjusted =
         subOfrs(b, nestedLoc, srcIndices.sliceOffsets[d], padLow[d]);
-    if (hasPadding()) {
+    if (im2colOp.hasPadding()) {
       adjusted = affine::makeComposedFoldedAffineMax(b, nestedLoc, maxZeroMap,
                                                      {adjusted});
       adjusted = affine::makeComposedFoldedAffineMin(
@@ -760,8 +859,8 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   }
 
   Value validSize;
-  if (hasPadding()) {
-    validSize = computeIm2colValidSize(b, nestedLoc, *this, srcIndices,
+  if (im2colOp.hasPadding()) {
+    validSize = computeIm2colValidSize(b, nestedLoc, im2colOp, srcIndices,
                                        innerInputTileSize, ivs,
                                        maybeOutputDimToVectorize);
     extractSizes[vecInputDim] = validSize;
@@ -770,7 +869,7 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   }
 
   auto extractType = RankedTensorType::get(
-      {hasPadding() ? ShapedType::kDynamic : paddedStaticSize},
+      {im2colOp.hasPadding() ? ShapedType::kDynamic : paddedStaticSize},
       outputType.getElementType());
   auto extract =
       tensor::ExtractSliceOp::create(b, nestedLoc, extractType, inputSlice,
@@ -779,7 +878,7 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
   // Branch only on the vectorizable payload:
   //  - No padding: linalg.copy (static type, concrete copy op)
   //  - Has padding: tensor.pad (dynamic extract padded to static size)
-  if (!hasPadding()) {
+  if (!im2colOp.hasPadding()) {
     auto sliceType = cast<RankedTensorType>(extract.getType());
     auto destExtract = tensor::ExtractSliceOp::create(
         b, nestedLoc, sliceType, loopNest.loops.back().getRegionIterArg(0),
@@ -796,9 +895,9 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
 
     auto paddedType =
         RankedTensorType::get({paddedStaticSize}, outputType.getElementType());
-    auto paddedSlice =
-        tensor::PadOp::create(b, nestedLoc, paddedType, extract.getResult(),
-                              lowPad, highPad, getPadValue(), /*nofold=*/false);
+    auto paddedSlice = tensor::PadOp::create(
+        b, nestedLoc, paddedType, extract.getResult(), lowPad, highPad,
+        im2colOp.getPadValue(), /*nofold=*/false);
     sliceToInsert = paddedSlice.getResult();
   }
 
@@ -809,6 +908,145 @@ FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
       cast<scf::YieldOp>(loopNest.loops.back().getBody()->getTerminator());
   yieldOp->getOpOperands().front().assign(insert.getResult());
   return SmallVector<Value>({loopNest.results[0]});
+}
+
+/// Async-copy decomposition: lower the im2col op to a gather over a
+/// collapsed source. The source is reshaped to 2D [outer_size, C] where
+/// outer_size is the product of all non-channel input dims. A
+/// linalg.generic computes, for each non-innermost output position, the
+/// linearized flat index into that collapsed source via the shared
+/// computeIm2colSourceIndices helper. An iree_linalg_ext.gather reads the
+/// contiguous channel slice for every output row; the result is expanded
+/// back to the original output shape.
+static FailureOr<SmallVector<Value>>
+decomposeOperationAsyncCopyImpl(Im2colOp im2colOp, OpBuilder &b) {
+  if (!canDecomposeIm2colAsyncCopyImpl(im2colOp)) {
+    return im2colOp.emitOpError(
+        "async_copy decomposition preconditions not satisfied "
+        "(see canDecomposeAsyncCopy)");
+  }
+
+  Location loc = im2colOp.getLoc();
+  auto inputType = cast<RankedTensorType>(im2colOp.getInputType());
+  auto outputType = cast<RankedTensorType>(im2colOp.getOutputType());
+  ArrayRef<int64_t> inputShape = inputType.getShape();
+  ArrayRef<int64_t> outputShape = outputType.getShape();
+  int64_t inputRank = inputType.getRank();
+  int64_t outputRank = outputType.getRank();
+  int64_t numOutputRows = ShapedType::getNumElements(outputShape.drop_back());
+
+  // Step 1: Collapse source to 2D: [[0..inputRank-2], [inputRank-1]].
+  SmallVector<ReassociationIndices> srcReassoc = {
+      llvm::to_vector(llvm::seq<int64_t>(0, inputRank - 1)), {inputRank - 1}};
+  Value collapsedSource =
+      tensor::CollapseShapeOp::create(b, loc, im2colOp.getInput(), srcReassoc);
+
+  // Step 2: Build a 1D index tensor by running a linalg.generic with a
+  // single parallel iterator over numOutputRows.
+  Type indexType = b.getIndexType();
+  Value indexEmpty = tensor::EmptyOp::create(
+      b, loc, ArrayRef<int64_t>{numOutputRows}, indexType);
+  AffineMap indexMap = b.getMultiDimIdentityMap(1);
+  SmallVector<utils::IteratorType> iterTypes = {utils::IteratorType::parallel};
+
+  auto indexGeneric = linalg::GenericOp::create(
+      b, loc, indexEmpty.getType(), /*inputs=*/ValueRange{},
+      /*outputs=*/ValueRange{indexEmpty},
+      /*indexingMaps=*/ArrayRef<AffineMap>{indexMap}, iterTypes,
+      [&](OpBuilder &nestedB, Location nestedLoc, ValueRange) {
+        // Delinearize linalg.index 0 into per-output-dim positions,
+        // covering every output dim except the innermost (vectorized)
+        // one. Size-1 non-vectorized K output dims contribute zero to
+        // the delinearization because their basis entry is 1.
+        Value flatIdx = linalg::IndexOp::create(nestedB, nestedLoc, 0);
+        SmallVector<OpFoldResult> iterBasis;
+        for (int64_t d = 0; d < outputRank - 1; ++d) {
+          iterBasis.push_back(nestedB.getIndexAttr(outputShape[d]));
+        }
+
+        // Delinearize to (outputRank - 1) positions.
+        SmallVector<Value> nonVectorizedPositions;
+        if (outputRank == 1) {
+          // Rare: only the vectorized (and innermost) dim, no iteration
+          // positions to delinearize. numOutputRows is 1 in this case.
+        } else if (outputRank == 2) {
+          nonVectorizedPositions.push_back(flatIdx);
+        } else {
+          auto delinearize = affine::AffineDelinearizeIndexOp::create(
+              nestedB, nestedLoc, flatIdx, iterBasis,
+              /*hasOuterBound=*/true);
+          for (unsigned i = 0; i < delinearize.getNumResults(); ++i) {
+            nonVectorizedPositions.push_back(delinearize.getResult(i));
+          }
+        }
+
+        // Assemble outputDimPositions for the helper: actual-output-dim
+        // order, length == outputRank, with a zero constant in the
+        // vectorized slot.
+        Value zero = arith::ConstantIndexOp::create(nestedB, nestedLoc, 0);
+        SmallVector<Value> outputDimPositions;
+        outputDimPositions.reserve(outputRank);
+        for (int64_t d = 0; d < outputRank - 1; ++d) {
+          outputDimPositions.push_back(nonVectorizedPositions[d]);
+        }
+        outputDimPositions.push_back(zero); // vectorized slot
+
+        SmallVector<OpFoldResult> sliceOffsets =
+            computeIm2colSourceIndices(
+                nestedB, nestedLoc, im2colOp, outputDimPositions,
+                /*innerTileSize=*/nestedB.getIndexAttr(1))
+                .sliceOffsets;
+
+        // Linearize sliceOffsets[0..inputRank-2] using
+        // inputShape[0..inputRank-2] to get the flat gather index into
+        // the collapsed source.
+        SmallVector<Value> outerCoords;
+        SmallVector<OpFoldResult> outerBasis;
+        for (int64_t i = 0; i < inputRank - 1; ++i) {
+          outerCoords.push_back(getValueOrCreateConstantIndexOp(
+              nestedB, nestedLoc, sliceOffsets[i]));
+          outerBasis.push_back(nestedB.getIndexAttr(inputShape[i]));
+        }
+        Value flatGatherIdx = affine::AffineLinearizeIndexOp::create(
+            nestedB, nestedLoc, outerCoords, outerBasis,
+            /*disjoint=*/false);
+
+        linalg::YieldOp::create(nestedB, nestedLoc, flatGatherIdx);
+      });
+  Value indices = indexGeneric.getResult(0);
+
+  // Step 3: Collapse the im2col output to 2D [numOutputRows, C_per_window],
+  // build the gather, then expand back.
+  SmallVector<ReassociationIndices> outputReassoc = {
+      llvm::to_vector(llvm::seq<int64_t>(0, outputRank - 1)), {outputRank - 1}};
+  Value collapsedOutput = tensor::CollapseShapeOp::create(
+      b, loc, im2colOp.getOutput(), outputReassoc);
+
+  auto gatherOp = IREE::LinalgExt::GatherOp::create(
+      b, loc, cast<RankedTensorType>(collapsedOutput.getType()),
+      collapsedSource, indices, /*mask=*/Value(), collapsedOutput,
+      b.getDenseI64ArrayAttr({0}));
+
+  // Propagate the lowering_config attribute by raw name copy. This keeps
+  // LinalgExt free of any dependency on Codegen::IREECodegenAttrs.
+  constexpr StringLiteral kLoweringConfigAttrName = "lowering_config";
+  if (Attribute lcAttr = im2colOp->getAttr(kLoweringConfigAttrName)) {
+    gatherOp->setAttr(kLoweringConfigAttrName, lcAttr);
+  }
+
+  Value result = tensor::ExpandShapeOp::create(
+      b, loc, outputType, gatherOp.getResult(0), outputReassoc);
+
+  return SmallVector<Value>{result};
+}
+
+FailureOr<SmallVector<Value>>
+Im2colOp::decomposeOperationAsyncCopy(OpBuilder &b) {
+  return decomposeOperationAsyncCopyImpl(*this, b);
+}
+
+FailureOr<SmallVector<Value>> Im2colOp::decomposeOperation(OpBuilder &b) {
+  return decomposeOperationStreamCopy(*this, b);
 }
 
 //===----------------------------------------------------------------------===//
@@ -880,6 +1118,18 @@ struct UsedOperationsAndBlockArguments {
   SetVector<Operation *> usedOperations;
 };
 
+struct ElementwiseInputExtraction {
+  Operation *elementwiseOp = nullptr;
+  unsigned operandIndex = 0;
+  unsigned blockArgOperandIndex = 0;
+  SmallVector<unsigned> extraInputOperandIndices;
+};
+
+struct ExtractableElementwiseOperands {
+  unsigned blockArgOperandIndex = 0;
+  SmallVector<unsigned> extraInputOperandIndices;
+};
+
 /// For a given `resultNumber` in a linalg::GenericOp, this op scans the
 /// GenericOp's body for the block arguments and operations that are involved
 /// in its computation.
@@ -934,8 +1184,650 @@ captureUsedOperationsAndBlockArguments(linalg::GenericOp genericOp,
       }
     }
   }
-
   return UsedOperationsAndBlockArguments{usedInputIndices, usedOperations};
+}
+
+static llvm::SmallDenseSet<int64_t>
+getIndexingMapDimsWithIteratorType(AffineMap map,
+                                   ArrayRef<utils::IteratorType> iterators,
+                                   utils::IteratorType iteratorType) {
+  llvm::SmallDenseSet<int64_t> dims;
+  if (!map.isProjectedPermutation()) {
+    return dims;
+  }
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      continue;
+    }
+    int64_t position = dimExpr.getPosition();
+    if (iterators[position] == iteratorType) {
+      dims.insert(position);
+    }
+  }
+  return dims;
+}
+
+static AffineMap
+dropIteratorDims(AffineMap map,
+                 const llvm::SmallDenseSet<int64_t> &droppedDims) {
+  SmallVector<AffineExpr> results;
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr || droppedDims.contains(dimExpr.getPosition())) {
+      continue;
+    }
+    results.push_back(expr);
+  }
+  return AffineMap::get(map.getNumDims(), map.getNumSymbols(), results,
+                        map.getContext());
+}
+
+static FailureOr<AffineMap>
+projectIndexingMapThroughInputMap(AffineMap inputMap, AffineMap map) {
+  if (inputMap.getNumSymbols() != 0 || map.getNumSymbols() != 0) {
+    return failure();
+  }
+
+  SmallVector<int64_t> loopDimToInputDim(inputMap.getNumDims(), -1);
+  for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return failure();
+    }
+    int64_t loopDim = dimExpr.getPosition();
+    if (loopDimToInputDim[loopDim] != -1) {
+      return failure();
+    }
+    loopDimToInputDim[loopDim] = inputDim;
+  }
+
+  SmallVector<AffineExpr> projectedResults;
+  MLIRContext *context = inputMap.getContext();
+  for (AffineExpr expr : map.getResults()) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return failure();
+    }
+    int64_t inputDim = loopDimToInputDim[dimExpr.getPosition()];
+    if (inputDim == -1) {
+      return failure();
+    }
+    projectedResults.push_back(getAffineDimExpr(inputDim, context));
+  }
+
+  return AffineMap::get(inputMap.getNumResults(), /*symbolCount=*/0,
+                        projectedResults, context);
+}
+
+static bool isExtfLike(Operation *op) {
+  return isa<arith::ExtFOp, arith::ScalingExtFOp>(op);
+}
+
+static bool hasMultipleExtfLikesInSingleUseChain(Operation *op, Block &body) {
+  if (!isExtfLike(op)) {
+    return false;
+  }
+
+  unsigned extfLikeCount = 0;
+  Operation *currentOp = op;
+  while (currentOp && currentOp->getBlock() == &body && isExtfLike(currentOp)) {
+    if (++extfLikeCount > 1) {
+      return true;
+    }
+    if (!currentOp->hasTrait<OpTrait::OneResult>() ||
+        !currentOp->getResult(0).hasOneUse()) {
+      return false;
+    }
+    currentOp = *currentOp->getResult(0).user_begin();
+  }
+
+  return false;
+}
+
+static std::optional<ExtractableElementwiseOperands>
+getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
+                                         unsigned argNumber,
+                                         unsigned numDpsInputs) {
+  if (isa<arith::ScalingTruncFOp>(op)) {
+    auto valueArg = dyn_cast<BlockArgument>(op->getOperand(0));
+    if (!valueArg || valueArg.getOwner() != &body ||
+        valueArg.getArgNumber() != argNumber) {
+      return std::nullopt;
+    }
+  }
+  // Keep one extf-like op in the contraction body so it still matches the
+  // expected input type for the chosen matmul-like lowering. Peel only when a
+  // chain has multiple extf-like ops, e.g. scaling_extf(...)->extf.
+  if (isExtfLike(op) && !hasMultipleExtfLikesInSingleUseChain(op, body)) {
+    return std::nullopt;
+  }
+  if (op->getNumResults() != 1 || op->getNumOperands() > 2 ||
+      op->getNumRegions() != 0) {
+    return std::nullopt;
+  }
+
+  std::optional<unsigned> blockArgOperandIndex;
+  SmallVector<unsigned> extraInputOperandIndices;
+  for (auto [operandIndex, operand] : llvm::enumerate(op->getOperands())) {
+    auto blockArg = dyn_cast<BlockArgument>(operand);
+    if (blockArg && blockArg.getOwner() == &body &&
+        blockArg.getArgNumber() == argNumber) {
+      if (blockArgOperandIndex) {
+        return std::nullopt;
+      }
+      blockArgOperandIndex = operandIndex;
+      continue;
+    }
+
+    if (op->getNumOperands() != 2) {
+      return std::nullopt;
+    }
+    if (operand.getDefiningOp<arith::ConstantOp>()) {
+      continue;
+    }
+    if (blockArg && blockArg.getOwner() == &body &&
+        blockArg.getArgNumber() < numDpsInputs) {
+      extraInputOperandIndices.push_back(blockArg.getArgNumber());
+      continue;
+    }
+    return std::nullopt;
+  }
+
+  if (!blockArgOperandIndex) {
+    return std::nullopt;
+  }
+
+  return ExtractableElementwiseOperands{*blockArgOperandIndex,
+                                        extraInputOperandIndices};
+}
+
+static std::optional<ElementwiseInputExtraction>
+matchElementwiseInputExtraction(linalg::GenericOp genericOp) {
+  if (!genericOp.hasPureTensorSemantics()) {
+    return std::nullopt;
+  }
+
+  Block &body = genericOp.getRegion().front();
+  for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
+    unsigned operandIndex = inputOperand->getOperandNumber();
+    auto inputType = dyn_cast<RankedTensorType>(inputOperand->get().getType());
+    if (!inputType) {
+      continue;
+    }
+    BlockArgument arg = body.getArgument(operandIndex);
+    if (arg.use_empty()) {
+      continue;
+    }
+
+    Operation *singleUser = nullptr;
+    for (Operation *user : arg.getUsers()) {
+      if (singleUser) {
+        singleUser = nullptr;
+        break;
+      }
+      singleUser = user;
+    }
+    if (!singleUser) {
+      continue;
+    }
+
+    std::optional<ExtractableElementwiseOperands> extractableOperands =
+        getExtractableElementwiseBlockArgOperand(singleUser, body, operandIndex,
+                                                 genericOp.getNumDpsInputs());
+    if (!extractableOperands) {
+      continue;
+    }
+
+    AffineMap inputMap = genericOp.getIndexingMapsArray()[operandIndex];
+    bool canProjectExtraInputs = true;
+    for (unsigned extraOperandIndex :
+         extractableOperands->extraInputOperandIndices) {
+      if (failed(projectIndexingMapThroughInputMap(
+              inputMap, genericOp.getIndexingMapsArray()[extraOperandIndex]))) {
+        canProjectExtraInputs = false;
+        break;
+      }
+    }
+    if (!canProjectExtraInputs) {
+      continue;
+    }
+    return ElementwiseInputExtraction{
+        singleUser, operandIndex, extractableOperands->blockArgOperandIndex,
+        extractableOperands->extraInputOperandIndices};
+  }
+
+  return std::nullopt;
+}
+
+static Value createElementwiseInputGeneric(RewriterBase &rewriter, Location loc,
+                                           ValueRange inputs,
+                                           ArrayRef<AffineMap> indexingMaps,
+                                           Type resultElementType,
+                                           Operation *elementwiseOp,
+                                           ValueRange mappedOperands) {
+  Value input = inputs.front();
+  auto inputType = cast<RankedTensorType>(input.getType());
+  auto resultType = RankedTensorType::get(
+      inputType.getShape(), resultElementType, inputType.getEncoding());
+  auto mixedSizes = tensor::getMixedSizes(rewriter, loc, input);
+  Value empty =
+      inputType.getEncoding()
+          ? tensor::EmptyOp::create(rewriter, loc, mixedSizes,
+                                    resultElementType, inputType.getEncoding())
+          : tensor::EmptyOp::create(rewriter, loc, mixedSizes,
+                                    resultElementType);
+  SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
+                                                 utils::IteratorType::parallel);
+  return linalg::GenericOp::create(
+             rewriter, loc, TypeRange{resultType}, inputs, ValueRange{empty},
+             indexingMaps, iteratorTypes,
+             [&](OpBuilder &builder, Location nestedLoc, ValueRange args) {
+               IRMapping mapping;
+               for (auto [oldOperand, newArg] :
+                    llvm::zip_equal(mappedOperands,
+                                    args.take_front(mappedOperands.size()))) {
+                 mapping.map(oldOperand, newArg);
+               }
+               for (Value operand : elementwiseOp->getOperands()) {
+                 if (mapping.lookupOrNull(operand)) {
+                   continue;
+                 }
+                 auto constantOp = operand.getDefiningOp<arith::ConstantOp>();
+                 if (constantOp &&
+                     constantOp->getBlock() == elementwiseOp->getBlock()) {
+                   Operation *clonedConstant = builder.clone(*constantOp);
+                   mapping.map(operand, clonedConstant->getResult(0));
+                 }
+               }
+               Operation *cloned = builder.clone(*elementwiseOp, mapping);
+               linalg::YieldOp::create(builder, nestedLoc,
+                                       cloned->getResult(0));
+             })
+      .getResult(0);
+}
+
+static FailureOr<linalg::GenericOp>
+extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
+  std::optional<ElementwiseInputExtraction> extraction =
+      matchElementwiseInputExtraction(genericOp);
+  if (!extraction) {
+    return failure();
+  }
+
+  Block &body = genericOp.getRegion().front();
+  OpOperand *inputOperand =
+      genericOp.getDpsInputOperand(extraction->operandIndex);
+  rewriter.setInsertionPoint(genericOp);
+
+  auto inputType = cast<RankedTensorType>(inputOperand->get().getType());
+  AffineMap identityMap = rewriter.getMultiDimIdentityMap(inputType.getRank());
+  SmallVector<Value> extractedInputs{inputOperand->get()};
+  SmallVector<Value> mappedOperands{
+      extraction->elementwiseOp->getOperand(extraction->blockArgOperandIndex)};
+  SmallVector<AffineMap> extractedMaps{identityMap};
+  AffineMap inputMap =
+      genericOp.getIndexingMapsArray()[extraction->operandIndex];
+  for (unsigned extraOperandIndex : extraction->extraInputOperandIndices) {
+    extractedInputs.push_back(
+        genericOp.getDpsInputOperand(extraOperandIndex)->get());
+    mappedOperands.push_back(body.getArgument(extraOperandIndex));
+    FailureOr<AffineMap> projectedMap = projectIndexingMapThroughInputMap(
+        inputMap, genericOp.getIndexingMapsArray()[extraOperandIndex]);
+    if (failed(projectedMap)) {
+      return failure();
+    }
+    extractedMaps.push_back(*projectedMap);
+  }
+  extractedMaps.push_back(identityMap);
+
+  Value extractedInput = createElementwiseInputGeneric(
+      rewriter, genericOp.getLoc(), extractedInputs, extractedMaps,
+      extraction->elementwiseOp->getResult(0).getType(),
+      extraction->elementwiseOp, mappedOperands);
+
+  llvm::SmallDenseSet<unsigned> droppedInputIndices;
+  for (unsigned extraOperandIndex : extraction->extraInputOperandIndices) {
+    BlockArgument extraArg = body.getArgument(extraOperandIndex);
+    if (extraArg.hasOneUse() &&
+        *extraArg.user_begin() == extraction->elementwiseOp) {
+      droppedInputIndices.insert(extraOperandIndex);
+    }
+  }
+
+  SmallVector<Value> newInputs;
+  SmallVector<AffineMap> newMaps;
+  llvm::SmallDenseMap<unsigned, unsigned> oldInputToNewArg;
+  unsigned numDpsInputs = genericOp.getNumDpsInputs();
+  for (unsigned i = 0; i < numDpsInputs; ++i) {
+    if (droppedInputIndices.contains(i)) {
+      continue;
+    }
+    oldInputToNewArg[i] = newInputs.size();
+    newInputs.push_back(i == extraction->operandIndex
+                            ? extractedInput
+                            : genericOp.getDpsInputOperand(i)->get());
+    newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+  }
+
+  SmallVector<Value> newInits(genericOp.getDpsInits());
+  for (unsigned i = numDpsInputs;
+       i < static_cast<unsigned>(genericOp.getIndexingMapsArray().size());
+       ++i) {
+    newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
+  }
+
+  auto newGenericOp = linalg::GenericOp::create(
+      rewriter, genericOp.getLoc(), genericOp->getResultTypes(), newInputs,
+      newInits, newMaps, genericOp.getIteratorTypesArray());
+
+  SmallVector<Type> newArgTypes;
+  newArgTypes.reserve(body.getNumArguments() - droppedInputIndices.size());
+  for (auto [index, arg] : llvm::enumerate(body.getArguments())) {
+    if (index < numDpsInputs && droppedInputIndices.contains(index)) {
+      continue;
+    }
+    newArgTypes.push_back(
+        index == extraction->operandIndex
+            ? extraction->elementwiseOp->getResult(0).getType()
+            : arg.getType());
+  }
+  SmallVector<Location> argLocs(newArgTypes.size(), genericOp.getLoc());
+  Block *newBody =
+      rewriter.createBlock(&newGenericOp.getRegion(), {}, newArgTypes, argLocs);
+
+  IRMapping mapping;
+  for (auto [index, oldArg] : llvm::enumerate(body.getArguments())) {
+    if (index < numDpsInputs) {
+      if (droppedInputIndices.contains(index)) {
+        continue;
+      }
+      mapping.map(oldArg, newBody->getArgument(oldInputToNewArg[index]));
+      continue;
+    }
+    unsigned initIndex = index - numDpsInputs;
+    mapping.map(oldArg, newBody->getArgument(newInputs.size() + initIndex));
+  }
+
+  rewriter.setInsertionPointToStart(newBody);
+  for (Operation &op : body.without_terminator()) {
+    if (&op == extraction->elementwiseOp) {
+      mapping.map(op.getResult(0), mapping.lookup(op.getOperand(
+                                       extraction->blockArgOperandIndex)));
+      continue;
+    }
+    rewriter.clone(op, mapping);
+  }
+  rewriter.clone(*body.getTerminator(), mapping);
+
+  rewriter.replaceOp(genericOp, newGenericOp.getResults());
+  return newGenericOp;
+}
+
+static IREE::Codegen::InnerTileDescAttrInterface
+getMmaKind(Attribute loweringConfig) {
+  if (!loweringConfig) {
+    return nullptr;
+  }
+  IREE::Codegen::InnerTileDescAttrInterface mmaKind;
+  loweringConfig.walkImmediateSubElements(
+      [&](Attribute attr) {
+        if (mmaKind) {
+          return;
+        }
+        auto dictAttr = dyn_cast<DictionaryAttr>(attr);
+        if (!dictAttr) {
+          return;
+        }
+        mmaKind = dictAttr.getAs<IREE::Codegen::InnerTileDescAttrInterface>(
+            "mma_kind");
+      },
+      [](Type) {});
+  return mmaKind;
+}
+
+static LogicalResult emitInnerTiledMatmulVerifierError(
+    linalg::GenericOp genericOp, Attribute loweringConfig,
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind, const Twine &message) {
+  InFlightDiagnostic diag =
+      genericOp.emitOpError()
+      << "expected decomposed matmul generic to be an inner-tiled FP32 FMA: "
+      << message;
+  diag.attachNote(genericOp.getLoc())
+      << "indexing_maps = "
+      << formatAffineMaps(genericOp.getIndexingMapsArray())
+      << ", iterator_types = "
+      << formatIteratorTypes(genericOp.getIteratorTypesArray());
+  diag.attachNote(genericOp.getLoc())
+      << "lowering_config = " << loweringConfig << ", mma_kind = " << mmaKind;
+  if (mmaKind) {
+    SmallVector<VectorType> undistributedTileTypes;
+    SmallVector<VectorType> distributedTileTypes;
+    mmaKind.getUndistributedTileTypes(undistributedTileTypes);
+    mmaKind.getDistributedTileTypes(distributedTileTypes);
+    diag.attachNote(genericOp.getLoc())
+        << "inner_tile metadata: expected inputs = "
+        << mmaKind.getExpectedNumInputs()
+        << ", expected outputs = " << mmaKind.getExpectedNumOutputs()
+        << ", undistributed tile types = "
+        << formatVectorTypes(undistributedTileTypes)
+        << ", distributed tile types = "
+        << formatVectorTypes(distributedTileTypes);
+  }
+  return failure();
+}
+
+static FailureOr<SmallVector<Type>> getExpectedInnerTileElementTypes(
+    linalg::GenericOp genericOp, Attribute loweringConfig,
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  SmallVector<VectorType> tileTypes;
+  mmaKind.getUndistributedTileTypes(tileTypes);
+  unsigned expectedOperands =
+      mmaKind.getExpectedNumInputs() + mmaKind.getExpectedNumOutputs();
+  if (tileTypes.size() != expectedOperands) {
+    (void)emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("mma_kind produced ") + Twine(tileTypes.size()) +
+            " undistributed tile types, but expected " +
+            Twine(expectedOperands));
+    return failure();
+  }
+  if (genericOp.getNumDpsInputs() != mmaKind.getExpectedNumInputs() ||
+      genericOp.getNumDpsInits() != mmaKind.getExpectedNumOutputs()) {
+    (void)emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("generic has ") + Twine(genericOp.getNumDpsInputs()) +
+            " inputs and " + Twine(genericOp.getNumDpsInits()) +
+            " outputs, but mma_kind expects " +
+            Twine(mmaKind.getExpectedNumInputs()) + " inputs and " +
+            Twine(mmaKind.getExpectedNumOutputs()) + " outputs");
+    return failure();
+  }
+  if (failed(mmaKind.verifyIndexingMaps(genericOp.getIndexingMapsArray()))) {
+    (void)emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "indexing maps do not satisfy the mma_kind requirements");
+    return failure();
+  }
+
+  return llvm::map_to_vector(
+      tileTypes, [](VectorType type) -> Type { return type.getElementType(); });
+}
+
+static LogicalResult
+verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
+                        IREE::Codegen::InnerTileDescAttrInterface mmaKind,
+                        ArrayRef<Type> expectedElementTypes, Value value,
+                        unsigned operandIndex) {
+  Type f32Type = Float32Type::get(genericOp.getContext());
+  if (value.getType() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("mulf operand ") + Twine(operandIndex) + " has type " +
+            Twine(formatType(value.getType())) + ", expected f32");
+  }
+
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp) {
+    Type expectedType = expectedElementTypes[operandIndex];
+    Type actualType = value.getType();
+    if (actualType != expectedType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("mulf operand ") + Twine(operandIndex) +
+              " is not produced by an extf-like op and has source type " +
+              Twine(formatType(actualType)) + ", but mma_kind expects " +
+              Twine(formatType(expectedType)));
+    }
+    return success();
+  }
+
+  if (auto extfOp = dyn_cast<arith::ExtFOp>(definingOp)) {
+    Type expectedType = expectedElementTypes[operandIndex];
+    Type actualType = getElementTypeOrSelf(extfOp.getIn().getType());
+    if (actualType != expectedType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("extf feeding mulf operand ") + Twine(operandIndex) +
+              " converts from " + Twine(formatType(actualType)) +
+              ", but mma_kind expects " + Twine(formatType(expectedType)));
+    }
+    return success();
+  }
+
+  if (auto scalingExtfOp = dyn_cast<arith::ScalingExtFOp>(definingOp)) {
+    if (expectedElementTypes.size() < 5) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("scaling_extf feeds mulf operand ") + Twine(operandIndex) +
+              ", but mma_kind does not describe scale operands");
+    }
+    Type expectedInputType = expectedElementTypes[operandIndex];
+    Type actualInputType =
+        getElementTypeOrSelf(scalingExtfOp->getOperand(0).getType());
+    if (actualInputType != expectedInputType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("scaling_extf feeding mulf operand ") + Twine(operandIndex) +
+              " converts from " + Twine(formatType(actualInputType)) +
+              ", but mma_kind expects " + Twine(formatType(expectedInputType)));
+    }
+    Type expectedScaleType = expectedElementTypes[operandIndex + 2];
+    Type actualScaleType =
+        getElementTypeOrSelf(scalingExtfOp->getOperand(1).getType());
+    if (actualScaleType != expectedScaleType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("scaling_extf feeding mulf operand ") + Twine(operandIndex) +
+              " uses scale type " + Twine(formatType(actualScaleType)) +
+              ", but mma_kind expects " + Twine(formatType(expectedScaleType)));
+    }
+    return success();
+  }
+
+  return emitInnerTiledMatmulVerifierError(
+      genericOp, loweringConfig, mmaKind,
+      Twine("mulf operand ") + Twine(operandIndex) +
+          " is produced by unsupported op " +
+          definingOp->getName().getStringRef());
+}
+
+static LogicalResult
+verifyInnerTiledMatmulFma(linalg::GenericOp genericOp, Attribute loweringConfig,
+                          IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  FailureOr<SmallVector<Type>> maybeExpectedElementTypes =
+      getExpectedInnerTileElementTypes(genericOp, loweringConfig, mmaKind);
+  if (failed(maybeExpectedElementTypes)) {
+    return failure();
+  }
+  ArrayRef<Type> expectedElementTypes = *maybeExpectedElementTypes;
+  Type f32Type = Float32Type::get(genericOp.getContext());
+  if (expectedElementTypes.back() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("mma_kind accumulator element type is ") +
+            Twine(formatType(expectedElementTypes.back())) + ", expected f32");
+  }
+
+  Block &body = genericOp.getRegion().front();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(body.getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "body must yield exactly one accumulator value");
+  }
+
+  auto addOp = yieldOp.getOperand(0).getDefiningOp<arith::AddFOp>();
+  if (!addOp || addOp.getType() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "yielded value must be an arith.addf producing f32");
+  }
+
+  Value accArg = body.getArgument(genericOp.getNumDpsInputs());
+  Value lhs = addOp.getLhs();
+  Value rhs = addOp.getRhs();
+  auto mulOp = lhs.getDefiningOp<arith::MulFOp>();
+  if (rhs == accArg && mulOp) {
+    // Matched addf(mulf(...), acc).
+  } else if (lhs == accArg) {
+    mulOp = rhs.getDefiningOp<arith::MulFOp>();
+  } else {
+    mulOp = nullptr;
+  }
+  if (!mulOp || mulOp.getType() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "addf must accumulate an arith.mulf producing f32 with the output "
+        "block argument");
+  }
+
+  if (failed(verifyMatmulOperandCast(genericOp, loweringConfig, mmaKind,
+                                     expectedElementTypes, mulOp.getLhs(),
+                                     /*operandIndex=*/0))) {
+    return failure();
+  }
+  if (failed(verifyMatmulOperandCast(genericOp, loweringConfig, mmaKind,
+                                     expectedElementTypes, mulOp.getRhs(),
+                                     /*operandIndex=*/1))) {
+    return failure();
+  }
+  return success();
+}
+
+static bool isPrePeelScaledContraction(linalg::GenericOp genericOp) {
+  constexpr unsigned lhsOperandIndex = 0;
+  constexpr unsigned rhsOperandIndex = 1;
+  constexpr unsigned rhsScaleOperandIndex = 2;
+  if (genericOp.getNumDpsInputs() != 3 || genericOp.getNumDpsInits() != 1) {
+    return false;
+  }
+
+  SmallVector<AffineMap> maps = genericOp.getIndexingMapsArray();
+  SmallVector<utils::IteratorType> iterators =
+      genericOp.getIteratorTypesArray();
+  llvm::SmallDenseSet<int64_t> lhsRed = getIndexingMapDimsWithIteratorType(
+      maps[lhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsOperandIndex], iterators, utils::IteratorType::reduction);
+  llvm::SmallDenseSet<int64_t> rhsScaleRed = getIndexingMapDimsWithIteratorType(
+      maps[rhsScaleOperandIndex], iterators, utils::IteratorType::reduction);
+
+  llvm::SmallDenseSet<int64_t> kBDims;
+  for (int64_t dim : lhsRed) {
+    if (rhsRed.contains(dim) && !rhsScaleRed.contains(dim)) {
+      kBDims.insert(dim);
+    }
+  }
+  if (kBDims.empty()) {
+    return false;
+  }
+
+  SmallVector<AffineMap> scaledMaps{
+      maps[lhsOperandIndex], maps[rhsOperandIndex],
+      dropIteratorDims(maps[lhsOperandIndex], kBDims),
+      maps[rhsScaleOperandIndex], maps.back()};
+  return succeeded(inferScaledContractionDims(scaledMaps));
 }
 
 /// Returns a vector of GenericOps with only one output.
@@ -965,6 +1857,14 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     if (failed(usedOperationsAndBlockArguments)) {
       return failure();
     }
+    SmallVector<int64_t> sortedInputIndices(
+        usedOperationsAndBlockArguments->usedInputIndices.begin(),
+        usedOperationsAndBlockArguments->usedInputIndices.end());
+    llvm::sort(sortedInputIndices);
+    usedOperationsAndBlockArguments->usedInputIndices.clear();
+    usedOperationsAndBlockArguments->usedInputIndices.insert(
+        sortedInputIndices.begin(), sortedInputIndices.end());
+
     // Create a new linalg.generic operation for this result.
     SmallVector<Value> inputs = llvm::map_to_vector(
         usedOperationsAndBlockArguments->usedInputIndices,
@@ -1006,11 +1906,32 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
           linalg::YieldOp::create(b, loc, regionMapping.lookup(result));
         });
 
+    if (loweringConfig) {
+      while (true) {
+        FailureOr<linalg::GenericOp> elementwiseExtractedOp =
+            extractElementwiseInput(rewriter, newOp);
+        if (failed(elementwiseExtractedOp)) {
+          break;
+        }
+        newOp = *elementwiseExtractedOp;
+      }
+    }
+
     // HACK: Set layout on operation that has contraction indexing. Some
     // contraction bodies contain elementwise casts/scales that are extracted
     // later, so do not require the full contraction op interface match here.
     if (loweringConfig) {
-      if (succeeded(linalg::inferContractionDims(newOp))) {
+      bool isContraction =
+          succeeded(linalg::inferContractionDims(newOp)) ||
+          succeeded(inferScaledContractionDims(newOp)) ||
+          succeeded(inferScaledContractionDims(newOp.getIndexingMapsArray()));
+      if (isContraction) {
+        if (auto mmaKind = getMmaKind(loweringConfig)) {
+          if (failed(
+                  verifyInnerTiledMatmulFma(newOp, loweringConfig, mmaKind))) {
+            return failure();
+          }
+        }
         setLoweringConfig(newOp, loweringConfig);
       }
     }
@@ -1021,6 +1942,7 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     results.push_back(newOp);
   }
 
+  rewriter.eraseOp(genericOp);
   return results;
 }
 

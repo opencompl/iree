@@ -663,6 +663,11 @@ def OptimizeTensorInsertExtractSlicesPass
     Option<"foldIdentitySlices", "fold-identity-slices", "bool", "false",
            "Enable folding of identity tensor.*_slice ops.">
   ];
+  let dependentDialects = [
+    "::mlir::arith::ArithDialect",
+    "iree_compiler::IREE::Util::UtilDialect",
+    "::mlir::ub::UBDialect"
+  ];
 }
 
 def HoistInnerTiledAccReshapesPass :
@@ -1117,6 +1122,11 @@ def TensorToVectorVectorizePadPass :
 def TestExecutablePreprocessingPass :
     Pass<"iree-codegen-test-executable-preprocessing", ""> {
   let summary = "Tests iree-hal-preprocess-executables-with behavior.";
+}
+
+def TestMaterializeSMTConstraintAssignmentsPass :
+    Pass<"iree-codegen-test-materialize-smt-constraint-assignments", ""> {
+  let summary = "Test materializing a constraints op knob assignment.";
 }
 
 def TestPartitionableLoopsInterfacePass :

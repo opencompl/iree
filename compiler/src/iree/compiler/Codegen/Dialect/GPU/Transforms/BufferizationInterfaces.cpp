@@ -209,10 +209,11 @@ struct BarrierRegionOpBufferizationInterface
     ArrayAttr addressSpaces = fencedGpuAddressSpaces(
         rewriter, llvm::concat<Value>(*newOperands, *newResults));
     rewriter.setInsertionPoint(barrierOp);
-    gpu::BarrierOp::create(rewriter, barrierOp.getLoc(), addressSpaces);
+    gpu::BarrierOp::create(rewriter, barrierOp.getLoc(), addressSpaces,
+                           /*named_barrier=*/Value{});
     rewriter.setInsertionPointAfter(barrierOp);
-    auto afterBarrier =
-        gpu::BarrierOp::create(rewriter, barrierOp.getLoc(), addressSpaces);
+    auto afterBarrier = gpu::BarrierOp::create(
+        rewriter, barrierOp.getLoc(), addressSpaces, /*named_barrier=*/Value{});
 
     rewriter.inlineBlockBefore(barrierOp.getBody(), afterBarrier,
                                tensorizedOperands);
@@ -285,7 +286,8 @@ struct ValueBarrierOpBufferizationInterface
     }
 
     ArrayAttr addressSpaces = fencedGpuAddressSpaces(rewriter, buffers);
-    gpu::BarrierOp::create(rewriter, barrierOp.getLoc(), addressSpaces);
+    gpu::BarrierOp::create(rewriter, barrierOp.getLoc(), addressSpaces,
+                           /*named_barrier=*/Value{});
 
     // This operation bufferizes in place
     bufferization::replaceOpWithBufferizedValues(rewriter, op, buffers);
@@ -461,6 +463,72 @@ struct CoalescedGatherDMAOpBufferizationInterface
   }
 };
 
+/// Bufferization of iree_gpu.async_dma. Bufferizes to itself with memref
+/// operands and no result.
+struct AsyncDMAOpBufferizationInterface
+    : BufferizableOpInterface::ExternalModel<AsyncDMAOpBufferizationInterface,
+                                             IREE::GPU::AsyncDMAOp> {
+  bool bufferizesToMemoryRead(Operation *op, OpOperand &opOperand,
+                              const AnalysisState &state) const {
+    auto dmaOp = cast<IREE::GPU::AsyncDMAOp>(op);
+    return opOperand.get() == dmaOp.getSource();
+  }
+
+  bool bufferizesToMemoryWrite(Operation *op, OpOperand &opOperand,
+                               const AnalysisState &state) const {
+    auto dmaOp = cast<IREE::GPU::AsyncDMAOp>(op);
+    return opOperand.get() == dmaOp.getDest();
+  }
+
+  bufferization::AliasingValueList
+  getAliasingValues(Operation *op, OpOperand &opOperand,
+                    const AnalysisState &state) const {
+    auto dmaOp = cast<IREE::GPU::AsyncDMAOp>(op);
+    if (opOperand.get() == dmaOp.getDest() && dmaOp.hasTensorSemantics()) {
+      return {{dmaOp.getResult(), BufferRelation::Equivalent}};
+    }
+    return {};
+  }
+
+  bool mustBufferizeInPlace(Operation *op, OpOperand &opOperand,
+                            const AnalysisState &state) const {
+    auto dmaOp = cast<IREE::GPU::AsyncDMAOp>(op);
+    return opOperand.get() == dmaOp.getDest();
+  }
+
+  bool isWritable(Operation *op, Value value,
+                  const AnalysisState &state) const {
+    return true;
+  }
+
+  LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
+                          const BufferizationOptions &options,
+                          bufferization::BufferizationState &state) const {
+    auto dmaOp = cast<IREE::GPU::AsyncDMAOp>(op);
+    if (!dmaOp.hasTensorSemantics()) {
+      return failure();
+    }
+
+    FailureOr<Value> sourceBuffer =
+        getBuffer(rewriter, dmaOp.getSource(), options, state);
+    FailureOr<Value> destBuffer =
+        getBuffer(rewriter, dmaOp.getDest(), options, state);
+
+    if (failed(sourceBuffer) || failed(destBuffer)) {
+      return failure();
+    }
+
+    IREE::GPU::AsyncDMAOp::create(
+        rewriter, dmaOp.getLoc(), TypeRange{}, *sourceBuffer,
+        dmaOp.getSourceIndices(), *destBuffer, dmaOp.getDestIndices(),
+        dmaOp.getTransferTypeAttr(), dmaOp.getPermutationMapAttr(),
+        dmaOp.getInBoundsAttr());
+
+    replaceOpWithBufferizedValues(rewriter, dmaOp, *destBuffer);
+    return success();
+  }
+};
+
 /// AMD Specific Ops
 
 static bool hasStorageBufferMemSpace(BaseMemRefType m) {
@@ -573,20 +641,22 @@ struct BufferResourceCastOpBufferizationInterface
 } // namespace
 
 void registerIREEGPUBufferizationInterfaces(DialectRegistry &registry) {
-  registry.addExtension(
-      +[](MLIRContext *context, IREE::GPU::IREEGPUDialect *dialect) {
-        IREE::GPU::BarrierRegionOp::attachInterface<
-            BarrierRegionOpBufferizationInterface>(*context);
-        IREE::GPU::ValueBarrierOp::attachInterface<
-            ValueBarrierOpBufferizationInterface>(*context);
-        IREE::GPU::YieldOp::attachInterface<YieldOpBufferizationInterface>(
-            *context);
-        IREE::GPU::CoalescedGatherDMAOp::attachInterface<
-            CoalescedGatherDMAOpBufferizationInterface>(*context);
+  registry.addExtension(+[](MLIRContext *context,
+                            IREE::GPU::IREEGPUDialect *dialect) {
+    IREE::GPU::BarrierRegionOp::attachInterface<
+        BarrierRegionOpBufferizationInterface>(*context);
+    IREE::GPU::ValueBarrierOp::attachInterface<
+        ValueBarrierOpBufferizationInterface>(*context);
+    IREE::GPU::YieldOp::attachInterface<YieldOpBufferizationInterface>(
+        *context);
+    IREE::GPU::CoalescedGatherDMAOp::attachInterface<
+        CoalescedGatherDMAOpBufferizationInterface>(*context);
+    IREE::GPU::AsyncDMAOp::attachInterface<AsyncDMAOpBufferizationInterface>(
+        *context);
 
-        IREE::GPU::BufferResourceCastOp::attachInterface<
-            BufferResourceCastOpBufferizationInterface>(*context);
-      });
+    IREE::GPU::BufferResourceCastOp::attachInterface<
+        BufferResourceCastOpBufferizationInterface>(*context);
+  });
 }
 
 } // namespace mlir::iree_compiler

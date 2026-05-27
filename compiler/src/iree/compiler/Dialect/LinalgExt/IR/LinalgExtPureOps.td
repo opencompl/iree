@@ -36,7 +36,8 @@ def IREELinalgExt_IndexOp : IREELinalgExt_PureOp<"index", [Pure]>,
     This operation is a mirror of `linalg.index` operation and has the same
     semantics, except that `linalg.index` enforces that the parent op is a
     `LinalgOp`, and the `iree_linalg_ext.index` operation enforces that the
-    parent op is one of `IREE::LinalgExt::CustomOp` or `IREE::LinalgExt::AttentionOp`.
+    parent op is one of `IREE::LinalgExt::CustomOp`,
+    `IREE::LinalgExt::AttentionOp`, or `IREE::LinalgExt::OnlineAttentionOp`.
   }];
 
   let assemblyFormat = [{ $dim attr-dict `:` type($result) }];
@@ -57,6 +58,33 @@ def IREELinalgExt_YieldOp : IREELinalgExt_PureOp<"yield", [Pure, ReturnLike, Ter
   ];
 
   let assemblyFormat = "attr-dict ($operands^ `:` type($operands))?";
+}
+
+def IREELinalgExt_ScalingTruncFOp :
+    IREELinalgExt_PureOp<"scaling_truncf", [Pure]> {
+  let summary = "Scaling truncate floating point with scale generation";
+  let description = [{
+    Truncates a floating point value to a smaller floating point type and
+    simultaneously generates the corresponding scale value. Unlike
+    `arith.scaling_truncf` which takes an explicit scale operand, this
+    operation computes the scale automatically based on the input value
+    and target type.
+
+    The first result is the truncated value in the target floating point
+    type, and the second result is the computed scale (typically f8E8M0FNU).
+
+    ```mlir
+    %trunc, %scale = iree_linalg_ext.scaling_truncf %input : f32 to f4E2M1FN, f8E8M0FNU
+    ```
+  }];
+
+  let arguments = (ins AnyFloat:$input);
+  let results = (outs AnyFloat:$result, AnyFloat:$scale);
+
+  let assemblyFormat =
+      "$input `:` type($input) `to` type($result) `,` type($scale) attr-dict";
+
+  let hasVerifier = 1;
 }
 
 } // OpGroupUtilityOps
