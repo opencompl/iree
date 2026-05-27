@@ -11,26 +11,20 @@
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
-<<<<<<< HEAD
+#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
-=======
-#include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
->>>>>>> 782235cbaf083c2362b98d9e32c30d67ac4d115a
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/TypeUtilities.h"
-<<<<<<< HEAD
+#include "mlir/Interfaces/IndexingMapOpInterface.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <optional>
-=======
-#include "mlir/Interfaces/IndexingMapOpInterface.h"
->>>>>>> 782235cbaf083c2362b98d9e32c30d67ac4d115a
 
 #include "iree/compiler/Codegen/Utils/Utils.h"
 
@@ -863,7 +857,7 @@ setContractionAnchor(IREE::Codegen::InnerTileDescAttrInterface intrinsic,
 }
 
 static LogicalResult
-setScaledContractionAnchor(SmallVector<bool> promotedOperands,
+setScaledContractionAnchor(SmallVector<Attribute> promotedOperands,
                            RewriterBase &rewriter, linalg::LinalgOp contract) {
   SmallVector<int64_t> bounds = getIterationSpaceBounds(contract);
   FailureOr<ScaledContractionLayout> maybeLayouts = getScaledContractionLayout(
@@ -885,7 +879,10 @@ setScaledContractionAnchor(SmallVector<bool> promotedOperands,
     unsigned operandNumber = operand.getOperandNumber();
     auto layoutedOperand = ToLayoutOp::create(rewriter, loc, operand.get(),
                                               layouts.operands[operandNumber]);
-    layoutedOperand.setSharedMemoryConversion(promotedOperands[operandNumber]);
+    if (promotedOperands[operandNumber]) {
+      layoutedOperand.setSharedMemoryConversionAttr(
+          promotedOperands[operandNumber]);
+    }
     operand.set(layoutedOperand);
   }
 
@@ -955,7 +952,7 @@ static LogicalResult setIntrinsicLoweringConfigLayout(
     FailureOr<linalg::LinalgOp> cleanCandidate =
         extractElementwiseInputsForIntrinsic(rewriter, candidate);
     if (succeeded(cleanCandidate)) {
-      promotedOperands = getPromotedOperands(*cleanCandidate);
+      promotedOperands = getPromotedOperandAttrs(*cleanCandidate);
       if (succeeded(setContractionAnchor(intrinsic, promotedOperands, rewriter,
                                          *cleanCandidate))) {
         return success();
