@@ -24,51 +24,48 @@ flow.executable private @executable_0 {
       %argQS: !stream.binding,
       %argKS: !stream.binding,
       %argVS: !stream.binding,
-      %argPS: !stream.binding,
       %ret: !stream.binding
     ) attributes {translation_info = #translation} {
       %cst0 = arith.constant 0.0 : f32
       %c0 = arith.constant 0 : index
 
       %dispQ = stream.binding.subspan %argQ[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4x32xf4E2M1FN>>
-      %dispK = stream.binding.subspan %argK[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x32x4x32xf4E2M1FN>>
-      %dispV = stream.binding.subspan %argV[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x32x4x32xf4E2M1FN>>
+      %dispK = stream.binding.subspan %argK[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4x32xf4E2M1FN>>
+      %dispV = stream.binding.subspan %argV[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4x32xf4E2M1FN>>
       %dispQS = stream.binding.subspan %argQS[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4xf8E8M0FNU>>
-      %dispKS = stream.binding.subspan %argKS[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x32x4xf8E8M0FNU>>
-      %dispVS = stream.binding.subspan %argVS[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x4x32xf8E8M0FNU>>
-      %dispPS = stream.binding.subspan %argPS[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x128xf8E8M0FNU>>
+      %dispKS = stream.binding.subspan %argKS[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4xf8E8M0FNU>>
+      %dispVS = stream.binding.subspan %argVS[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4xf8E8M0FNU>>
       %dispR = stream.binding.subspan %ret[%c0] : !stream.binding -> !iree_tensor_ext.dispatch.tensor<writeonly:tensor<4x32x4096x128xf32>>
 
       %Q = iree_tensor_ext.dispatch.tensor.load %dispQ, offsets = [0,0,0,0,0], sizes = [4,32,4096,4,32], strides = [1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4x32xf4E2M1FN>> -> tensor<4x32x4096x4x32xf4E2M1FN>
-      %K = iree_tensor_ext.dispatch.tensor.load %dispK, offsets = [0,0,0,0,0,0], sizes = [4,32,128,32,4,32], strides = [1,1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x32x4x32xf4E2M1FN>> -> tensor<4x32x128x32x4x32xf4E2M1FN>
-      %V = iree_tensor_ext.dispatch.tensor.load %dispV, offsets = [0,0,0,0,0,0], sizes = [4,32,128,32,4,32], strides = [1,1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x32x4x32xf4E2M1FN>> -> tensor<4x32x128x32x4x32xf4E2M1FN>
+      %K = iree_tensor_ext.dispatch.tensor.load %dispK, offsets = [0,0,0,0,0], sizes = [4,32,4096,4,32], strides = [1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4x32xf4E2M1FN>> -> tensor<4x32x4096x4x32xf4E2M1FN>
+      %V = iree_tensor_ext.dispatch.tensor.load %dispV, offsets = [0,0,0,0,0], sizes = [4,32,4096,4,32], strides = [1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4x32xf4E2M1FN>> -> tensor<4x32x4096x4x32xf4E2M1FN>
       %QS = iree_tensor_ext.dispatch.tensor.load %dispQS, offsets = [0,0,0,0], sizes = [4,32,4096,4], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4xf8E8M0FNU>> -> tensor<4x32x4096x4xf8E8M0FNU>
-      %KS = iree_tensor_ext.dispatch.tensor.load %dispKS, offsets = [0,0,0,0,0], sizes = [4,32,128,32,4], strides = [1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x32x4xf8E8M0FNU>> -> tensor<4x32x128x32x4xf8E8M0FNU>
-      %VS = iree_tensor_ext.dispatch.tensor.load %dispVS, offsets = [0,0,0,0,0], sizes = [4,32,128,4,32], strides = [1,1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x128x4x32xf8E8M0FNU>> -> tensor<4x32x128x4x32xf8E8M0FNU>
-      %PS = iree_tensor_ext.dispatch.tensor.load %dispPS, offsets = [0,0,0,0], sizes = [4,32,4096,128], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x128xf8E8M0FNU>> -> tensor<4x32x4096x128xf8E8M0FNU>
+      %KS = iree_tensor_ext.dispatch.tensor.load %dispKS, offsets = [0,0,0,0], sizes = [4,32,4096,4], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4xf8E8M0FNU>> -> tensor<4x32x4096x4xf8E8M0FNU>
+      %VS = iree_tensor_ext.dispatch.tensor.load %dispVS, offsets = [0,0,0,0], sizes = [4,32,4096,4], strides = [1,1,1,1] : !iree_tensor_ext.dispatch.tensor<readonly:tensor<4x32x4096x4xf8E8M0FNU>> -> tensor<4x32x4096x4xf8E8M0FNU>
 
-      %S_empty = tensor.empty() : tensor<4x32x4096x128x32xf32>
+      %S_empty = tensor.empty() : tensor<4x32x4096x4096xf32>
       %S_fill  = linalg.fill ins(%cst0 : f32)
-                              outs(%S_empty : tensor<4x32x4096x128x32xf32>)
-                              -> tensor<4x32x4096x128x32xf32>
+                              outs(%S_empty : tensor<4x32x4096x4096xf32>)
+                              -> tensor<4x32x4096x4096xf32>
 
       %S = linalg.generic  {
           indexing_maps = [
-            affine_map<(Z, H, N1, N2G, N2B, DG, DB) -> (Z, H, N1, DG, DB)>,
-            affine_map<(Z, H, N1, N2G, N2B, DG, DB) -> (Z, H, N2G, N2B, DG, DB)>,
-            affine_map<(Z, H, N1, N2G, N2B, DG, DB) -> (Z, H, N1, DG)>,
-            affine_map<(Z, H, N1, N2G, N2B, DG, DB) -> (Z, H, N2G, N2B, DG)>,
-            affine_map<(Z, H, N1, N2G, N2B, DG, DB) -> (Z, H, N1, N2G, N2B)>
+            affine_map<(Z, H, N1, N2, DG, DB) -> (Z, H, N1, DG, DB)>,
+            affine_map<(Z, H, N1, N2, DG, DB) -> (Z, H, N2, DG, DB)>,
+            affine_map<(Z, H, N1, N2, DG, DB) -> (Z, H, N1, DG)>,
+            affine_map<(Z, H, N1, N2, DG, DB) -> (Z, H, N2, DG)>,
+            affine_map<(Z, H, N1, N2, DG, DB) -> (Z, H, N1, N2)>
           ],
-          iterator_types = ["parallel", "parallel",  "parallel", "parallel", "parallel", "reduction", "reduction"],
+          iterator_types = ["parallel", "parallel",  "parallel", "parallel", "reduction", "reduction"],
           lowering_config = #iree_gpu.lowering_config<{
-            subgroup_basis = [[1, 1, 2, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6]],
+            subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 4, 5]],
             mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_16x16x128_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>,
-            promote_operands = [0, 2]
+            promote_operands = [0, 1, 2, 3]
           }>
         }
-        ins(%Q, %K, %QS, %KS : tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x128x32x4x32xf4E2M1FN>, tensor<4x32x4096x4xf8E8M0FNU>, tensor<4x32x128x32x4xf8E8M0FNU>)
-        outs(%S_fill : tensor<4x32x4096x128x32xf32>)
+        ins(%Q, %K, %QS, %KS : tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x4096x4xf8E8M0FNU>, tensor<4x32x4096x4xf8E8M0FNU>)
+        outs(%S_fill : tensor<4x32x4096x4096xf32>)
       {
       ^bb0(%q : f4E2M1FN, %k : f4E2M1FN, %q_scale : f8E8M0FNU, %k_scale : f8E8M0FNU, %s : f32):
         %q_ext = arith.scaling_extf %q, %q_scale : f4E2M1FN, f8E8M0FNU to f32
@@ -76,7 +73,7 @@ flow.executable private @executable_0 {
         %mul  = arith.mulf %q_ext, %k_ext : f32
         %sum  = arith.addf %mul, %s : f32
         linalg.yield %sum : f32
-      } -> tensor<4x32x4096x128x32xf32>
+      } -> tensor<4x32x4096x4096xf32>
 
       %red_empty = tensor.empty() : tensor<4x32x4096x4x32xf32>
       %max_empty = tensor.empty() : tensor<4x32x4096xf32>
@@ -97,13 +94,12 @@ flow.executable private @executable_0 {
 
       %MAX, %SUM, %PV = iree_linalg_ext.exp_reduction {
         indexing_maps = [
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, M, KG, KB)>,
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, KG, KB, DG, DB)>,
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, M, KG)>,
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, KG, DG, DB)>,
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, M)>,
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, M)>,
-          affine_map<(B, H, M, DG, DB, KG, KB) -> (B, H, M, DG, DB)>
+          affine_map<(B, H, M, DG, DB, K2) -> (B, H, M, K2)>,
+          affine_map<(B, H, M, DG, DB, K2) -> (B, H, K2, DG, DB)>,
+          affine_map<(B, H, M, DG, DB, K2) -> (B, H, K2, DG)>,
+          affine_map<(B, H, M, DG, DB, K2) -> (B, H, M)>,
+          affine_map<(B, H, M, DG, DB, K2) -> (B, H, M)>,
+          affine_map<(B, H, M, DG, DB, K2) -> (B, H, M, DG, DB)>
         ],
         iterator_types = [
           #iree_linalg_ext.iterator_type<parallel>,
@@ -111,26 +107,24 @@ flow.executable private @executable_0 {
           #iree_linalg_ext.iterator_type<parallel>,
           #iree_linalg_ext.iterator_type<parallel>,
           #iree_linalg_ext.iterator_type<parallel>,
-          #iree_linalg_ext.iterator_type<reduction>,
           #iree_linalg_ext.iterator_type<reduction>
         ],
         exp_reduced_operands = [1, 2]
       }
         attributes {lowering_config = #iree_gpu.lowering_config<{
-          workgroup = [1, 1, 64, 1, 0, 0, 0],
-          reduction = [0, 0, 0, 0, 0, 64, 32],
-          subgroup_basis = [[1, 1, 2, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6]],
-          mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_32x32x64_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>
+          workgroup = [1, 1, 64, 0, 0, 0],
+          reduction = [0, 0, 0, 0, 0, 64],
+          subgroup_basis = [[1, 1, 2, 1, 1, 1], [0, 1, 2, 3, 4, 5]],
+          mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x16_F16, col_major = true>
         }>}
-        ins(%S, %V, %PS, %VS : tensor<4x32x4096x128x32xf32>, tensor<4x32x128x32x4x32xf4E2M1FN>, tensor<4x32x4096x128xf8E8M0FNU>, tensor<4x32x128x4x32xf8E8M0FNU>)
+        ins(%S, %V, %VS : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x4096x4xf8E8M0FNU>)
         outs(%max_init, %sum_init, %acc_init : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x4x32xf32>)
       {
-      ^bb0(%ex : f32, %v : f4E2M1FN, %ex_scale : f8E8M0FNU, %v_scale : f8E8M0FNU, %m : f32, %sum : f32, %acc : f32):
-        %fp4max = arith.constant 6.0 : f32
-        %ex4m = arith.mulf %ex, %fp4max : f32
-        %ex_trunc = arith.scaling_truncf %ex4m, %ex_scale : f32, f8E8M0FNU to f4E2M1FN
-        %ex_ext = arith.scaling_extf %ex_trunc, %ex_scale : f4E2M1FN, f8E8M0FNU to f32
-        %v_ext = arith.scaling_extf %v, %v_scale : f4E2M1FN, f8E8M0FNU to f32
+      ^bb0(%ex : f32, %v : f4E2M1FN, %v_scale : f8E8M0FNU, %m : f32, %sum : f32, %acc : f32):
+        %ex_ext_f16 = arith.truncf %ex : f32 to f16
+        %ex_ext = arith.extf %ex_ext_f16 : f16 to f32
+        %v_ext_f16 = arith.scaling_extf %v, %v_scale : f4E2M1FN, f8E8M0FNU to f16
+        %v_ext = arith.extf %v_ext_f16 : f16 to f32
         %nsum = arith.addf %ex, %sum : f32
         %mul  = arith.mulf %ex_ext, %v_ext : f32
         %nacc = arith.addf %mul, %acc : f32
@@ -158,24 +152,22 @@ flow.executable private @executable_0 {
   }
 }
 
-func.func @attention(%arg0: !hal.buffer_view, %arg1: !hal.buffer_view, %arg2: !hal.buffer_view, %arg3: !hal.buffer_view, %arg4: !hal.buffer_view, %arg5: !hal.buffer_view, %arg6: !hal.buffer_view) -> !hal.buffer_view {
+func.func @attention(%arg0: !hal.buffer_view, %arg1: !hal.buffer_view, %arg2: !hal.buffer_view, %arg3: !hal.buffer_view, %arg4: !hal.buffer_view, %arg5: !hal.buffer_view) -> !hal.buffer_view {
   %c = arith.constant 1 : index
   %q_bytes = hal.tensor.import %arg0 "q" : !hal.buffer_view -> tensor<4x32x4096x64xi8>
   %k_bytes = hal.tensor.import %arg1 "k" : !hal.buffer_view -> tensor<4x32x4096x64xi8>
   %v_bytes = hal.tensor.import %arg2 "v" : !hal.buffer_view -> tensor<4x32x4096x64xi8>
   %q_scale_bytes = hal.tensor.import %arg3 "q_scale" : !hal.buffer_view -> tensor<4x32x4096x4xi8>
   %k_scale_bytes = hal.tensor.import %arg4 "k_scale" : !hal.buffer_view -> tensor<4x32x4096x4xi8>
-  %v_scale_bytes = hal.tensor.import %arg5 "v_scale" : !hal.buffer_view -> tensor<4x32x128x4x32xi8>
-  %p_scale_bytes = hal.tensor.import %arg6 "p_scale" : !hal.buffer_view -> tensor<4x32x4096x128xi8>
+  %v_scale_bytes = hal.tensor.import %arg5 "v_scale" : !hal.buffer_view -> tensor<4x32x4096x4xi8>
   %q = iree_tensor_ext.bitcast %q_bytes : tensor<4x32x4096x64xi8> -> tensor<4x32x4096x4x32xf4E2M1FN>
-  %k = iree_tensor_ext.bitcast %k_bytes : tensor<4x32x4096x64xi8> -> tensor<4x32x128x32x4x32xf4E2M1FN>
-  %v = iree_tensor_ext.bitcast %v_bytes : tensor<4x32x4096x64xi8> -> tensor<4x32x128x32x4x32xf4E2M1FN>
+  %k = iree_tensor_ext.bitcast %k_bytes : tensor<4x32x4096x64xi8> -> tensor<4x32x4096x4x32xf4E2M1FN>
+  %v = iree_tensor_ext.bitcast %v_bytes : tensor<4x32x4096x64xi8> -> tensor<4x32x4096x4x32xf4E2M1FN>
   %q_scale = iree_tensor_ext.bitcast %q_scale_bytes : tensor<4x32x4096x4xi8> -> tensor<4x32x4096x4xf8E8M0FNU>
-  %k_scale = iree_tensor_ext.bitcast %k_scale_bytes : tensor<4x32x4096x4xi8> -> tensor<4x32x128x32x4xf8E8M0FNU>
-  %v_scale = iree_tensor_ext.bitcast %v_scale_bytes : tensor<4x32x128x4x32xi8> -> tensor<4x32x128x4x32xf8E8M0FNU>
-  %p_scale = iree_tensor_ext.bitcast %p_scale_bytes : tensor<4x32x4096x128xi8> -> tensor<4x32x4096x128xf8E8M0FNU>
+  %k_scale = iree_tensor_ext.bitcast %k_scale_bytes : tensor<4x32x4096x4xi8> -> tensor<4x32x4096x4xf8E8M0FNU>
+  %v_scale = iree_tensor_ext.bitcast %v_scale_bytes : tensor<4x32x4096x4xi8> -> tensor<4x32x4096x4xf8E8M0FNU>
 
-  %ret0 = flow.dispatch @executable_0::@dispatch[%c](%q, %k, %v, %q_scale, %k_scale, %v_scale, %p_scale) : (tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x128x32x4x32xf4E2M1FN>, tensor<4x32x128x32x4x32xf4E2M1FN>, tensor<4x32x4096x4xf8E8M0FNU>, tensor<4x32x128x32x4xf8E8M0FNU>, tensor<4x32x128x4x32xf8E8M0FNU>, tensor<4x32x4096x128xf8E8M0FNU>) ->  tensor<4x32x4096x128xf32>
+  %ret0 = flow.dispatch @executable_0::@dispatch[%c](%q, %k, %v, %q_scale, %k_scale, %v_scale) : (tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x4096x4x32xf4E2M1FN>, tensor<4x32x4096x4xf8E8M0FNU>, tensor<4x32x4096x4xf8E8M0FNU>, tensor<4x32x4096x4xf8E8M0FNU>) ->  tensor<4x32x4096x128xf32>
 
   %ret = hal.tensor.export %ret0 "out" : tensor<4x32x4096x128xf32> -> !hal.buffer_view
   return %ret : !hal.buffer_view
