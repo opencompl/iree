@@ -2,7 +2,10 @@
 
 INPUT_FILE="$(realpath "$1")"
 BASE_NAME="${INPUT_FILE%.*}"
-ARCH=gfx942
+ARCH="${ARCH:-gfx942}"
+if [[ -n "${2:-}" ]]; then
+    ARCH="$2"
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="$(realpath $SCRIPT_DIR/..)"
