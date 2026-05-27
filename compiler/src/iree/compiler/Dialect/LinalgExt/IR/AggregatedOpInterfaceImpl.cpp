@@ -1290,7 +1290,11 @@ getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
                                          unsigned argNumber,
                                          unsigned numDpsInputs) {
   if (isa<arith::ScalingTruncFOp>(op)) {
-    return std::nullopt;
+    auto valueArg = dyn_cast<BlockArgument>(op->getOperand(0));
+    if (!valueArg || valueArg.getOwner() != &body ||
+        valueArg.getArgNumber() != argNumber) {
+      return std::nullopt;
+    }
   }
   // Keep one extf-like op in the contraction body so it still matches the
   // expected input type for the chosen matmul-like lowering. Peel only when a
@@ -1853,6 +1857,14 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     if (failed(usedOperationsAndBlockArguments)) {
       return failure();
     }
+    SmallVector<int64_t> sortedInputIndices(
+        usedOperationsAndBlockArguments->usedInputIndices.begin(),
+        usedOperationsAndBlockArguments->usedInputIndices.end());
+    llvm::sort(sortedInputIndices);
+    usedOperationsAndBlockArguments->usedInputIndices.clear();
+    usedOperationsAndBlockArguments->usedInputIndices.insert(
+        sortedInputIndices.begin(), sortedInputIndices.end());
+
     // Create a new linalg.generic operation for this result.
     SmallVector<Value> inputs = llvm::map_to_vector(
         usedOperationsAndBlockArguments->usedInputIndices,

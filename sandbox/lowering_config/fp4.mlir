@@ -118,7 +118,7 @@ flow.executable private @executable_0 {
       }
         attributes {lowering_config = #iree_gpu.lowering_config<{
           workgroup = [1, 1, 64, 1, 0, 0, 0],
-          reduction = [0, 0, 0, 0, 0, 64, 32],
+          reduction = [0, 0, 0, 0, 0, 32, 32],
           subgroup_basis = [[1, 1, 2, 1, 1, 1, 1], [0, 1, 2, 3, 4, 5, 6]],
           mma_kind = #iree_gpu.scaled_mma_layout<intrinsic = MFMA_SCALE_F32_32x32x64_B32, lhs_elem_type = f4E2M1FN, rhs_elem_type = f4E2M1FN, acc_elem_type = f32>
         }>}
