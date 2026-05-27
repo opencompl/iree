@@ -5,14 +5,15 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/FormattingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/Im2colUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetOperations.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
 #include "mlir/Analysis/SliceAnalysis.h"
@@ -1270,8 +1271,7 @@ static bool hasMultipleExtfLikesInSingleUseChain(Operation *op, Block &body) {
 
   unsigned extfLikeCount = 0;
   Operation *currentOp = op;
-  while (currentOp && currentOp->getBlock() == &body &&
-         isExtfLike(currentOp)) {
+  while (currentOp && currentOp->getBlock() == &body && isExtfLike(currentOp)) {
     if (++extfLikeCount > 1) {
       return true;
     }
@@ -1508,7 +1508,8 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
 
   SmallVector<Value> newInits(genericOp.getDpsInits());
   for (unsigned i = numDpsInputs;
-       i < static_cast<unsigned>(genericOp.getIndexingMapsArray().size()); ++i) {
+       i < static_cast<unsigned>(genericOp.getIndexingMapsArray().size());
+       ++i) {
     newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
   }
 
@@ -1547,9 +1548,8 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   rewriter.setInsertionPointToStart(newBody);
   for (Operation &op : body.without_terminator()) {
     if (&op == extraction->elementwiseOp) {
-      mapping.map(op.getResult(0),
-                  mapping.lookup(
-                      op.getOperand(extraction->blockArgOperandIndex)));
+      mapping.map(op.getResult(0), mapping.lookup(op.getOperand(
+                                       extraction->blockArgOperandIndex)));
       continue;
     }
     rewriter.clone(op, mapping);
@@ -1558,6 +1558,237 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
 
   rewriter.replaceOp(genericOp, newGenericOp.getResults());
   return newGenericOp;
+}
+
+static IREE::Codegen::InnerTileDescAttrInterface
+getMmaKind(Attribute loweringConfig) {
+  if (!loweringConfig) {
+    return nullptr;
+  }
+  IREE::Codegen::InnerTileDescAttrInterface mmaKind;
+  loweringConfig.walkImmediateSubElements(
+      [&](Attribute attr) {
+        if (mmaKind) {
+          return;
+        }
+        auto dictAttr = dyn_cast<DictionaryAttr>(attr);
+        if (!dictAttr) {
+          return;
+        }
+        mmaKind = dictAttr.getAs<IREE::Codegen::InnerTileDescAttrInterface>(
+            "mma_kind");
+      },
+      [](Type) {});
+  return mmaKind;
+}
+
+static LogicalResult emitInnerTiledMatmulVerifierError(
+    linalg::GenericOp genericOp, Attribute loweringConfig,
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind, const Twine &message) {
+  InFlightDiagnostic diag =
+      genericOp.emitOpError()
+      << "expected decomposed matmul generic to be an inner-tiled FP32 FMA: "
+      << message;
+  diag.attachNote(genericOp.getLoc())
+      << "indexing_maps = "
+      << formatAffineMaps(genericOp.getIndexingMapsArray())
+      << ", iterator_types = "
+      << formatIteratorTypes(genericOp.getIteratorTypesArray());
+  diag.attachNote(genericOp.getLoc())
+      << "lowering_config = " << loweringConfig << ", mma_kind = " << mmaKind;
+  if (mmaKind) {
+    SmallVector<VectorType> undistributedTileTypes;
+    SmallVector<VectorType> distributedTileTypes;
+    mmaKind.getUndistributedTileTypes(undistributedTileTypes);
+    mmaKind.getDistributedTileTypes(distributedTileTypes);
+    diag.attachNote(genericOp.getLoc())
+        << "inner_tile metadata: expected inputs = "
+        << mmaKind.getExpectedNumInputs()
+        << ", expected outputs = " << mmaKind.getExpectedNumOutputs()
+        << ", undistributed tile types = "
+        << formatVectorTypes(undistributedTileTypes)
+        << ", distributed tile types = "
+        << formatVectorTypes(distributedTileTypes);
+  }
+  return failure();
+}
+
+static FailureOr<SmallVector<Type>> getExpectedInnerTileElementTypes(
+    linalg::GenericOp genericOp, Attribute loweringConfig,
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  SmallVector<VectorType> tileTypes;
+  mmaKind.getUndistributedTileTypes(tileTypes);
+  unsigned expectedOperands =
+      mmaKind.getExpectedNumInputs() + mmaKind.getExpectedNumOutputs();
+  if (tileTypes.size() != expectedOperands) {
+    (void)emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("mma_kind produced ") + Twine(tileTypes.size()) +
+            " undistributed tile types, but expected " +
+            Twine(expectedOperands));
+    return failure();
+  }
+  if (genericOp.getNumDpsInputs() != mmaKind.getExpectedNumInputs() ||
+      genericOp.getNumDpsInits() != mmaKind.getExpectedNumOutputs()) {
+    (void)emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("generic has ") + Twine(genericOp.getNumDpsInputs()) +
+            " inputs and " + Twine(genericOp.getNumDpsInits()) +
+            " outputs, but mma_kind expects " +
+            Twine(mmaKind.getExpectedNumInputs()) + " inputs and " +
+            Twine(mmaKind.getExpectedNumOutputs()) + " outputs");
+    return failure();
+  }
+  if (failed(mmaKind.verifyIndexingMaps(genericOp.getIndexingMapsArray()))) {
+    (void)emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "indexing maps do not satisfy the mma_kind requirements");
+    return failure();
+  }
+
+  return llvm::map_to_vector(
+      tileTypes, [](VectorType type) -> Type { return type.getElementType(); });
+}
+
+static LogicalResult
+verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
+                        IREE::Codegen::InnerTileDescAttrInterface mmaKind,
+                        ArrayRef<Type> expectedElementTypes, Value value,
+                        unsigned operandIndex) {
+  Type f32Type = Float32Type::get(genericOp.getContext());
+  if (value.getType() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("mulf operand ") + Twine(operandIndex) + " has type " +
+            Twine(formatType(value.getType())) + ", expected f32");
+  }
+
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp) {
+    Type expectedType = expectedElementTypes[operandIndex];
+    Type actualType = value.getType();
+    if (actualType != expectedType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("mulf operand ") + Twine(operandIndex) +
+              " is not produced by an extf-like op and has source type " +
+              Twine(formatType(actualType)) + ", but mma_kind expects " +
+              Twine(formatType(expectedType)));
+    }
+    return success();
+  }
+
+  if (auto extfOp = dyn_cast<arith::ExtFOp>(definingOp)) {
+    Type expectedType = expectedElementTypes[operandIndex];
+    Type actualType = getElementTypeOrSelf(extfOp.getIn().getType());
+    if (actualType != expectedType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("extf feeding mulf operand ") + Twine(operandIndex) +
+              " converts from " + Twine(formatType(actualType)) +
+              ", but mma_kind expects " + Twine(formatType(expectedType)));
+    }
+    return success();
+  }
+
+  if (auto scalingExtfOp = dyn_cast<arith::ScalingExtFOp>(definingOp)) {
+    if (expectedElementTypes.size() < 5) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("scaling_extf feeds mulf operand ") + Twine(operandIndex) +
+              ", but mma_kind does not describe scale operands");
+    }
+    Type expectedInputType = expectedElementTypes[operandIndex];
+    Type actualInputType =
+        getElementTypeOrSelf(scalingExtfOp->getOperand(0).getType());
+    if (actualInputType != expectedInputType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("scaling_extf feeding mulf operand ") + Twine(operandIndex) +
+              " converts from " + Twine(formatType(actualInputType)) +
+              ", but mma_kind expects " + Twine(formatType(expectedInputType)));
+    }
+    Type expectedScaleType = expectedElementTypes[operandIndex + 2];
+    Type actualScaleType =
+        getElementTypeOrSelf(scalingExtfOp->getOperand(1).getType());
+    if (actualScaleType != expectedScaleType) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine("scaling_extf feeding mulf operand ") + Twine(operandIndex) +
+              " uses scale type " + Twine(formatType(actualScaleType)) +
+              ", but mma_kind expects " + Twine(formatType(expectedScaleType)));
+    }
+    return success();
+  }
+
+  return emitInnerTiledMatmulVerifierError(
+      genericOp, loweringConfig, mmaKind,
+      Twine("mulf operand ") + Twine(operandIndex) +
+          " is produced by unsupported op " +
+          definingOp->getName().getStringRef());
+}
+
+static LogicalResult
+verifyInnerTiledMatmulFma(linalg::GenericOp genericOp, Attribute loweringConfig,
+                          IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  FailureOr<SmallVector<Type>> maybeExpectedElementTypes =
+      getExpectedInnerTileElementTypes(genericOp, loweringConfig, mmaKind);
+  if (failed(maybeExpectedElementTypes)) {
+    return failure();
+  }
+  ArrayRef<Type> expectedElementTypes = *maybeExpectedElementTypes;
+  Type f32Type = Float32Type::get(genericOp.getContext());
+  if (expectedElementTypes.back() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        Twine("mma_kind accumulator element type is ") +
+            Twine(formatType(expectedElementTypes.back())) + ", expected f32");
+  }
+
+  Block &body = genericOp.getRegion().front();
+  auto yieldOp = dyn_cast<linalg::YieldOp>(body.getTerminator());
+  if (!yieldOp || yieldOp.getNumOperands() != 1) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "body must yield exactly one accumulator value");
+  }
+
+  auto addOp = yieldOp.getOperand(0).getDefiningOp<arith::AddFOp>();
+  if (!addOp || addOp.getType() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "yielded value must be an arith.addf producing f32");
+  }
+
+  Value accArg = body.getArgument(genericOp.getNumDpsInputs());
+  Value lhs = addOp.getLhs();
+  Value rhs = addOp.getRhs();
+  auto mulOp = lhs.getDefiningOp<arith::MulFOp>();
+  if (rhs == accArg && mulOp) {
+    // Matched addf(mulf(...), acc).
+  } else if (lhs == accArg) {
+    mulOp = rhs.getDefiningOp<arith::MulFOp>();
+  } else {
+    mulOp = nullptr;
+  }
+  if (!mulOp || mulOp.getType() != f32Type) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "addf must accumulate an arith.mulf producing f32 with the output "
+        "block argument");
+  }
+
+  if (failed(verifyMatmulOperandCast(genericOp, loweringConfig, mmaKind,
+                                     expectedElementTypes, mulOp.getLhs(),
+                                     /*operandIndex=*/0))) {
+    return failure();
+  }
+  if (failed(verifyMatmulOperandCast(genericOp, loweringConfig, mmaKind,
+                                     expectedElementTypes, mulOp.getRhs(),
+                                     /*operandIndex=*/1))) {
+    return failure();
+  }
+  return success();
 }
 
 static bool isPrePeelScaledContraction(linalg::GenericOp genericOp) {
@@ -1678,11 +1909,17 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     // contraction bodies contain elementwise casts/scales that are extracted
     // later, so do not require the full contraction op interface match here.
     if (loweringConfig) {
-      bool isContraction = succeeded(linalg::inferContractionDims(newOp)) ||
-                           succeeded(inferScaledContractionDims(newOp)) ||
-                           succeeded(inferScaledContractionDims(
-                               newOp.getIndexingMapsArray()));
+      bool isContraction =
+          succeeded(linalg::inferContractionDims(newOp)) ||
+          succeeded(inferScaledContractionDims(newOp)) ||
+          succeeded(inferScaledContractionDims(newOp.getIndexingMapsArray()));
       if (isContraction) {
+        if (auto mmaKind = getMmaKind(loweringConfig)) {
+          if (failed(
+                  verifyInnerTiledMatmulFma(newOp, loweringConfig, mmaKind))) {
+            return failure();
+          }
+        }
         setLoweringConfig(newOp, loweringConfig);
       }
     }

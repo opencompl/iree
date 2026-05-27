@@ -14,6 +14,7 @@ iree_cc_library(
   NAME
     IR
   HDRS
+    "FormattingUtils.h"
     "Im2colUtils.h"
     "LinalgExtAttrs.h.inc"
     "LinalgExtDialect.h"
@@ -70,6 +71,7 @@ iree_cc_library(
     MLIRUBDialect
     MLIRValueBoundsOpInterface
     MLIRViewLikeInterface
+    iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Dialect::LinalgExt::Utils
   PUBLIC
 )
