@@ -3334,23 +3334,35 @@ CustomOp::reifyResultShapes(OpBuilder &builder,
 
 LogicalResult IREE::LinalgExt::IndexOp::verify() {
   auto parentOp = getOperation()->getParentOp();
-  if (!isa<CustomOp, AttentionOp, OnlineAttentionOp>(parentOp)) {
+  std::optional<int64_t> numLoops =
+      llvm::TypeSwitch<Operation *, std::optional<int64_t>>(parentOp)
+          .Case<CustomOp>([](CustomOp op) -> std::optional<int64_t> {
+            return op.getNumLoops();
+          })
+          .Case<AttentionOp>([](AttentionOp op) -> std::optional<int64_t> {
+            return op.getIterationDomainRank();
+          })
+          .Case<OnlineAttentionOp>(
+              [](OnlineAttentionOp op) -> std::optional<int64_t> {
+                return op.getIterationDomainRank();
+              })
+          .Case<ExpReductionOp>(
+              [](ExpReductionOp op) -> std::optional<int64_t> {
+                return op.getIteratorTypes().size();
+              })
+          .Default([](Operation *) -> std::optional<int64_t> {
+            return std::nullopt;
+          });
+  if (!numLoops) {
     return emitOpError(
         "expected parent op to be one of `iree_linalg_ext.custom_op`, "
-        "`iree_linalg_ext.attention`, `iree_linalg_ext.online_attention`");
+        "`iree_linalg_ext.attention`, `iree_linalg_ext.online_attention`, "
+        "`iree_linalg_ext.exp_reduction`");
   }
-  int64_t numLoops;
-  if (auto customOp = dyn_cast<CustomOp>(parentOp)) {
-    numLoops = customOp.getNumLoops();
-  } else if (auto attentionOp = dyn_cast<AttentionOp>(parentOp)) {
-    numLoops = attentionOp.getIterationDomainRank();
-  } else {
-    numLoops = cast<OnlineAttentionOp>(parentOp).getIterationDomainRank();
-  }
-  if (numLoops <= getDim()) {
+  if (*numLoops <= getDim()) {
     return emitOpError("expected dim (")
-           << getDim() << ") to be lower than the number of loops (" << numLoops
-           << ") of the enclosing operation";
+           << getDim() << ") to be lower than the number of loops ("
+           << *numLoops << ") of the enclosing operation";
   }
   return success();
 }

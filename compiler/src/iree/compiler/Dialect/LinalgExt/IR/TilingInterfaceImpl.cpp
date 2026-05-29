@@ -2444,6 +2444,28 @@ LogicalResult ArgCompareOp::getPartialResultTilePosition(
 // ExpReductionOp
 //===----------------------------------------------------------------------===//
 
+static void offsetExpReductionIndices(OpBuilder &b, ExpReductionOp op,
+                                      ArrayRef<OpFoldResult> offsets) {
+  IRRewriter rewriter(b);
+  for (auto indexOp : op.getBody()->getOps<IREE::LinalgExt::IndexOp>()) {
+    if (indexOp.getDim() >= offsets.size() || !offsets[indexOp.getDim()]) {
+      continue;
+    }
+    OpBuilder::InsertionGuard guard(b);
+    rewriter.setInsertionPointAfter(indexOp);
+    AffineExpr index, offset;
+    bindDims(b.getContext(), index, offset);
+    OpFoldResult applied = affine::makeComposedFoldedAffineApply(
+        rewriter, indexOp.getLoc(), index + offset,
+        {getAsOpFoldResult(indexOp.getResult()), offsets[indexOp.getDim()]});
+    Value materialized =
+        getValueOrCreateConstantIndexOp(b, indexOp.getLoc(), applied);
+    rewriter.replaceUsesWithIf(indexOp, materialized, [&](OpOperand &use) {
+      return use.getOwner() != materialized.getDefiningOp();
+    });
+  }
+}
+
 SmallVector<utils::IteratorType> ExpReductionOp::getLoopIteratorTypes() {
   return llvm::to_vector(getIteratorTypes()
                              .getAsValueRange<IREE::LinalgExt::IteratorTypeAttr,
@@ -2491,6 +2513,7 @@ ExpReductionOp::getTiledImplementation(OpBuilder &b,
   }
 
   Operation *tiledOp = mlir::clone(b, *this, resultTensorTypes, tiledOperands);
+  offsetExpReductionIndices(b, cast<ExpReductionOp>(tiledOp), offsets);
   return TilingResult{
       {tiledOp}, SmallVector<Value>(tiledOp->getResults()), generatedSlices};
 }

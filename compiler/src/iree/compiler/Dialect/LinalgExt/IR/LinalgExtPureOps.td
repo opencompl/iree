@@ -37,7 +37,8 @@ def IREELinalgExt_IndexOp : IREELinalgExt_PureOp<"index", [Pure]>,
     semantics, except that `linalg.index` enforces that the parent op is a
     `LinalgOp`, and the `iree_linalg_ext.index` operation enforces that the
     parent op is one of `IREE::LinalgExt::CustomOp`,
-    `IREE::LinalgExt::AttentionOp`, or `IREE::LinalgExt::OnlineAttentionOp`.
+    `IREE::LinalgExt::AttentionOp`, `IREE::LinalgExt::OnlineAttentionOp`,
+    or `IREE::LinalgExt::ExpReductionOp`.
   }];
 
   let assemblyFormat = [{ $dim attr-dict `:` type($result) }];

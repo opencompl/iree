@@ -1302,42 +1302,76 @@ getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
   if (isExtfLike(op) && !hasMultipleExtfLikesInSingleUseChain(op, body)) {
     return std::nullopt;
   }
-  if (op->getNumResults() != 1 || op->getNumOperands() > 2 ||
-      op->getNumRegions() != 0) {
+  if (op->getNumResults() != 1 || op->getNumRegions() != 0) {
+    return std::nullopt;
+  }
+
+  BackwardSliceOptions options;
+  options.inclusive = true;
+  options.filter = [&body](Operation *sliceOp) -> bool {
+    return sliceOp->getBlock() == &body;
+  };
+  SetVector<Operation *> usedOperations;
+  if (failed(getBackwardSlice(op->getResult(0), &usedOperations, options))) {
     return std::nullopt;
   }
 
   std::optional<unsigned> blockArgOperandIndex;
   SmallVector<unsigned> extraInputOperandIndices;
-  for (auto [operandIndex, operand] : llvm::enumerate(op->getOperands())) {
-    auto blockArg = dyn_cast<BlockArgument>(operand);
-    if (blockArg && blockArg.getOwner() == &body &&
-        blockArg.getArgNumber() == argNumber) {
-      if (blockArgOperandIndex) {
-        return std::nullopt;
-      }
-      blockArgOperandIndex = operandIndex;
-      continue;
-    }
-
-    if (op->getNumOperands() != 2) {
+  for (Operation *usedOperation : usedOperations) {
+    if (usedOperation->getNumRegions() != 0 ||
+        (!usedOperation->hasTrait<OpTrait::OneResult>() &&
+         !isa<linalg::IndexOp>(usedOperation))) {
       return std::nullopt;
     }
-    if (operand.getDefiningOp<arith::ConstantOp>()) {
-      continue;
+
+    for (auto [operandIndex, operand] :
+         llvm::enumerate(usedOperation->getOperands())) {
+      auto blockArg = dyn_cast<BlockArgument>(operand);
+      if (!blockArg || blockArg.getOwner() != &body) {
+        if (blockArg && blockArg.getOwner() != &body) {
+          continue;
+        }
+        Operation *definingOp = operand.getDefiningOp();
+        if (definingOp && definingOp->getBlock() == &body &&
+            usedOperations.contains(definingOp)) {
+          continue;
+        }
+        if (!definingOp) {
+          continue;
+        }
+        if (operand.getDefiningOp<arith::ConstantOp>()) {
+          continue;
+        }
+        return std::nullopt;
+      }
+
+      if (blockArg.getArgNumber() == argNumber) {
+        if (usedOperation == op) {
+          if (blockArgOperandIndex) {
+            return std::nullopt;
+          }
+          blockArgOperandIndex = operandIndex;
+        }
+        continue;
+      }
+
+      if (blockArg.getArgNumber() < numDpsInputs) {
+        extraInputOperandIndices.push_back(blockArg.getArgNumber());
+        continue;
+      }
+      return std::nullopt;
     }
-    if (blockArg && blockArg.getOwner() == &body &&
-        blockArg.getArgNumber() < numDpsInputs) {
-      extraInputOperandIndices.push_back(blockArg.getArgNumber());
-      continue;
-    }
-    return std::nullopt;
   }
 
   if (!blockArgOperandIndex) {
     return std::nullopt;
   }
 
+  llvm::sort(extraInputOperandIndices);
+  extraInputOperandIndices.erase(std::unique(extraInputOperandIndices.begin(),
+                                             extraInputOperandIndices.end()),
+                                 extraInputOperandIndices.end());
   return ExtractableElementwiseOperands{*blockArgOperandIndex,
                                         extraInputOperandIndices};
 }
@@ -1400,12 +1434,11 @@ matchElementwiseInputExtraction(linalg::GenericOp genericOp) {
   return std::nullopt;
 }
 
-static Value createElementwiseInputGeneric(RewriterBase &rewriter, Location loc,
-                                           ValueRange inputs,
-                                           ArrayRef<AffineMap> indexingMaps,
-                                           Type resultElementType,
-                                           Operation *elementwiseOp,
-                                           ValueRange mappedOperands) {
+static FailureOr<Value> createElementwiseInputGeneric(
+    RewriterBase &rewriter, Location loc, ValueRange inputs,
+    ArrayRef<AffineMap> indexingMaps, AffineMap inputMap,
+    Type resultElementType, Operation *elementwiseOp,
+    ValueRange mappedOperands) {
   Value input = inputs.front();
   auto inputType = cast<RankedTensorType>(input.getType());
   auto resultType = RankedTensorType::get(
@@ -1419,6 +1452,36 @@ static Value createElementwiseInputGeneric(RewriterBase &rewriter, Location loc,
                                     resultElementType);
   SmallVector<utils::IteratorType> iteratorTypes(inputType.getRank(),
                                                  utils::IteratorType::parallel);
+
+  SmallVector<int64_t> loopDimToInputDim(inputMap.getNumDims(), -1);
+  for (auto [inputDim, expr] : llvm::enumerate(inputMap.getResults())) {
+    auto dimExpr = dyn_cast<AffineDimExpr>(expr);
+    if (!dimExpr) {
+      return failure();
+    }
+    loopDimToInputDim[dimExpr.getPosition()] = inputDim;
+  }
+
+  BackwardSliceOptions options;
+  options.inclusive = true;
+  options.filter = [elementwiseOp](Operation *op) -> bool {
+    return op->getBlock() == elementwiseOp->getBlock();
+  };
+  SetVector<Operation *> usedOperations;
+  if (failed(getBackwardSlice(elementwiseOp->getResult(0), &usedOperations,
+                              options))) {
+    return failure();
+  }
+  for (Operation *usedOperation : usedOperations) {
+    if (auto indexOp = dyn_cast<linalg::IndexOp>(usedOperation)) {
+      int64_t oldDim = indexOp.getDim();
+      if (oldDim >= static_cast<int64_t>(loopDimToInputDim.size()) ||
+          loopDimToInputDim[oldDim] < 0) {
+        return failure();
+      }
+    }
+  }
+
   return linalg::GenericOp::create(
              rewriter, loc, TypeRange{resultType}, inputs, ValueRange{empty},
              indexingMaps, iteratorTypes,
@@ -1429,20 +1492,28 @@ static Value createElementwiseInputGeneric(RewriterBase &rewriter, Location loc,
                                     args.take_front(mappedOperands.size()))) {
                  mapping.map(oldOperand, newArg);
                }
-               for (Value operand : elementwiseOp->getOperands()) {
-                 if (mapping.lookupOrNull(operand)) {
+               for (Operation *usedOperation : usedOperations) {
+                 if (auto indexOp = dyn_cast<linalg::IndexOp>(usedOperation)) {
+                   int64_t oldDim = indexOp.getDim();
+                   if (oldDim >=
+                           static_cast<int64_t>(loopDimToInputDim.size()) ||
+                       loopDimToInputDim[oldDim] < 0) {
+                     return;
+                   }
+                   Value newIndex = linalg::IndexOp::create(
+                       builder, nestedLoc, loopDimToInputDim[oldDim]);
+                   mapping.map(indexOp.getResult(), newIndex);
                    continue;
                  }
-                 auto constantOp = operand.getDefiningOp<arith::ConstantOp>();
-                 if (constantOp &&
-                     constantOp->getBlock() == elementwiseOp->getBlock()) {
-                   Operation *clonedConstant = builder.clone(*constantOp);
-                   mapping.map(operand, clonedConstant->getResult(0));
+                 Operation *cloned = builder.clone(*usedOperation, mapping);
+                 if (usedOperation->getNumResults() == 1) {
+                   mapping.map(usedOperation->getResult(0),
+                               cloned->getResult(0));
                  }
                }
-               Operation *cloned = builder.clone(*elementwiseOp, mapping);
-               linalg::YieldOp::create(builder, nestedLoc,
-                                       cloned->getResult(0));
+               linalg::YieldOp::create(
+                   builder, nestedLoc,
+                   mapping.lookup(elementwiseOp->getResult(0)));
              })
       .getResult(0);
 }
@@ -1481,10 +1552,13 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   }
   extractedMaps.push_back(identityMap);
 
-  Value extractedInput = createElementwiseInputGeneric(
-      rewriter, genericOp.getLoc(), extractedInputs, extractedMaps,
+  FailureOr<Value> extractedInput = createElementwiseInputGeneric(
+      rewriter, genericOp.getLoc(), extractedInputs, extractedMaps, inputMap,
       extraction->elementwiseOp->getResult(0).getType(),
       extraction->elementwiseOp, mappedOperands);
+  if (failed(extractedInput)) {
+    return failure();
+  }
 
   llvm::SmallDenseSet<unsigned> droppedInputIndices;
   for (unsigned extraOperandIndex : extraction->extraInputOperandIndices) {
@@ -1505,7 +1579,7 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
     }
     oldInputToNewArg[i] = newInputs.size();
     newInputs.push_back(i == extraction->operandIndex
-                            ? extractedInput
+                            ? *extractedInput
                             : genericOp.getDpsInputOperand(i)->get());
     newMaps.push_back(genericOp.getIndexingMapsArray()[i]);
   }
@@ -1878,7 +1952,22 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     indexingMaps.push_back(genericOp.getIndexingMapMatchingResult(
         genericOp->getOpResult(resultNumber)));
     llvm::SmallBitVector unusedDims = getUnusedDimsBitVector(indexingMaps);
-    indexingMaps = compressUnusedDims(indexingMaps);
+    for (Operation *usedOperation :
+         usedOperationsAndBlockArguments->usedOperations) {
+      if (auto indexOp = dyn_cast<linalg::IndexOp>(usedOperation)) {
+        unusedDims.reset(indexOp.getDim());
+      }
+    }
+    indexingMaps = llvm::map_to_vector(indexingMaps, [&](AffineMap map) {
+      return compressDims(map, unusedDims);
+    });
+    SmallVector<int64_t> compressedDims(genericOp.getNumLoops(), -1);
+    int64_t compressedDim = 0;
+    for (auto i : llvm::seq<int64_t>(genericOp.getNumLoops())) {
+      if (!unusedDims.test(i)) {
+        compressedDims[i] = compressedDim++;
+      }
+    }
     SmallVector<utils::IteratorType> iteratorTypes;
     for (auto i : llvm::seq<int64_t>(genericOp.getNumLoops())) {
       if (!unusedDims.test(i)) {
@@ -1901,6 +1990,13 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
           }
           for (Operation *usedOperation :
                usedOperationsAndBlockArguments->usedOperations) {
+            if (auto indexOp = dyn_cast<linalg::IndexOp>(usedOperation)) {
+              int64_t compressedDim = compressedDims[indexOp.getDim()];
+              assert(compressedDim >= 0 && "index op dim should be preserved");
+              Value newIndex = linalg::IndexOp::create(b, loc, compressedDim);
+              regionMapping.map(indexOp.getResult(), newIndex);
+              continue;
+            }
             b.clone(*usedOperation, regionMapping);
           }
           linalg::YieldOp::create(b, loc, regionMapping.lookup(result));
@@ -2008,6 +2104,16 @@ FailureOr<SmallVector<Value>> ExpReductionOp::decomposeOperation(OpBuilder &b) {
   getBodyRegion().cloneInto(&expRedGeneric.getBodyRegion(), mapper);
   IRRewriter::InsertionGuard g(rewriter);
   rewriter.setInsertionPointAfter(expRedGeneric.getBody()->getTerminator());
+  for (auto &op : llvm::make_early_inc_range(*expRedGeneric.getBody())) {
+    if (auto indexOp = dyn_cast<IREE::LinalgExt::IndexOp>(&op)) {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(&op);
+      Value replacement =
+          linalg::IndexOp::create(rewriter, op.getLoc(), indexOp.getDim());
+      indexOp.replaceAllUsesWith(replacement);
+      op.erase();
+    }
+  }
   auto yieldOp =
       cast<IREE::LinalgExt::YieldOp>(expRedGeneric.getBody()->getTerminator());
   rewriter.replaceOpWithNewOp<linalg::YieldOp>(yieldOp, yieldOp.getOperands());
