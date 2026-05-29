@@ -1230,6 +1230,9 @@ def IREELinalgExt_OnlineAttentionOp : IREELinalgExt_Op<"online_attention",
 def IREELinalgExt_ExpReductionOp : IREELinalgExt_Op<"exp_reduction", [
   AttrSizedOperandSegments,
   DeclareOpInterfaceMethods<AggregatedOpInterface, ["decomposeOperation"]>,
+  DeclareOpInterfaceMethods<LinalgFusionInterface,
+    ["getIndexingMapsForResults", "getIndexingMapsForOperands",
+     "getStaticLoopRanges"]>,
   DeclareOpInterfaceMethods<IndexingMapOpInterface>,
   DeclareOpInterfaceMethods<TilingInterface,
   [
@@ -1386,6 +1389,9 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_Op<"exp_reduction", [
     int64_t getReducingOpIndex() {
       return 0;
     }
+
+    SmallVector<AffineMap> getIndexingMapsArray();
+    AffineMap getMatchingIndexingMap(OpOperand *operand);
   }];
 }
 

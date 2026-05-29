@@ -2356,6 +2356,52 @@ LogicalResult ExpReductionOp::verify() {
   return success();
 }
 
+SmallVector<AffineMap> ExpReductionOp::getIndexingMapsArray() {
+  return SmallVector<AffineMap>(
+      getIndexingMaps().getAsValueRange<AffineMapAttr>());
+}
+
+SmallVector<AffineMap> ExpReductionOp::getIndexingMapsForOperands() {
+  return getIndexingMapsArray();
+}
+
+SmallVector<AffineMap> ExpReductionOp::getIndexingMapsForResults() {
+  return llvm::to_vector_of<AffineMap>(
+      llvm::drop_begin(getIndexingMapsArray(), getNumDpsInputs()));
+}
+
+AffineMap ExpReductionOp::getMatchingIndexingMap(OpOperand *operand) {
+  return getIndexingMapsArray()[operand->getOperandNumber()];
+}
+
+SmallVector<int64_t> ExpReductionOp::getStaticLoopRanges() {
+  SmallVector<int64_t> bounds(getNumLoops(), ShapedType::kDynamic);
+  SmallVector<bool> dimsFound(getNumLoops(), false);
+
+  for (OpOperand &opOperand : getOperation()->getOpOperands()) {
+    auto operandType = dyn_cast<RankedTensorType>(opOperand.get().getType());
+    if (!operandType) {
+      continue;
+    }
+    AffineMap indexingMap = getMatchingIndexingMap(&opOperand);
+    for (auto [size, expr] :
+         llvm::zip_equal(operandType.getShape(), indexingMap.getResults())) {
+      auto dim = dyn_cast<AffineDimExpr>(expr);
+      if (!dim) {
+        continue;
+      }
+      unsigned pos = dim.getPosition();
+      if (dimsFound[pos]) {
+        continue;
+      }
+      bounds[pos] = size;
+      dimsFound[pos] = true;
+    }
+  }
+
+  return bounds;
+}
+
 //===----------------------------------------------------------------------===//
 // Im2colOp
 //===----------------------------------------------------------------------===//
