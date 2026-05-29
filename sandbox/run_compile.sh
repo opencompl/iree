@@ -16,5 +16,6 @@ cd $SCRIPT_DIR
 iree-compile \
     --iree-hal-target-backends=rocm \
     --iree-rocm-target=$ARCH \
+    --iree-preprocessing-pass-pipeline='builtin.module(util.func(iree-preprocessing-make-single-dispatch))' \
     --mlir-print-ir-after-all \
     "$INPUT_FILE" > "${BASE_NAME}.out" 2>"${BASE_NAME}.err"
