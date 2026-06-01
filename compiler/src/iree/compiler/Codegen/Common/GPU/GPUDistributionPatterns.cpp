@@ -6,6 +6,7 @@
 
 #include "iree/compiler/Codegen/Common/GPU/GPUPatterns.h"
 #include "iree/compiler/Codegen/Common/GPU/GPUVectorDistribution.h"
+#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -122,6 +123,44 @@ struct DistributeElementwise final
 
     DistributionPattern::replaceOpWithDistributedValues(
         rewriter, op, distributedOp->getResults());
+    return success();
+  }
+};
+
+struct DistributePackedScalingTruncF final
+    : OpDistributionPattern<IREE::Codegen::PackedScalingTruncFOp> {
+  using OpDistributionPattern::OpDistributionPattern;
+
+  LogicalResult matchAndRewrite(IREE::Codegen::PackedScalingTruncFOp op,
+                                DistributionSignature &signature,
+                                PatternRewriter &rewriter) const override {
+    auto input = cast<VectorValue>(op.getInput());
+    auto scale = cast<VectorValue>(op.getScale());
+    auto result = cast<VectorValue>(op.getResult());
+
+    VectorLayoutInterface inputLayout = signature[input];
+    VectorLayoutInterface scaleLayout = signature[scale];
+    VectorLayoutInterface resultLayout = signature[result];
+
+    if (!inputLayout) {
+      return rewriter.notifyMatchFailure(op, "input does not have layout");
+    }
+    if (!scaleLayout) {
+      return rewriter.notifyMatchFailure(op, "scale does not have layout");
+    }
+    if (!resultLayout) {
+      return rewriter.notifyMatchFailure(op, "result does not have layout");
+    }
+
+    VectorType distributedResultType =
+        VectorType::get(resultLayout.getDistributedShape(),
+                        result.getType().getElementType());
+    auto distributed = IREE::Codegen::PackedScalingTruncFOp::create(
+        rewriter, op.getLoc(), distributedResultType,
+        getDistributed(rewriter, input, inputLayout),
+        getDistributed(rewriter, scale, scaleLayout), op.getLayout());
+
+    replaceOpWithDistributedValues(rewriter, op, distributed.getResult());
     return success();
   }
 };
@@ -361,6 +400,7 @@ struct DistributeTrivialExtract final
 void populateGPUDistributionPatterns(RewritePatternSet &patterns) {
   patterns.add<DistributeConstants, DistributePoison, DistributeScfFor,
                DistributeTrivialExtract>(patterns.getContext());
+  patterns.add<DistributePackedScalingTruncF>(patterns.getContext());
   // Elementwise patterns.
   patterns.add<DistributeElementwise>(patterns.getContext());
   patterns.add<DistributeTrivialLayoutConversions>(patterns.getContext());

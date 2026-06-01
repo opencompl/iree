@@ -455,6 +455,39 @@ void InnerTiledOp::populateBoundsForShapedValueDim(
 }
 
 //===----------------------------------------------------------------------===//
+// PackedScalingTruncFOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult PackedScalingTruncFOp::verify() {
+  auto inputType = dyn_cast<VectorType>(getInput().getType());
+  auto scaleType = dyn_cast<VectorType>(getScale().getType());
+  auto resultType = dyn_cast<VectorType>(getResult().getType());
+  if (!inputType || !scaleType || !resultType) {
+    return emitOpError("input, scale, and result must be vectors");
+  }
+
+  if (inputType.getNumElements() != resultType.getNumElements() ||
+      scaleType.getNumElements() != resultType.getNumElements()) {
+    return emitOpError("input, scale, and result must have the same number of "
+                       "elements");
+  }
+
+  if (!isa<FloatType>(inputType.getElementType())) {
+    return emitOpError("input element type must be floating point, got ")
+           << inputType.getElementType();
+  }
+  if (!isa<FloatType>(scaleType.getElementType())) {
+    return emitOpError("scale element type must be floating point, got ")
+           << scaleType.getElementType();
+  }
+  if (!isa<FloatType>(resultType.getElementType())) {
+    return emitOpError("result element type must be floating point, got ")
+           << resultType.getElementType();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // WorkgroupCountHintOp
 //===----------------------------------------------------------------------===//
 

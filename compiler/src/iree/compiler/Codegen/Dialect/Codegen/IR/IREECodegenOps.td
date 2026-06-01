@@ -460,6 +460,46 @@ def IREECodegen_InnerTiledOp : Op<IREECodegen_Dialect, "inner_tiled", [
 }
 
 //===----------------------------------------------------------------------===//
+// PackedScalingTruncFOp
+//===----------------------------------------------------------------------===//
+
+def IREECodegen_PackedScalingTruncFOp :
+    Op<IREECodegen_Dialect, "packed_scaling_truncf", [
+      Pure
+    ]> {
+  let summary = [{Layout-anchored scaled truncation to packed low precision.}];
+  let description = [{
+    Represents a scaled truncation that should remain in the requested vector
+    layout instead of being materialized through a generic elementwise producer.
+
+    The operation has elementwise semantics over the vector shape:
+
+    ```mlir
+    %0 = arith.scaling_truncf %input, %scale : vector<...xf32>,
+         vector<...xf8E8M0FNU> to vector<...xf4E2M1FN>
+    ```
+
+    The `layout` attribute is used as the distribution anchor for the result.
+    Late GPU lowering maps this back to the target packed scaled truncation
+    sequence.
+  }];
+
+  let arguments = (ins
+    AnyType:$input,
+    AnyType:$scale,
+    AnyAttr:$layout
+  );
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = [{
+    $input `,` $scale `to` `layout` `(` $layout `)` attr-dict
+    `:` type($input) `,` type($scale) `to` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // HintWorkgroupCountOp
 //===----------------------------------------------------------------------===//
 
