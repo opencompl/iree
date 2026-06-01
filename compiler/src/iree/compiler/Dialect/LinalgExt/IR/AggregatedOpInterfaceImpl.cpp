@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
+#include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUAttrs.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/FormattingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/Im2colUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
@@ -1733,6 +1734,19 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
                         IREE::Codegen::InnerTileDescAttrInterface mmaKind,
                         ArrayRef<Type> expectedElementTypes, Value value,
                         unsigned operandIndex) {
+  auto verifySource = [&](Value source, unsigned sourceIndex,
+                          StringRef description) -> LogicalResult {
+    Block &body = genericOp.getRegion().front();
+    Value expectedArg = body.getArgument(sourceIndex);
+    if (source != expectedArg) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          Twine(description) + " for mulf operand " + Twine(operandIndex) +
+              " must use block argument #" + Twine(sourceIndex));
+    }
+    return success();
+  };
+
   Type f32Type = Float32Type::get(genericOp.getContext());
   if (value.getType() != f32Type) {
     return emitInnerTiledMatmulVerifierError(
@@ -1753,7 +1767,7 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
               Twine(formatType(actualType)) + ", but mma_kind expects " +
               Twine(formatType(expectedType)));
     }
-    return success();
+    return verifySource(value, operandIndex, "raw mulf operand");
   }
 
   if (auto extfOp = dyn_cast<arith::ExtFOp>(definingOp)) {
@@ -1766,7 +1780,7 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
               " converts from " + Twine(formatType(actualType)) +
               ", but mma_kind expects " + Twine(formatType(expectedType)));
     }
-    return success();
+    return verifySource(extfOp.getIn(), operandIndex, "extf input");
   }
 
   if (auto scalingExtfOp = dyn_cast<arith::ScalingExtFOp>(definingOp)) {
@@ -1796,6 +1810,14 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
               " uses scale type " + Twine(formatType(actualScaleType)) +
               ", but mma_kind expects " + Twine(formatType(expectedScaleType)));
     }
+    if (failed(verifySource(scalingExtfOp->getOperand(0), operandIndex,
+                            "scaling_extf value input"))) {
+      return failure();
+    }
+    if (failed(verifySource(scalingExtfOp->getOperand(1), operandIndex + 2,
+                            "scaling_extf scale input"))) {
+      return failure();
+    }
     return success();
   }
 
@@ -1804,6 +1826,63 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
       Twine("mulf operand ") + Twine(operandIndex) +
           " is produced by unsupported op " +
           definingOp->getName().getStringRef());
+}
+
+static LogicalResult verifyInnerTiledLoweringShape(
+    linalg::GenericOp genericOp, Attribute loweringConfig,
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  if (!genericOp.hasPureTensorSemantics()) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "generic must have pure tensor semantics");
+  }
+
+  if (auto scaledMmaKind = dyn_cast<IREE::GPU::ScaledMMAAttr>(mmaKind)) {
+    FailureOr<ScaledContractionDimensions> maybeDims =
+        inferScaledContractionDims(genericOp);
+    if (failed(maybeDims)) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          "generic must be a scaled contraction with four inputs and one "
+          "output");
+    }
+    if (maybeDims->m.empty() || maybeDims->n.empty() || maybeDims->k.empty() ||
+        maybeDims->kB.empty()) {
+      return emitInnerTiledMatmulVerifierError(
+          genericOp, loweringConfig, mmaKind,
+          "scaled contraction dimensions must include non-empty M, N, K, and "
+          "KB groups");
+    }
+
+    SmallVector<Type> expectedElementTypes;
+    scaledMmaKind.getElementTypes(expectedElementTypes);
+    for (unsigned operandIndex :
+         {IREE::GPU::kScaledMMAOperandLhs, IREE::GPU::kScaledMMAOperandRhs,
+          IREE::GPU::kScaledMMAOperandLhsScale,
+          IREE::GPU::kScaledMMAOperandRhsScale,
+          IREE::GPU::kScaledMMAOperandAcc}) {
+      auto operandType = dyn_cast<RankedTensorType>(
+          genericOp->getOperand(operandIndex).getType());
+      if (!operandType ||
+          operandType.getElementType() != expectedElementTypes[operandIndex]) {
+        return emitInnerTiledMatmulVerifierError(
+            genericOp, loweringConfig, mmaKind,
+            Twine("operand #") + Twine(operandIndex) + " has element type " +
+                Twine(formatType(getElementTypeOrSelf(
+                    genericOp->getOperand(operandIndex).getType()))) +
+                ", but mma_kind expects " +
+                Twine(formatType(expectedElementTypes[operandIndex])));
+      }
+    }
+    return success();
+  }
+
+  if (!linalg::isaContractionOpInterface(genericOp)) {
+    return emitInnerTiledMatmulVerifierError(
+        genericOp, loweringConfig, mmaKind,
+        "generic must implement the contraction op interface");
+  }
+  return success();
 }
 
 static LogicalResult
@@ -1821,6 +1900,10 @@ verifyInnerTiledMatmulFma(linalg::GenericOp genericOp, Attribute loweringConfig,
         genericOp, loweringConfig, mmaKind,
         Twine("mma_kind accumulator element type is ") +
             Twine(formatType(expectedElementTypes.back())) + ", expected f32");
+  }
+  if (failed(
+          verifyInnerTiledLoweringShape(genericOp, loweringConfig, mmaKind))) {
+    return failure();
   }
 
   Block &body = genericOp.getRegion().front();
@@ -2017,11 +2100,11 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
     // contraction bodies contain elementwise casts/scales that are extracted
     // later, so do not require the full contraction op interface match here.
     if (loweringConfig) {
-      bool isContraction =
+      bool hasContractionIndexing =
           succeeded(linalg::inferContractionDims(newOp)) ||
           succeeded(inferScaledContractionDims(newOp)) ||
           succeeded(inferScaledContractionDims(newOp.getIndexingMapsArray()));
-      if (isContraction) {
+      if (hasContractionIndexing) {
         if (auto mmaKind = getMmaKind(loweringConfig)) {
           if (failed(
                   verifyInnerTiledMatmulFma(newOp, loweringConfig, mmaKind))) {
