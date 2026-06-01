@@ -15,7 +15,7 @@ module @e2e {
     %cst = arith.constant 0.000000e+00 : f32
     %0 = tensor.empty() : tensor<4x32x4096x4096xf32>
     %1 = linalg.fill ins(%cst : f32) outs(%0 : tensor<4x32x4096x4096xf32>) -> tensor<4x32x4096x4096xf32>
-    %2 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor<4x32x4096x64xf8E4M3FN>, tensor<4x32x4096x64xf8E4M3FN>) outs(%1 : tensor<4x32x4096x4096xf32>) attrs =  {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F8E4M3FN>, promote_operands = [0, 1], subgroup_basis = [[1, 1, 2, 1, 1], [0, 1, 2, 3, 4]]}>} {
+    %2 = linalg.generic {indexing_maps = [#map, #map1, #map2], iterator_types = ["parallel", "parallel", "parallel", "parallel", "reduction"]} ins(%arg0, %arg1 : tensor<4x32x4096x64xf8E4M3FN>, tensor<4x32x4096x64xf8E4M3FN>) outs(%1 : tensor<4x32x4096x4096xf32>) {
     ^bb0(%in: f8E4M3FN, %in_0: f8E4M3FN, %out: f32):
       %8 = arith.extf %in : f8E4M3FN to f32
       %9 = arith.extf %in_0 : f8E4M3FN to f32
@@ -31,7 +31,7 @@ module @e2e {
     %cst_1 = arith.constant 0.000000e+00 : f32
     %7 = linalg.fill ins(%cst_1 : f32) outs(%6 : tensor<4x32x4096xf32>) -> tensor<4x32x4096xf32>
     %12 = linalg.fill ins(%cst_1 : f32) outs(%3 : tensor<4x32x4096x64xf32>) -> tensor<4x32x4096x64xf32>
-    %13:3 = iree_linalg_ext.exp_reduction{indexing_maps = [#map, #map3, #map4, #map4, #map2], iterator_types = [#iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<reduction>], exp_reduced_operands = [1, 2]} attributes {lowering_config = #iree_gpu.lowering_config<{mma_kind = #iree_gpu.mma_layout<MFMA_F32_16x16x32_F8E4M3FN, col_major = true>, reduction = [0, 0, 0, 0, 32], subgroup_basis = [[1, 1, 2, 1, 1], [0, 1, 2, 3, 4]], workgroup = [1, 1, 64, 0, 0]}>} ins(%2, %arg2 : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x64xf8E4M3FN>) outs(%5, %7, %12 : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>) {
+    %13:3 = iree_linalg_ext.exp_reduction{indexing_maps = [#map, #map3, #map4, #map4, #map2], iterator_types = [#iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<parallel>, #iree_linalg_ext.iterator_type<reduction>], exp_reduced_operands = [1, 2]} ins(%2, %arg2 : tensor<4x32x4096x4096xf32>, tensor<4x32x4096x64xf8E4M3FN>) outs(%5, %7, %12 : tensor<4x32x4096xf32>, tensor<4x32x4096xf32>, tensor<4x32x4096x64xf32>) {
     ^bb0(%arg3: f32, %arg4: f8E4M3FN, %arg5: f32, %arg6: f32, %arg7: f32):
       %cst_2 = arith.constant 4.480000e+02 : f32
       %15 = arith.mulf %arg3, %cst_2 : f32

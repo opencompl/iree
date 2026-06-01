@@ -2104,13 +2104,14 @@ FailureOr<SmallVector<Value>> ExpReductionOp::decomposeOperation(OpBuilder &b) {
   Value scaledS = elementwiseValueInPlace<arith::MulFOp>(
       b, loc, normValMap, normValMap, log2eTensor, sValue->get());
 
-  // curr_max = max(sValue, prev_max)
+  // ExpReduction models natural exponentials, but the lowering uses exp2.
+  // Keep the running max and exponential argument in log2-space.
   Value currMax = reduce<arith::MaximumFOp>(
       rewriter, loc, normValMap, prevMaxMap, scaledS, prevMax->get());
-  // ex = e^{sValue - curr_max}
+  // ex = exp2(sValue * log2(e) - curr_max)
   Value ex = computeSubAndExp(rewriter, loc, prevMaxMap, normValMap, currMax,
-                              sValue->get(), /*useExp2=*/true);
-  // norm = e^(prev_max - curr_max)
+                              scaledS, /*useExp2=*/true);
+  // norm = exp2(prev_max - curr_max)
   Value norm = computeSubAndExp(rewriter, loc, prevMaxMap, prevMaxMap, currMax,
                                 prevMax->get(), /*useExp2=*/true);
 
