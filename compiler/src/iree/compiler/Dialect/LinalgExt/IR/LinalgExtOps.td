@@ -1238,7 +1238,12 @@ def IREELinalgExt_ExpReductionOp : IREELinalgExt_Op<"exp_reduction", [
     "getTiledImplementation",
     "getResultTilePosition",
     "generateResultTileValue"
-  ]>
+  ]>,
+  DeclareOpInterfaceMethods<PartialReductionOpInterface,
+   ["generateInitialTensorForPartialReduction",
+    "tileToPartialReduction",
+    "mergeReductions",
+    "getPartialResultTilePosition"]>
 ]> {
   let summary = [{
     A linalg.generic extension with support for exponential reduction.
