@@ -371,6 +371,59 @@ remapProjectedPermutationMap(AffineMap map, ArrayRef<int64_t> dimMap,
   return AffineMap::get(newDomainRank, /*symbolCount=*/0, results, context);
 }
 
+static SmallVector<AffineMap> getStaticUnitBroadcastFoldedMaps(AffineMap map,
+                                                               Value value) {
+  SmallVector<AffineMap> maps{map};
+  auto shapedType = dyn_cast<ShapedType>(value.getType());
+  if (!shapedType || !map.isProjectedPermutation() ||
+      shapedType.getRank() != map.getNumResults()) {
+    return maps;
+  }
+
+  SmallVector<unsigned> staticUnitResults;
+  for (auto [resultNumber, resultExpr, dimSize] :
+       llvm::enumerate(map.getResults(), shapedType.getShape())) {
+    if (dimSize == 1 && isa<AffineDimExpr>(resultExpr)) {
+      staticUnitResults.push_back(resultNumber);
+    }
+  }
+
+  if (staticUnitResults.empty() || staticUnitResults.size() >= 64) {
+    return maps;
+  }
+
+  MLIRContext *context = map.getContext();
+  uint64_t limit = uint64_t{1} << staticUnitResults.size();
+  for (int64_t numDropped :
+       llvm::seq<int64_t>(1, staticUnitResults.size() + 1)) {
+    for (uint64_t mask = 1; mask < limit; ++mask) {
+      if (llvm::popcount(mask) != numDropped) {
+        continue;
+      }
+      SmallVector<AffineExpr> results;
+      for (auto [resultNumber, resultExpr] :
+           llvm::enumerate(map.getResults())) {
+        bool drop = false;
+        for (auto [candidateNumber, unitResultNumber] :
+             llvm::enumerate(staticUnitResults)) {
+          if (resultNumber == unitResultNumber &&
+              (mask & (uint64_t{1} << candidateNumber))) {
+            drop = true;
+            break;
+          }
+        }
+        if (!drop) {
+          results.push_back(resultExpr);
+        }
+      }
+      maps.push_back(AffineMap::get(map.getNumDims(), /*symbolCount=*/0,
+                                    results, context));
+    }
+  }
+
+  return maps;
+}
+
 static bool isSingleInputElementwise(linalg::GenericOp op) {
   if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1 ||
       op->getNumResults() != 1 || op.getNumReductionLoops() != 0) {
@@ -1071,24 +1124,46 @@ getExplicitAttentionConfigInfo(IREE::LinalgExt::ExpReductionOp op) {
     return failure();
   }
 
-  FailureOr<IREE::LinalgExt::AttentionOpDetail> maybeOpInfo =
-      IREE::LinalgExt::AttentionOpDetail::get(*maybeQMap, *maybeKMap,
-                                              *maybeVMap, *maybeOMap);
-  if (failed(maybeOpInfo) || maybeOpInfo->getMDims().empty() ||
-      maybeOpInfo->getK1Dims().empty() || maybeOpInfo->getK2Dims().empty() ||
-      maybeOpInfo->getNDims().empty() ||
-      maybeOpInfo->getSMap() != *maybeScoreMap) {
+  SmallVector<AffineMap> qMapCandidates = getStaticUnitBroadcastFoldedMaps(
+      *maybeQMap, qkOp.getDpsInputOperand(0)->get());
+  SmallVector<AffineMap> kMapCandidates = getStaticUnitBroadcastFoldedMaps(
+      *maybeKMap, qkOp.getDpsInputOperand(1)->get());
+  std::optional<IREE::LinalgExt::AttentionOpDetail> opInfo;
+  AffineMap queryMap;
+  AffineMap keyMap;
+  for (AffineMap candidateQMap : qMapCandidates) {
+    for (AffineMap candidateKMap : kMapCandidates) {
+      FailureOr<IREE::LinalgExt::AttentionOpDetail> maybeOpInfo =
+          IREE::LinalgExt::AttentionOpDetail::get(candidateQMap, candidateKMap,
+                                                  *maybeVMap, *maybeOMap);
+      if (failed(maybeOpInfo) || maybeOpInfo->getMDims().empty() ||
+          maybeOpInfo->getK1Dims().empty() ||
+          maybeOpInfo->getK2Dims().empty() || maybeOpInfo->getNDims().empty() ||
+          maybeOpInfo->getSMap() != *maybeScoreMap) {
+        continue;
+      }
+      opInfo = *maybeOpInfo;
+      queryMap = candidateQMap;
+      keyMap = candidateKMap;
+      break;
+    }
+    if (opInfo) {
+      break;
+    }
+  }
+
+  if (!opInfo) {
     return failure();
   }
 
   AttentionConfigInfo configInfo;
-  configInfo.opInfo = *maybeOpInfo;
+  configInfo.opInfo = *opInfo;
   configInfo.bounds = std::move(bounds);
   configInfo.query = qkOp.getDpsInputOperand(0)->get();
   configInfo.key = qkOp.getDpsInputOperand(1)->get();
   configInfo.value = op.getDpsInputOperand(1)->get();
-  configInfo.queryMap = *maybeQMap;
-  configInfo.keyMap = *maybeKMap;
+  configInfo.queryMap = queryMap;
+  configInfo.keyMap = keyMap;
   configInfo.valueMap = *maybeVMap;
   configInfo.rootOp = op;
   configInfo.qkMatmulOp = qkOp;
@@ -1637,15 +1712,14 @@ static LogicalResult setAttentionReductionConfig(
       context, pvConfig, IREE::GPU::TilingLevel::Thread,
       projectBasisToOp(pvThreadBasis, configInfo.aggregateToPV));
 
-  SmallVector<NamedAttribute, 4> rootAttrs = {
-      NamedAttribute("workgroup",
-                     b.getI64ArrayAttr(projectTileSizes(
-                         workgroupTileSizes, configInfo.aggregateToRoot)))};
+  SmallVector<NamedAttribute, 4> rootAttrs = {NamedAttribute(
+      "workgroup", b.getI64ArrayAttr(projectTileSizes(
+                       workgroupTileSizes, configInfo.aggregateToRoot)))};
   if (clEnablePartialReduction) {
-    rootAttrs.push_back(NamedAttribute(
-        "partial_reduction",
-        b.getI64ArrayAttr(
-            projectTileSizes(reductionTileSizes, configInfo.aggregateToRoot))));
+    rootAttrs.push_back(
+        NamedAttribute("partial_reduction",
+                       b.getI64ArrayAttr(projectTileSizes(
+                           reductionTileSizes, configInfo.aggregateToRoot))));
   }
   if (configInfo.isExplicitExpReduction()) {
     llvm::append_range(rootAttrs, pvConfig);
@@ -2182,7 +2256,10 @@ static LogicalResult setRootDefaultConfig(IREE::GPU::TargetAttr target,
   MLIRContext *context = op->getContext();
   GPUPipeline passPipeline = GPUPipeline::Distribute;
   TileSizesListType tileSizes;
-  auto interfaceOp = cast<PartitionableLoopsInterface>(*op);
+  auto interfaceOp = dyn_cast<PartitionableLoopsInterface>(*op);
+  if (!interfaceOp) {
+    return failure();
+  }
   auto partitionedLoops = interfaceOp.getPartitionableLoops(std::nullopt);
   if (partitionedLoops.empty()) {
     tileSizes.push_back({});
