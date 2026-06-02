@@ -49,6 +49,11 @@
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
 
+static llvm::cl::opt<bool> clEnablePartialReduction(
+    "iree-codegen-enable-partial-reduction",
+    llvm::cl::desc("Enable materializing partial_reduction lowering configs."),
+    llvm::cl::init(true));
+
 #define DEBUG_TYPE "iree-llvmgpu-kernel-config"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 namespace mlir::iree_compiler {
@@ -1635,10 +1640,13 @@ static LogicalResult setAttentionReductionConfig(
   SmallVector<NamedAttribute, 4> rootAttrs = {
       NamedAttribute("workgroup",
                      b.getI64ArrayAttr(projectTileSizes(
-                         workgroupTileSizes, configInfo.aggregateToRoot))),
-      NamedAttribute("partial_reduction",
-                     b.getI64ArrayAttr(projectTileSizes(
-                         reductionTileSizes, configInfo.aggregateToRoot)))};
+                         workgroupTileSizes, configInfo.aggregateToRoot)))};
+  if (clEnablePartialReduction) {
+    rootAttrs.push_back(NamedAttribute(
+        "partial_reduction",
+        b.getI64ArrayAttr(
+            projectTileSizes(reductionTileSizes, configInfo.aggregateToRoot))));
+  }
   if (configInfo.isExplicitExpReduction()) {
     llvm::append_range(rootAttrs, pvConfig);
   }
