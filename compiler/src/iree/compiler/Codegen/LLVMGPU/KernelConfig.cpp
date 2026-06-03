@@ -1712,12 +1712,17 @@ static LogicalResult setAttentionReductionConfig(
       context, pvConfig, IREE::GPU::TilingLevel::Thread,
       projectBasisToOp(pvThreadBasis, configInfo.aggregateToPV));
 
-  SmallVector<NamedAttribute, 4> rootAttrs = {NamedAttribute(
+  SmallVector<NamedAttribute, 5> rootAttrs = {NamedAttribute(
       "workgroup", b.getI64ArrayAttr(projectTileSizes(
                        workgroupTileSizes, configInfo.aggregateToRoot)))};
   if (clEnablePartialReduction) {
     rootAttrs.push_back(
         NamedAttribute("partial_reduction",
+                       b.getI64ArrayAttr(projectTileSizes(
+                           reductionTileSizes, configInfo.aggregateToRoot))));
+  } else {
+    rootAttrs.push_back(
+        NamedAttribute("reduction",
                        b.getI64ArrayAttr(projectTileSizes(
                            reductionTileSizes, configInfo.aggregateToRoot))));
   }
