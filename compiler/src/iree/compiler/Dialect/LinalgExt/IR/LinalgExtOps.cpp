@@ -3368,32 +3368,6 @@ LogicalResult IREE::LinalgExt::IndexOp::verify() {
 }
 
 //===---------------------------------------------------------------------===//
-// ScalingTruncFOp
-//===---------------------------------------------------------------------===//
-
-LogicalResult ScalingTruncFOp::verify() {
-  auto inputType = getInput().getType();
-  auto resultType = getResult().getType();
-  auto scaleType = getScale().getType();
-
-  // Input, result, and scale must all be floating point types.
-  if (!isa<FloatType>(inputType)) {
-    return emitOpError("input must be a floating point type, got '")
-           << inputType << "'";
-  }
-  if (!isa<FloatType>(resultType)) {
-    return emitOpError("result must be a floating point type, got '")
-           << resultType << "'";
-  }
-  if (!isa<FloatType>(scaleType)) {
-    return emitOpError("scale must be a floating point type, got '")
-           << scaleType << "'";
-  }
-
-  return success();
-}
-
-//===---------------------------------------------------------------------===//
 // End operation definitions
 //===---------------------------------------------------------------------===//
 

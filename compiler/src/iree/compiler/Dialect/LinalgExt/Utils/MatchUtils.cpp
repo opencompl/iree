@@ -143,8 +143,7 @@ static bool isScaledContractionBody(Block &block) {
     Operation *op = value.getDefiningOp();
     while (op) {
       if ((op->getNumOperands() == 1) ||
-          !isa<arith::ExtFOp, arith::TruncFOp, arith::ScalingExtFOp,
-               arith::ScalingTruncFOp>(op)) {
+          !isa<arith::ExtFOp, arith::TruncFOp, arith::ScalingExtFOp>(op)) {
         break;
       }
       auto iface = dyn_cast<MemoryEffectOpInterface>(op);

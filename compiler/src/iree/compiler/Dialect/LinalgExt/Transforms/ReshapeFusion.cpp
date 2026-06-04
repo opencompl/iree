@@ -12,6 +12,7 @@
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/Utils.h"
+#include "mlir/Dialect/Affine/Utils.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
@@ -1086,6 +1087,66 @@ getCollapsedOpIndexingMap(AffineMap indexingMap,
                         resultExprs, context);
 }
 
+template <typename AttentionOpTy>
+static void rewriteCollapsedIndexOps(AttentionOpTy origOp, Operation *collapsedOp,
+                                     const CollapsingInfo &collapsingInfo,
+                                     RewriterBase &rewriter) {
+  SmallVector<int64_t> staticLoopRanges = origOp.getStaticLoopRanges();
+  auto origOpToCollapsedOpMapping =
+      collapsingInfo.getOrigOpToCollapsedOpMapping();
+  auto collapsedOpToOrigOpMapping =
+      collapsingInfo.getCollapsedOpToOrigOpMapping();
+
+  auto collapsedAttentionOp = cast<AttentionOpTy>(collapsedOp);
+  for (IndexOp indexOp : llvm::make_early_inc_range(
+           collapsedAttentionOp.getBody()->template getOps<IndexOp>())) {
+    unsigned originalDim = indexOp.getDim();
+    auto [collapsedDim, relativePosition] =
+        origOpToCollapsedOpMapping[originalDim];
+    ReassociationIndicesRef collapsedGroup =
+        collapsedOpToOrigOpMapping[collapsedDim];
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    rewriter.setInsertionPoint(indexOp);
+    Value collapsedIndex = IndexOp::create(rewriter, indexOp.getLoc(),
+                                           collapsedDim);
+
+    if (collapsedGroup.size() == 1) {
+      rewriter.replaceOp(indexOp, collapsedIndex);
+      continue;
+    }
+
+    int64_t suffixProduct = 1;
+    for (unsigned i = relativePosition + 1; i < collapsedGroup.size(); ++i) {
+      int64_t size = staticLoopRanges[collapsedGroup[i]];
+      if (ShapedType::isDynamic(size)) {
+        suffixProduct = ShapedType::kDynamic;
+        break;
+      }
+      suffixProduct *= size;
+    }
+    int64_t dimSize = staticLoopRanges[originalDim];
+    if (ShapedType::isDynamic(suffixProduct) || ShapedType::isDynamic(dimSize)) {
+      rewriter.replaceOp(indexOp, collapsedIndex);
+      continue;
+    }
+
+    AffineExpr expr = rewriter.getAffineDimExpr(0);
+    if (suffixProduct != 1) {
+      expr = expr.floorDiv(suffixProduct);
+    }
+    if (relativePosition != 0 && dimSize != 1) {
+      expr = expr % dimSize;
+    }
+    OpFoldResult originalIndex = affine::makeComposedFoldedAffineApply(
+        rewriter, indexOp.getLoc(), AffineMap::get(1, 0, expr),
+        getAsOpFoldResult(collapsedIndex));
+    Value materialized =
+        getValueOrCreateConstantIndexOp(rewriter, indexOp.getLoc(), originalIndex);
+    rewriter.replaceOp(indexOp, materialized);
+  }
+}
+
 /// Returns a copy of `origOp` with collapsed iteration dimensions.
 template <typename AttentionOpTy>
 static Operation *createCollapsedOp(AttentionOpTy origOp,
@@ -1105,6 +1166,7 @@ static Operation *createCollapsedOp(AttentionOpTy origOp,
       rewriter.getAffineMapArrayAttr(indexingMaps));
   rewriter.inlineRegionBefore(origOp.getRegion(), collapsedOp.getRegion(),
                               collapsedOp.getRegion().begin());
+  rewriteCollapsedIndexOps(origOp, collapsedOp, collapsingInfo, rewriter);
   return collapsedOp;
 }
 

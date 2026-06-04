@@ -3603,6 +3603,28 @@ SmallVector<utils::IteratorType> OnlineAttentionOp::getLoopIteratorTypes() {
                                    getKeyMap(), getValueMap(), getOutputMap());
 }
 
+static void offsetOnlineAttentionIndices(OpBuilder &b, OnlineAttentionOp op,
+                                         ArrayRef<OpFoldResult> offsets) {
+  IRRewriter rewriter(b);
+  for (auto indexOp : op.getBody()->getOps<IREE::LinalgExt::IndexOp>()) {
+    if (indexOp.getDim() >= offsets.size() || !offsets[indexOp.getDim()]) {
+      continue;
+    }
+    OpBuilder::InsertionGuard guard(b);
+    rewriter.setInsertionPointAfter(indexOp);
+    AffineExpr index, offset;
+    bindDims(b.getContext(), index, offset);
+    OpFoldResult applied = affine::makeComposedFoldedAffineApply(
+        rewriter, indexOp.getLoc(), index + offset,
+        {getAsOpFoldResult(indexOp.getResult()), offsets[indexOp.getDim()]});
+    Value materialized =
+        getValueOrCreateConstantIndexOp(b, indexOp.getLoc(), applied);
+    rewriter.replaceUsesWithIf(indexOp, materialized, [&](OpOperand &use) {
+      return use.getOwner() != materialized.getDefiningOp();
+    });
+  }
+}
+
 FailureOr<TilingResult>
 OnlineAttentionOp::getTiledImplementation(OpBuilder &builder,
                                           ArrayRef<OpFoldResult> offsets,
@@ -3692,6 +3714,8 @@ OnlineAttentionOp::getTiledImplementation(OpBuilder &builder,
 
   Operation *tiledOp =
       mlir::clone(builder, getOperation(), resultTypes, tiledOperands);
+  offsetOnlineAttentionIndices(builder, cast<OnlineAttentionOp>(tiledOp),
+                               offsets);
 
   return TilingResult{
       {tiledOp}, SmallVector<Value>(tiledOp->getResults()), slices};

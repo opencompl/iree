@@ -72,6 +72,13 @@ static bool isEligibleConstExpr(Operation *op) {
     return false;
   }
 
+  // Index-like ops are position dependent even when they are pure scalar ops
+  // with no operands. Treating them as constants hoists them out of their
+  // parent region, where they are no longer meaningful or legal.
+  if (op->getName().getStringRef() == "iree_linalg_ext.index") {
+    return false;
+  }
+
   // By default, ops without results are not const-expr.
   if (op->getNumResults() == 0) {
     return false;

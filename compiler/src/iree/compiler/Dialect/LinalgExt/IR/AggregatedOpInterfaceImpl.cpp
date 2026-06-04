@@ -208,15 +208,17 @@ static Value applyPostQKMatmulElementwise(OpBuilder &builder, Location loc,
 
   // Convert iree_linalg_ext.index -> linalg.index in the cloned region.
   Block &block = dstRegion.back();
-  for (auto &op : llvm::make_early_inc_range(block)) {
-    if (auto indexOp = dyn_cast<IREE::LinalgExt::IndexOp>(&op)) {
-      OpBuilder::InsertionGuard g(builder);
-      builder.setInsertionPoint(&op);
-      Value replacement =
-          linalg::IndexOp::create(builder, op.getLoc(), indexOp.getDim());
-      indexOp.replaceAllUsesWith(replacement);
-      op.erase();
-    }
+  SmallVector<IREE::LinalgExt::IndexOp> indexOps;
+  genericOp->walk([&](IREE::LinalgExt::IndexOp indexOp) {
+    indexOps.push_back(indexOp);
+  });
+  for (auto indexOp : indexOps) {
+    OpBuilder::InsertionGuard g(builder);
+    builder.setInsertionPoint(indexOp);
+    Value replacement =
+        linalg::IndexOp::create(builder, indexOp.getLoc(), indexOp.getDim());
+    indexOp.replaceAllUsesWith(replacement);
+    indexOp.erase();
   }
 
   {
@@ -1291,11 +1293,7 @@ getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
                                          unsigned argNumber,
                                          unsigned numDpsInputs) {
   if (isa<arith::ScalingTruncFOp>(op)) {
-    auto valueArg = dyn_cast<BlockArgument>(op->getOperand(0));
-    if (!valueArg || valueArg.getOwner() != &body ||
-        valueArg.getArgNumber() != argNumber) {
-      return std::nullopt;
-    }
+    return std::nullopt;
   }
   // Keep one extf-like op in the contraction body so it still matches the
   // expected input type for the chosen matmul-like lowering. Peel only when a
