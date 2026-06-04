@@ -306,6 +306,7 @@ struct AttentionConfigInfo {
   Operation *rootOp = nullptr;
   IREE::LinalgExt::OnlineAttentionOp onlineAttentionOp;
   linalg::LinalgOp qkMatmulOp;
+  SmallVector<linalg::LinalgOp> scoreMatmulOps;
   SmallVector<int64_t> aggregateToRoot;
   SmallVector<int64_t> aggregateToQK;
   SmallVector<int64_t> aggregateToPV;
@@ -424,13 +425,18 @@ static SmallVector<AffineMap> getStaticUnitBroadcastFoldedMaps(AffineMap map,
   return maps;
 }
 
-static bool isSingleInputElementwise(linalg::GenericOp op) {
-  if (op.getNumDpsInputs() != 1 || op.getNumDpsInits() != 1 ||
-      op->getNumResults() != 1 || op.getNumReductionLoops() != 0) {
+static bool isElementwiseSingleResult(linalg::GenericOp op) {
+  if (op.getNumDpsInits() != 1 || op->getNumResults() != 1 ||
+      op.getNumReductionLoops() != 0) {
     return false;
   }
-  return op.getMatchingIndexingMap(op.getDpsInputOperand(0)) ==
-         op.getMatchingIndexingMap(op.getDpsInitOperand(0));
+  AffineMap outputMap = op.getMatchingIndexingMap(op.getDpsInitOperand(0));
+  for (OpOperand *inputOperand : op.getDpsInputOperands()) {
+    if (op.getMatchingIndexingMap(inputOperand) != outputMap) {
+      return false;
+    }
+  }
+  return true;
 }
 
 static linalg::LinalgOp findContractionProducer(Value value) {
@@ -442,15 +448,46 @@ static linalg::LinalgOp findContractionProducer(Value value) {
         return linalgOp;
       }
       if (auto genericOp = dyn_cast<linalg::GenericOp>(producer)) {
-        if (isSingleInputElementwise(genericOp)) {
-          value = genericOp.getDpsInputOperand(0)->get();
-          continue;
+        if (isElementwiseSingleResult(genericOp)) {
+          for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
+            if (linalg::LinalgOp contraction =
+                    findContractionProducer(inputOperand->get())) {
+              return contraction;
+            }
+          }
         }
       }
     }
     return nullptr;
   }
   return nullptr;
+}
+
+static void collectContractionProducers(Value value,
+                                        SmallVectorImpl<linalg::LinalgOp> &ops) {
+  Operation *producer = value.getDefiningOp();
+  if (!producer) {
+    return;
+  }
+  auto linalgOp = dyn_cast<linalg::LinalgOp>(producer);
+  if (!linalgOp) {
+    return;
+  }
+  if (linalg::isaContractionOpInterface(linalgOp) &&
+      linalgOp.getNumDpsInputs() >= 2 && linalgOp.getNumDpsInits() == 1 &&
+      linalgOp->getNumResults() == 1) {
+    if (!llvm::is_contained(ops, linalgOp)) {
+      ops.push_back(linalgOp);
+    }
+    return;
+  }
+  auto genericOp = dyn_cast<linalg::GenericOp>(producer);
+  if (!genericOp || !isElementwiseSingleResult(genericOp)) {
+    return;
+  }
+  for (OpOperand *inputOperand : genericOp.getDpsInputOperands()) {
+    collectContractionProducers(inputOperand->get(), ops);
+  }
 }
 
 static LogicalResult
@@ -959,7 +996,12 @@ static LogicalResult setAttentionConfigsAndEntryPointFnTranslation(
     IREE::GPU::LoweringConfigAttr pvLoweringConfig,
     IREE::Codegen::TranslationInfoAttr translationInfo) {
   if (configInfo.isExplicitExpReduction()) {
-    setLoweringConfig(configInfo.qkMatmulOp, qkLoweringConfig);
+    if (configInfo.scoreMatmulOps.empty()) {
+      setLoweringConfig(configInfo.qkMatmulOp, qkLoweringConfig);
+    }
+    for (linalg::LinalgOp scoreMatmulOp : configInfo.scoreMatmulOps) {
+      setLoweringConfig(scoreMatmulOp, qkLoweringConfig);
+    }
   } else {
     OpBuilder b(configInfo.rootOp);
     SmallVector<NamedAttribute, 2> qkAttrs;
@@ -1019,7 +1061,10 @@ getOnlineAttentionConfigInfo(IREE::LinalgExt::OnlineAttentionOp op) {
 
 static FailureOr<AttentionConfigInfo>
 getExplicitAttentionConfigInfo(IREE::LinalgExt::ExpReductionOp op) {
-  if (op.getNumDpsInputs() != 2 || op.getNumDpsInits() < 3) {
+  // The explicit attention form always has score and value as the first two
+  // inputs, but score modifiers may pass additional read-only operands into the
+  // reduction body. They do not change the QK/PV domain reconstruction below.
+  if (op.getNumDpsInputs() < 2 || op.getNumDpsInits() < 3) {
     return failure();
   }
 
@@ -1167,6 +1212,7 @@ getExplicitAttentionConfigInfo(IREE::LinalgExt::ExpReductionOp op) {
   configInfo.valueMap = *maybeVMap;
   configInfo.rootOp = op;
   configInfo.qkMatmulOp = qkOp;
+  collectContractionProducers(scoreValue, configInfo.scoreMatmulOps);
   configInfo.aggregateToRoot = aggregateToExp;
   configInfo.aggregateToPV = aggregateToExp;
   configInfo.aggregateToQK = aggregateToQK;
