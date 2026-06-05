@@ -1292,9 +1292,6 @@ static std::optional<ExtractableElementwiseOperands>
 getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
                                          unsigned argNumber,
                                          unsigned numDpsInputs) {
-  if (isa<arith::ScalingTruncFOp>(op)) {
-    return std::nullopt;
-  }
   // Keep one extf-like op in the contraction body so it still matches the
   // expected input type for the chosen matmul-like lowering. Peel only when a
   // chain has multiple extf-like ops, e.g. scaling_extf(...)->extf.
@@ -1657,6 +1654,26 @@ getMmaKind(Attribute loweringConfig) {
       },
       [](Type) {});
   return mmaKind;
+}
+
+static bool hasPartialReduction(Attribute loweringConfig) {
+  if (!loweringConfig) {
+    return false;
+  }
+  bool found = false;
+  loweringConfig.walkImmediateSubElements(
+      [&](Attribute attr) {
+        if (found) {
+          return;
+        }
+        auto dictAttr = dyn_cast<DictionaryAttr>(attr);
+        if (!dictAttr) {
+          return;
+        }
+        found = static_cast<bool>(dictAttr.get("partial_reduction"));
+      },
+      [](Type) {});
+  return found;
 }
 
 static LogicalResult emitInnerTiledMatmulVerifierError(
@@ -2051,8 +2068,9 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
           succeeded(inferScaledContractionDims(newOp.getIndexingMapsArray()));
       if (hasContractionIndexing) {
         if (auto mmaKind = getMmaKind(loweringConfig)) {
-          if (failed(
-                  verifyInnerTiledMatmulFma(newOp, loweringConfig, mmaKind))) {
+          if (!hasPartialReduction(loweringConfig) &&
+              failed(verifyInnerTiledMatmulFma(newOp, loweringConfig,
+                                               mmaKind))) {
             return failure();
           }
         }

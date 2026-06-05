@@ -300,6 +300,10 @@ struct AttentionConfigInfo {
   Value query;
   Value key;
   Value value;
+  Value queryScale;
+  Value keyScale;
+  Value scoreScale;
+  Value valueScale;
   AffineMap queryMap;
   AffineMap keyMap;
   AffineMap valueMap;
@@ -312,6 +316,9 @@ struct AttentionConfigInfo {
   SmallVector<int64_t> aggregateToPV;
 
   bool isExplicitExpReduction() const { return qkMatmulOp != nullptr; }
+  bool hasScaledMmaOperands() const {
+    return queryScale && keyScale && scoreScale && valueScale;
+  }
 };
 
 static LogicalResult reconcileBounds(int64_t &bound, int64_t newBound) {
@@ -439,10 +446,15 @@ static bool isElementwiseSingleResult(linalg::GenericOp op) {
   return true;
 }
 
+static bool isAttentionScoreContraction(linalg::LinalgOp op) {
+  return linalg::isaContractionOpInterface(op) ||
+         IREE::LinalgExt::isaScaledContractionOpInterface(op);
+}
+
 static linalg::LinalgOp findContractionProducer(Value value) {
   while (Operation *producer = value.getDefiningOp()) {
     if (auto linalgOp = dyn_cast<linalg::LinalgOp>(producer)) {
-      if (linalg::isaContractionOpInterface(linalgOp) &&
+      if (isAttentionScoreContraction(linalgOp) &&
           linalgOp.getNumDpsInputs() >= 2 && linalgOp.getNumDpsInits() == 1 &&
           linalgOp->getNumResults() == 1) {
         return linalgOp;
@@ -473,7 +485,7 @@ static void collectContractionProducers(Value value,
   if (!linalgOp) {
     return;
   }
-  if (linalg::isaContractionOpInterface(linalgOp) &&
+  if (isAttentionScoreContraction(linalgOp) &&
       linalgOp.getNumDpsInputs() >= 2 && linalgOp.getNumDpsInits() == 1 &&
       linalgOp->getNumResults() == 1) {
     if (!llvm::is_contained(ops, linalgOp)) {
@@ -1207,6 +1219,12 @@ getExplicitAttentionConfigInfo(IREE::LinalgExt::ExpReductionOp op) {
   configInfo.query = qkOp.getDpsInputOperand(0)->get();
   configInfo.key = qkOp.getDpsInputOperand(1)->get();
   configInfo.value = op.getDpsInputOperand(1)->get();
+  if (qkOp.getNumDpsInputs() >= 4 && op.getNumDpsInputs() >= 4) {
+    configInfo.queryScale = qkOp.getDpsInputOperand(2)->get();
+    configInfo.keyScale = qkOp.getDpsInputOperand(3)->get();
+    configInfo.scoreScale = op.getDpsInputOperand(2)->get();
+    configInfo.valueScale = op.getDpsInputOperand(3)->get();
+  }
   configInfo.queryMap = queryMap;
   configInfo.keyMap = keyMap;
   configInfo.valueMap = *maybeVMap;
@@ -1222,7 +1240,9 @@ getExplicitAttentionConfigInfo(IREE::LinalgExt::ExpReductionOp op) {
 static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     IREE::GPU::TargetAttr target, mlir::FunctionOpInterface entryPoint,
     AttentionConfigInfo &configInfo) {
-  if (target.getWgp().getMma().empty()) {
+  bool useScaledMma = configInfo.hasScaledMmaOperands();
+  if ((!useScaledMma && target.getWgp().getMma().empty()) ||
+      (useScaledMma && target.getWgp().getScaledMma().empty())) {
     return failure();
   }
 
@@ -1292,29 +1312,53 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
     auto [aType, bType, cType] = mma.getABCElementTypes();
     intrinsics.emplace_back(mSize, nSize, kSize, aType, bType, cType, mma);
   };
+  auto storeScaledMmaInfo = [](IREE::GPU::ScaledMMAAttr mma,
+                               SmallVector<GPUIntrinsicType> &intrinsics) {
+    auto [mSize, nSize, kSize, kBSize] = mma.getScaledMNKShape();
+    SmallVector<Type> elementTypes;
+    mma.getElementTypes(elementTypes);
+    intrinsics.emplace_back(
+        GPUIntrinsicType({mSize}, {nSize}, {kSize, kBSize}, {},
+                         elementTypes[IREE::GPU::kScaledMMAOperandLhs],
+                         elementTypes[IREE::GPU::kScaledMMAOperandRhs],
+                         elementTypes[IREE::GPU::kScaledMMAOperandAcc], mma));
+  };
 
   SmallVector<GPUIntrinsicType> intrinsics;
-  intrinsics.reserve(target.getWgp().getMma().size());
   MLIRContext *context = configInfo.rootOp->getContext();
-  for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
-    if (mma.getSubgroupSize() != targetSubgroupSize) {
-      continue;
+  if (useScaledMma) {
+    intrinsics.reserve(target.getWgp().getScaledMma().size());
+    for (IREE::GPU::ScaledMMAAttr mma : target.getWgp().getScaledMma()) {
+      if (mma.getSubgroupSize() != targetSubgroupSize) {
+        continue;
+      }
+      if (!mma.getDistributionMappingKind()) {
+        continue;
+      }
+      storeScaledMmaInfo(mma, intrinsics);
     }
-    // Intrinsics without distribution mapping cannot be distributed.
-    if (!mma.getDistributionMappingKind()) {
-      continue;
-    }
-    // TODO: Enable block intrinsics for attention.
-    if (mma.isBlockIntrinsic()) {
-      continue;
-    }
-    storeMmaInfo(mma, intrinsics);
-    // Store info on virtual intrinsics based on current mma if any
-    for (IREE::GPU::VirtualMMAIntrinsic virtualIntrinsic :
-         mma.getVirtualIntrinsics()) {
-      auto virtualMma =
-          IREE::GPU::VirtualMMAAttr::get(context, virtualIntrinsic);
-      storeMmaInfo(virtualMma, intrinsics);
+  } else {
+    intrinsics.reserve(target.getWgp().getMma().size());
+    for (IREE::GPU::MMAAttr mma : target.getWgp().getMma()) {
+      if (mma.getSubgroupSize() != targetSubgroupSize) {
+        continue;
+      }
+      // Intrinsics without distribution mapping cannot be distributed.
+      if (!mma.getDistributionMappingKind()) {
+        continue;
+      }
+      // TODO: Enable block intrinsics for attention.
+      if (mma.isBlockIntrinsic()) {
+        continue;
+      }
+      storeMmaInfo(mma, intrinsics);
+      // Store info on virtual intrinsics based on current mma if any
+      for (IREE::GPU::VirtualMMAIntrinsic virtualIntrinsic :
+           mma.getVirtualIntrinsics()) {
+        auto virtualMma =
+            IREE::GPU::VirtualMMAAttr::get(context, virtualIntrinsic);
+        storeMmaInfo(virtualMma, intrinsics);
+      }
     }
   }
 
@@ -1329,6 +1373,14 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   Type kElementType = getElementTypeOrSelf(kMatrix);
   Type vElementType = getElementTypeOrSelf(vMatrix);
   Type f32Type = b.getF32Type();
+  Type qScaleElementType =
+      useScaledMma ? getElementTypeOrSelf(configInfo.queryScale) : nullptr;
+  Type kScaleElementType =
+      useScaledMma ? getElementTypeOrSelf(configInfo.keyScale) : nullptr;
+  Type scoreScaleElementType =
+      useScaledMma ? getElementTypeOrSelf(configInfo.scoreScale) : nullptr;
+  Type valueScaleElementType =
+      useScaledMma ? getElementTypeOrSelf(configInfo.valueScale) : nullptr;
   GPUMatmulShapeType qkMatmul{
       /*m=*/getDimBounds(mDims),
       /*n=*/getDimBounds(k2Dims),
@@ -1337,6 +1389,8 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
       /*a=*/qElementType,
       /*b=*/kElementType,
       /*c=*/f32Type,
+      /*aScale=*/qScaleElementType,
+      /*bScale=*/kScaleElementType,
   };
   GPUMatmulShapeType pvMatmul{/*m=*/getDimBounds(mDims),
                               /*n=*/getDimBounds(nDims),
@@ -1344,7 +1398,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
                               /*batch=*/getDimBounds(batchDims),
                               /*a=*/vElementType,
                               /*b=*/vElementType,
-                              /*c=*/f32Type};
+                              /*c=*/f32Type,
+                              /*aScale=*/scoreScaleElementType,
+                              /*bScale=*/valueScaleElementType};
 
   GPUMMAHeuristicSeeds pvMatmulSeeds = {/*bestSubgroupCountPerWorkgroup=*/4,
                                         /*bestMNTileCountPerSubgroup=*/4,
@@ -1474,6 +1530,12 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
       return IREE::GPU::VirtualMMAAttr::get(context, vmma.getIntrinsic(),
                                             /*colMajor=*/colMajor);
     }
+    if (auto scaledMma = dyn_cast<IREE::GPU::ScaledMMAAttr>(mmaKind)) {
+      return IREE::GPU::ScaledMMAAttr::get(
+          context, scaledMma.getIntrinsic(), scaledMma.getLhsElemType(),
+          scaledMma.getRhsElemType(), scaledMma.getAccElemType(),
+          /*colMajor=*/colMajor);
+    }
     // For intrinsics which do not have a known colMajor layout, just return the
     // original layout.
     return mmaKind;
@@ -1483,7 +1545,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
   SmallVector<NamedAttribute, 2> pvConfig;
 
   // Configuring for qk matmul.
-  appendPromotedOperandsListWithDerivedThread(context, qkConfig, {0, 1});
+  if (!useScaledMma) {
+    appendPromotedOperandsListWithDerivedThread(context, qkConfig, {0, 1});
+  }
   IREE::GPU::setMmaKind(context, qkConfig,
                         getIntrinsic(qkSchedule.mmaKind, useColMajor));
   IREE::GPU::setBasis(
@@ -1491,7 +1555,9 @@ static LogicalResult setAttentionIntrinsicBasedVectorDistributionConfig(
       projectBasisToOp(subgroupBasis, configInfo.aggregateToQK));
 
   // Configuring for pv matmul.
-  appendPromotedOperandsListWithDerivedThread(context, pvConfig, {1});
+  appendPromotedOperandsListWithDerivedThread(
+      context, pvConfig,
+      useScaledMma ? ArrayRef<int64_t>{1, 2, 3} : ArrayRef<int64_t>{1});
   IREE::GPU::setMmaKind(context, pvConfig,
                         getIntrinsic(pvSchedule.mmaKind, useColMajor));
   IREE::GPU::setBasis(
@@ -1730,6 +1796,32 @@ static LogicalResult setAttentionReductionConfig(
     reductionTileSizes[dim] = threadCount * subgroupCount;
   }
 
+  if (configInfo.isExplicitExpReduction() &&
+      configInfo.hasScaledMmaOperands()) {
+    workgroupTileSizes.assign(opInfo.getDomainRank(), 0);
+    reductionTileSizes.assign(opInfo.getDomainRank(), 0);
+
+    for (int64_t dim : opInfo.getBatchDims()) {
+      workgroupTileSizes[dim] = 1;
+    }
+    if (!opInfo.getMDims().empty()) {
+      workgroupTileSizes[opInfo.getMDims().back()] = targetSubgroupSize;
+    }
+    for (int64_t dim : opInfo.getNDims().drop_back()) {
+      workgroupTileSizes[dim] = 1;
+    }
+    for (int64_t dim : opInfo.getK2Dims()) {
+      reductionTileSizes[dim] = 32;
+    }
+
+    subgroupBasis.counts.assign(opInfo.getDomainRank(), 1);
+    subgroupBasis.mapping.resize(opInfo.getDomainRank());
+    std::iota(subgroupBasis.mapping.begin(), subgroupBasis.mapping.end(), 0);
+    if (!opInfo.getMDims().empty()) {
+      subgroupBasis.counts[opInfo.getMDims().back()] = 2;
+    }
+  }
+
   int64_t flatWorkgroupSize =
       targetSubgroupSize * ShapedType::getNumElements(subgroupBasis.counts);
   std::array<int64_t, 3> workgroupSize{flatWorkgroupSize, 1, 1};
@@ -1757,6 +1849,49 @@ static LogicalResult setAttentionReductionConfig(
   IREE::GPU::setBasis(
       context, pvConfig, IREE::GPU::TilingLevel::Thread,
       projectBasisToOp(pvThreadBasis, configInfo.aggregateToPV));
+
+  if (configInfo.hasScaledMmaOperands()) {
+    auto getScaledMma = [&](Type lhsType, Type rhsType,
+                            IREE::GPU::ScaledMMAIntrinsic preferredIntrinsic)
+        -> IREE::GPU::ScaledMMAAttr {
+      IREE::GPU::ScaledMMAAttr fallback;
+      for (IREE::GPU::ScaledMMAAttr mma : target.getWgp().getScaledMma()) {
+        SmallVector<Type> elementTypes;
+        mma.getElementTypes(elementTypes);
+        if (elementTypes[IREE::GPU::kScaledMMAOperandLhs] != lhsType ||
+            elementTypes[IREE::GPU::kScaledMMAOperandRhs] != rhsType ||
+            elementTypes[IREE::GPU::kScaledMMAOperandAcc] != b.getF32Type()) {
+          continue;
+        }
+        if (!mma.getDistributionMappingKind() ||
+            mma.getSubgroupSize() != targetSubgroupSize) {
+          continue;
+        }
+        if (!fallback) {
+          fallback = mma;
+        }
+        if (mma.getIntrinsic() == preferredIntrinsic) {
+          return mma;
+        }
+      }
+      return fallback;
+    };
+
+    Type qElementType = getElementTypeOrSelf(configInfo.query);
+    Type kElementType = getElementTypeOrSelf(configInfo.key);
+    Type vElementType = getElementTypeOrSelf(configInfo.value);
+    auto qkMma = getScaledMma(
+        qElementType, kElementType,
+        IREE::GPU::ScaledMMAIntrinsic::MFMA_SCALE_F32_16x16x128_B32);
+    auto pvMma = getScaledMma(
+        vElementType, vElementType,
+        IREE::GPU::ScaledMMAIntrinsic::MFMA_SCALE_F32_32x32x64_B32);
+    if (!qkMma || !pvMma) {
+      return failure();
+    }
+    IREE::GPU::setMmaKind(context, qkConfig, qkMma);
+    IREE::GPU::setMmaKind(context, pvConfig, pvMma);
+  }
 
   SmallVector<NamedAttribute, 5> rootAttrs = {NamedAttribute(
       "workgroup", b.getI64ArrayAttr(projectTileSizes(

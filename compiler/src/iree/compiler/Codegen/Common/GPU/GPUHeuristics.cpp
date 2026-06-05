@@ -30,6 +30,28 @@ using IREE::GPU::getSingleSubgroupLayout;
 // Threshold used to determine whether a matmul dimension is 'very skinny'.
 constexpr int64_t kVerySkinnyDimThreshold = 4;
 
+static bool isScaledMMA(IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  return isa<IREE::GPU::ScaledMMAAttr>(mmaKind);
+}
+
+static int64_t getMmaLhsOperandIndex(
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  return isScaledMMA(mmaKind) ? IREE::GPU::kScaledMMAOperandLhs
+                              : IREE::GPU::kMMAOperandLhs;
+}
+
+static int64_t getMmaRhsOperandIndex(
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  return isScaledMMA(mmaKind) ? IREE::GPU::kScaledMMAOperandRhs
+                              : IREE::GPU::kMMAOperandRhs;
+}
+
+static int64_t getMmaAccOperandIndex(
+    IREE::Codegen::InnerTileDescAttrInterface mmaKind) {
+  return isScaledMMA(mmaKind) ? IREE::GPU::kScaledMMAOperandAcc
+                              : IREE::GPU::kMMAOperandAcc;
+}
+
 template <typename T>
 static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
                                      const llvm::SmallVectorImpl<T> &vector) {
@@ -1157,25 +1179,27 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     for (unsigned pvIndex : pvViableIntrinsicIndices) {
       const GPUIntrinsicType &intrinsicA = intrinsics[qkIndex];
       const GPUIntrinsicType &intrinsicB = intrinsics[pvIndex];
-      if (!matchLayout(getSingleSubgroupLayout(intrinsicA.mmaKind,
-                                               IREE::GPU::kMMAOperandAcc),
-                       getSingleSubgroupLayout(intrinsicB.mmaKind,
-                                               IREE::GPU::kMMAOperandAcc))) {
+      if (!matchLayout(getSingleSubgroupLayout(
+                           intrinsicA.mmaKind,
+                           getMmaAccOperandIndex(intrinsicA.mmaKind)),
+                       getSingleSubgroupLayout(
+                           intrinsicB.mmaKind,
+                           getMmaAccOperandIndex(intrinsicB.mmaKind)))) {
         continue;
       }
 
       // Check if we can reuse the output of intrinsicA for lhs/rhs of
       // intrinsicB.
-      bool canReuseAOutForBLhs =
-          matchLayout(getSingleSubgroupLayout(intrinsicA.mmaKind,
-                                              IREE::GPU::kMMAOperandAcc),
-                      getSingleSubgroupLayout(intrinsicB.mmaKind,
-                                              IREE::GPU::kMMAOperandLhs));
-      bool canReuseAOutForBRhs =
-          matchLayout(getSingleSubgroupLayout(intrinsicA.mmaKind,
-                                              IREE::GPU::kMMAOperandAcc),
-                      getSingleSubgroupLayout(intrinsicB.mmaKind,
-                                              IREE::GPU::kMMAOperandRhs));
+      bool canReuseAOutForBLhs = matchLayout(
+          getSingleSubgroupLayout(intrinsicA.mmaKind,
+                                  getMmaAccOperandIndex(intrinsicA.mmaKind)),
+          getSingleSubgroupLayout(intrinsicB.mmaKind,
+                                  getMmaLhsOperandIndex(intrinsicB.mmaKind)));
+      bool canReuseAOutForBRhs = matchLayout(
+          getSingleSubgroupLayout(intrinsicA.mmaKind,
+                                  getMmaAccOperandIndex(intrinsicA.mmaKind)),
+          getSingleSubgroupLayout(intrinsicB.mmaKind,
+                                  getMmaRhsOperandIndex(intrinsicB.mmaKind)));
       intrinsicPairs.push_back(
           {intrinsicA, intrinsicB, canReuseAOutForBLhs || canReuseAOutForBRhs});
     }
@@ -1206,9 +1230,8 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
         getOptimalAttentionPVSchedule(pvMatmul, intrinsicB, pvMatmulSeeds);
 
     LDBG() << "Chosen MMA schedule:\n" << schedule;
-    int64_t intrinsicAM = intrinsicA.mSizes[0];
-    int64_t intrinsicAN = intrinsicA.nSizes[0];
-    int64_t intrinsicAK = intrinsicA.kSizes[0];
+    int64_t intrinsicAM = llvm::product_of(intrinsicA.mSizes);
+    int64_t intrinsicAN = llvm::product_of(intrinsicA.nSizes);
     auto isValidSchedule = [&](const GPUMMASchedule &schedule) -> bool {
       // The output of the QK matmul must be a valid LHS of the PV matmul.
       // The total LHS tile (M x K) of the PV matmul must be a multiple of
@@ -1227,16 +1250,23 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
       // qkMatmul.K = problem.K1
       int64_t qkNTiles = pvKTile / intrinsicAN;
       SmallVector<int64_t, 2> qkKSizes = qkMatmul.kSizes;
-      qkKSizes.back() = qkMatmul.kSizes.back() / intrinsicAK;
+      MutableArrayRef<int64_t> qkInnerKSizes(qkKSizes);
+      qkInnerKSizes = qkInnerKSizes.take_back(intrinsicA.kSizes.size());
+      for (auto [qkKSize, intrinsicKSize] :
+           llvm::zip_equal(qkInnerKSizes, intrinsicA.kSizes)) {
+        qkKSize = llvm::divideCeil(qkKSize, intrinsicKSize);
+      }
+      SmallVector<int64_t, 2> qkNTileSizes(qkMatmul.nSizes.size(), 1);
+      qkNTileSizes.back() = qkNTiles;
       GPUMMASchedule qkSchedule{
           intrinsicA.mmaKind,
-          intrinsicAM,
-          intrinsicAN,
-          intrinsicAK,
+          intrinsicA.mSizes,
+          intrinsicA.nSizes,
+          intrinsicA.kSizes,
           /*mSubgroupCount=*/schedule.mSubgroupCounts,
           /*nSubgroupCount=*/SmallVector<int64_t>(qkMatmul.nSizes.size(), 1),
           schedule.mTileSizes,
-          {qkNTiles},
+          qkNTileSizes,
           qkKSizes};
 
       bool isQKAligned =
@@ -1283,16 +1313,23 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
         pvSchedule->getTotalKTileSize() * pvSchedule->getTotalKSize();
     int64_t qkNTiles = pvKTile / intrinsicAN;
     SmallVector<int64_t, 2> qkKSizes = qkMatmul.kSizes;
-    qkKSizes.back() = qkMatmul.kSizes.back() / intrinsicAK;
+    MutableArrayRef<int64_t> qkInnerKSizes(qkKSizes);
+    qkInnerKSizes = qkInnerKSizes.take_back(intrinsicA.kSizes.size());
+    for (auto [qkKSize, intrinsicKSize] :
+         llvm::zip_equal(qkInnerKSizes, intrinsicA.kSizes)) {
+      qkKSize = llvm::divideCeil(qkKSize, intrinsicKSize);
+    }
+    SmallVector<int64_t, 2> qkNTileSizes(qkMatmul.nSizes.size(), 1);
+    qkNTileSizes.back() = qkNTiles;
     GPUMMASchedule qkSchedule{
         intrinsicA.mmaKind,
-        pvSchedule->mSizes,
-        {intrinsicAN},
-        {intrinsicAK},
+        intrinsicA.mSizes,
+        intrinsicA.nSizes,
+        intrinsicA.kSizes,
         /*mSubgroupCount=*/pvSchedule->mSubgroupCounts,
         /*nSubgroupCount=*/SmallVector<int64_t>(qkMatmul.nSizes.size(), 1),
         pvSchedule->mTileSizes,
-        {qkNTiles},
+        qkNTileSizes,
         qkKSizes};
 
     return std::pair(qkSchedule, pvSchedule.value());

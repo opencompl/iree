@@ -32,9 +32,76 @@ struct GPUPackToIntrinsicsPass final
 };
 } // namespace
 
+static void eraseDim(SmallVectorImpl<unsigned> &dims, unsigned dim) {
+  llvm::erase(dims, dim);
+}
+
+static void addSortedDim(SmallVectorImpl<unsigned> &dims, unsigned dim) {
+  if (llvm::is_contained(dims, dim)) {
+    return;
+  }
+  dims.push_back(dim);
+  llvm::sort(dims);
+}
+
+static SmallVector<unsigned>
+getPartialReductionDims(IREE::GPU::LoweringConfigAttr config, int64_t rank) {
+  SmallVector<unsigned> dims;
+  ArrayAttr partialReduction =
+      config.getAttributes().getAs<ArrayAttr>("partial_reduction");
+  if (!partialReduction) {
+    return dims;
+  }
+  for (auto [index, attr] : llvm::enumerate(partialReduction)) {
+    auto intAttr = dyn_cast<IntegerAttr>(attr);
+    if (!intAttr || intAttr.getInt() <= 0 || index >= rank) {
+      continue;
+    }
+    dims.push_back(index);
+  }
+  return dims;
+}
+
+static void recoverPartialReducedScaledDims(
+    IREE::LinalgExt::ScaledContractionDimensions &dims,
+    ArrayRef<AffineMap> indexingMaps, IREE::GPU::LoweringConfigAttr config,
+    int64_t rank) {
+  if (!dims.k.empty() && !dims.kB.empty()) {
+    return;
+  }
+
+  for (unsigned dim : getPartialReductionDims(config, rank)) {
+    bool inLhs = indexingMaps[IREE::GPU::kScaledMMAOperandLhs].isFunctionOfDim(
+        dim);
+    bool inRhs = indexingMaps[IREE::GPU::kScaledMMAOperandRhs].isFunctionOfDim(
+        dim);
+    bool inLhsScale =
+        indexingMaps[IREE::GPU::kScaledMMAOperandLhsScale].isFunctionOfDim(dim);
+    bool inRhsScale =
+        indexingMaps[IREE::GPU::kScaledMMAOperandRhsScale].isFunctionOfDim(dim);
+
+    if (!inLhs || !inRhs) {
+      continue;
+    }
+
+    eraseDim(dims.batch, dim);
+    eraseDim(dims.m, dim);
+    eraseDim(dims.n, dim);
+
+    if (inLhsScale && inRhsScale) {
+      addSortedDim(dims.k, dim);
+      continue;
+    }
+    if (!inLhsScale && !inRhsScale) {
+      addSortedDim(dims.kB, dim);
+    }
+  }
+}
+
 FailureOr<SmallVector<OpFoldResult>>
 getPackedSizes(linalg::LinalgOp linalgOp, RewriterBase &rewriter,
-               IREE::Codegen::InnerTileDescAttrInterface kind) {
+               IREE::Codegen::InnerTileDescAttrInterface kind,
+               IREE::GPU::LoweringConfigAttr loweringConfig) {
   auto createPackedSizes =
       [&rewriter, &linalgOp](SmallVector<int64_t> dims,
                              SmallVector<SmallVector<unsigned, 2>> indices)
@@ -58,6 +125,9 @@ getPackedSizes(linalg::LinalgOp linalgOp, RewriterBase &rewriter,
     FailureOr<IREE::LinalgExt::ScaledContractionDimensions> scaledContrDims =
         IREE::LinalgExt::inferScaledContractionDims(linalgOp);
     if (succeeded(scaledContrDims)) {
+      recoverPartialReducedScaledDims(
+          *scaledContrDims, linalgOp.getIndexingMapsArray(), loweringConfig,
+          linalgOp.getNumLoops());
       auto [m, n, k, kB] = smmaKind.getScaledMNKShape();
       indices = {scaledContrDims->m, scaledContrDims->n, scaledContrDims->k,
                  scaledContrDims->kB};
@@ -97,7 +167,7 @@ LogicalResult packToIntrinsic(linalg::LinalgOp linalgOp,
   IREE::Codegen::InnerTileDescAttrInterface kind = getMmaKind(loweringConfig);
   assert(kind && "Packing op without mma kind");
   FailureOr<SmallVector<OpFoldResult>> packedSizes =
-      getPackedSizes(linalgOp, rewriter, kind);
+      getPackedSizes(linalgOp, rewriter, kind, loweringConfig);
   FailureOr<linalg::PackResult> maybeResult =
       linalg::pack(rewriter, linalgOp, packedSizes.value());
   if (failed(maybeResult)) {

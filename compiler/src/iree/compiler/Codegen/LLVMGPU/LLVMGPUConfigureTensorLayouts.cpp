@@ -145,6 +145,76 @@ formatScaledDims(IREE::LinalgExt::ScaledContractionDimensions dims) {
   return storage;
 }
 
+static bool containsDim(SmallVectorImpl<unsigned> &dims, unsigned dim) {
+  return llvm::is_contained(dims, dim);
+}
+
+static void eraseDim(SmallVectorImpl<unsigned> &dims, unsigned dim) {
+  llvm::erase(dims, dim);
+}
+
+static void addSortedDim(SmallVectorImpl<unsigned> &dims, unsigned dim) {
+  if (containsDim(dims, dim)) {
+    return;
+  }
+  dims.push_back(dim);
+  llvm::sort(dims);
+}
+
+static SmallVector<unsigned>
+getPartialReductionDims(IREE::GPU::LoweringConfigAttr config, int64_t rank) {
+  SmallVector<unsigned> dims;
+  ArrayAttr partialReduction =
+      config.getAttributes().getAs<ArrayAttr>("partial_reduction");
+  if (!partialReduction) {
+    return dims;
+  }
+  for (auto [index, attr] : llvm::enumerate(partialReduction)) {
+    auto intAttr = dyn_cast<IntegerAttr>(attr);
+    if (!intAttr || intAttr.getInt() <= 0 || index >= rank) {
+      continue;
+    }
+    dims.push_back(index);
+  }
+  return dims;
+}
+
+static void recoverPartialReducedScaledDims(
+    IREE::LinalgExt::ScaledContractionDimensions &dims,
+    ArrayRef<AffineMap> indexingMaps, IREE::GPU::LoweringConfigAttr config,
+    int64_t rank) {
+  if (!dims.k.empty() && !dims.kB.empty()) {
+    return;
+  }
+
+  for (unsigned dim : getPartialReductionDims(config, rank)) {
+    bool inLhs = indexingMaps[IREE::GPU::kScaledMMAOperandLhs].isFunctionOfDim(
+        dim);
+    bool inRhs = indexingMaps[IREE::GPU::kScaledMMAOperandRhs].isFunctionOfDim(
+        dim);
+    bool inLhsScale =
+        indexingMaps[IREE::GPU::kScaledMMAOperandLhsScale].isFunctionOfDim(dim);
+    bool inRhsScale =
+        indexingMaps[IREE::GPU::kScaledMMAOperandRhsScale].isFunctionOfDim(dim);
+
+    if (!inLhs || !inRhs) {
+      continue;
+    }
+
+    eraseDim(dims.batch, dim);
+    eraseDim(dims.m, dim);
+    eraseDim(dims.n, dim);
+
+    if (inLhsScale && inRhsScale) {
+      addSortedDim(dims.k, dim);
+      continue;
+    }
+    if (!inLhsScale && !inRhsScale) {
+      addSortedDim(dims.kB, dim);
+    }
+  }
+}
+
 static FailureOr<IREE::GPU::Basis>
 getBasisWithFullRankMapping(IREE::GPU::Basis basis, int64_t rank) {
   if (static_cast<int64_t>(basis.mapping.size()) == rank) {
@@ -659,6 +729,8 @@ getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
   }
 
   IREE::LinalgExt::ScaledContractionDimensions dims = *maybeDims;
+  int64_t rank = bounds.size();
+  recoverPartialReducedScaledDims(dims, indexingMaps, config, rank);
   if (dims.m.empty() || dims.n.empty() || dims.k.empty() || dims.kB.empty()) {
     candidate->emitRemark()
         << "scaled-contraction-layout: inferred incomplete dimensions "
@@ -667,7 +739,6 @@ getScaledContractionLayout(Operation *candidate, ArrayRef<int64_t> bounds,
     return failure();
   }
 
-  int64_t rank = bounds.size();
   int64_t innerMDim = dims.m.back();
   int64_t innerNDim = dims.n.back();
   int64_t innerKDim = dims.k.back();
