@@ -1,4 +1,5 @@
 // Copyright 2024 The IREE Authors
+
 //
 // Licensed under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -2775,11 +2776,48 @@ reduceExpReductionPartialResult(ExpReductionOp op, AffineMap partialMap,
       });
 }
 
+static bool usesLsePartialReductionCombiner(ExpReductionOp op) {
+  Attribute loweringConfig = op->getAttr("lowering_config");
+  if (!loweringConfig) {
+    return false;
+  }
+  bool found = false;
+  loweringConfig.walkImmediateSubElements(
+      [&](Attribute attr) {
+        if (found) {
+          return;
+        }
+        auto dictAttr = dyn_cast<DictionaryAttr>(attr);
+        if (!dictAttr) {
+          return;
+        }
+        auto combiner =
+            dictAttr.getAs<StringAttr>("partial_reduction_combiner");
+        found = combiner && combiner.getValue() == "lse";
+      },
+      [](Type) {});
+  return found;
+}
+
 FailureOr<MergeResult> ExpReductionOp::mergeReductions(
     OpBuilder &b, Location loc, ValueRange partialReduce,
     const llvm::SetVector<unsigned> &reductionDims) {
   SmallVector<AffineMap> partialMaps =
       getExpReductionPartialResultMaps(*this, reductionDims);
+
+  if (usesLsePartialReductionCombiner(*this)) {
+    SmallVector<Operation *> mergeOps;
+    SmallVector<Value> replacements(getNumDpsInits());
+    for (auto resultNumber : llvm::seq<int64_t>(0, getNumDpsInits())) {
+      linalg::ReduceOp reduce = reduceExpReductionPartialResult<arith::AddFOp>(
+          *this, partialMaps[resultNumber], reductionDims, b, loc,
+          partialReduce[resultNumber],
+          getDpsInitOperand(resultNumber)->get());
+      mergeOps.push_back(reduce);
+      replacements[resultNumber] = reduce.getResult(0);
+    }
+    return MergeResult{mergeOps, replacements};
+  }
 
   linalg::ReduceOp reducedMax =
       reduceExpReductionPartialResult<arith::MaximumFOp>(

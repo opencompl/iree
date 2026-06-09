@@ -14,6 +14,7 @@ iree_cc_library(
   NAME
     IR
   HDRS
+    "ExpReducePartialReductionOptions.h"
     "FormattingUtils.h"
     "Im2colUtils.h"
     "LinalgExtAttrs.h.inc"
@@ -29,6 +30,7 @@ iree_cc_library(
     "LinalgExtOps.h.inc"
   SRCS
     "AggregatedOpInterfaceImpl.cpp"
+    "ExpReducePartialReductionOptions.cpp"
     "Im2colUtils.cpp"
     "LinalgExtAttrs.cpp.inc"
     "LinalgExtDialect.cpp"

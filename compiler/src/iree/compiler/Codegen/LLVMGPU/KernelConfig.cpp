@@ -23,6 +23,7 @@
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/LinalgExt/IR/ExpReducePartialReductionOptions.h"
 #include "iree/compiler/Dialect/LinalgExt/IR/LinalgExtOps.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/IndexingUtils.h"
 #include "iree/compiler/Dialect/LinalgExt/Utils/MatchUtils.h"
@@ -48,11 +49,6 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
-
-static llvm::cl::opt<bool> clEnablePartialReduction(
-    "iree-codegen-enable-partial-reduction",
-    llvm::cl::desc("Enable materializing partial_reduction lowering configs."),
-    llvm::cl::init(true));
 
 #define DEBUG_TYPE "iree-llvmgpu-kernel-config"
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
@@ -1896,7 +1892,7 @@ static LogicalResult setAttentionReductionConfig(
   SmallVector<NamedAttribute, 5> rootAttrs = {NamedAttribute(
       "workgroup", b.getI64ArrayAttr(projectTileSizes(
                        workgroupTileSizes, configInfo.aggregateToRoot)))};
-  if (clEnablePartialReduction) {
+  if (IREE::LinalgExt::isExpReducePartialReductionEnabled()) {
     rootAttrs.push_back(
         NamedAttribute("partial_reduction",
                        b.getI64ArrayAttr(projectTileSizes(
