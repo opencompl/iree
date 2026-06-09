@@ -36,6 +36,7 @@
 #include "llvm/Support/DebugLog.h"
 #include "llvm/Support/InterleavedRange.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/MathExtras.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Transforms/Transforms.h"
@@ -1609,6 +1610,48 @@ struct AttentionReductionHeuristicSeeds {
   int64_t valueVectorSize;
 };
 
+static std::optional<int64_t>
+estimateAttentionReductionWorkgroupCount(ArrayRef<int64_t> bounds,
+                                         ArrayRef<int64_t> workgroupTileSizes) {
+  if (bounds.size() != workgroupTileSizes.size()) {
+    return std::nullopt;
+  }
+
+  int64_t workgroupCount = 1;
+  for (auto [bound, tileSize] : llvm::zip_equal(bounds, workgroupTileSizes)) {
+    if (tileSize <= 0) {
+      continue;
+    }
+    if (ShapedType::isDynamic(bound)) {
+      return std::nullopt;
+    }
+    workgroupCount *= llvm::divideCeil(bound, tileSize);
+  }
+  return workgroupCount;
+}
+
+static bool shouldUseAttentionReductionPartialReduction(
+    IREE::GPU::TargetAttr target, ArrayRef<int64_t> bounds,
+    ArrayRef<int64_t> workgroupTileSizes) {
+  if (!IREE::LinalgExt::isExpReducePartialReductionEnabled()) {
+    return false;
+  }
+
+  std::optional<int64_t> workgroupCount =
+      estimateAttentionReductionWorkgroupCount(bounds, workgroupTileSizes);
+  if (!workgroupCount) {
+    // For dynamic shapes, keep partial reduction available because the compiler
+    // cannot prove that the runtime problem has enough parallel work.
+    return true;
+  }
+
+  IREE::GPU::TargetChipAttr chip = target.getChip();
+  int64_t numWGPs = chip ? chip.getWgpCount() : 512;
+  int64_t numSIMDs = target.getWgp().getSimdsPerWgp().value_or(4);
+  int64_t saturationWorkgroups = numWGPs * numSIMDs;
+  return *workgroupCount < saturationWorkgroups;
+}
+
 static LogicalResult setAttentionReductionConfig(
     AttentionReductionHeuristicSeeds &seeds, IREE::GPU::TargetAttr target,
     FunctionOpInterface entryPoint, AttentionConfigInfo &configInfo) {
@@ -1618,6 +1661,7 @@ static LogicalResult setAttentionReductionConfig(
   // Get iteration domain bounds.
   OpBuilder b(configInfo.rootOp);
   SmallVector<int64_t> bounds = configInfo.bounds;
+  SmallVector<int64_t> originalBounds = bounds;
   IREE::LinalgExt::AttentionOpDetail &opInfo = configInfo.opInfo;
 
   // Distribute the 'available' resource to the basis on the given dimensions.
@@ -1792,8 +1836,9 @@ static LogicalResult setAttentionReductionConfig(
     reductionTileSizes[dim] = threadCount * subgroupCount;
   }
 
-  if (configInfo.isExplicitExpReduction() &&
-      configInfo.hasScaledMmaOperands()) {
+  bool isExplicitScaledExpReduction =
+      configInfo.isExplicitExpReduction() && configInfo.hasScaledMmaOperands();
+  if (isExplicitScaledExpReduction) {
     workgroupTileSizes.assign(opInfo.getDomainRank(), 0);
     reductionTileSizes.assign(opInfo.getDomainRank(), 0);
 
@@ -1892,7 +1937,8 @@ static LogicalResult setAttentionReductionConfig(
   SmallVector<NamedAttribute, 5> rootAttrs = {NamedAttribute(
       "workgroup", b.getI64ArrayAttr(projectTileSizes(
                        workgroupTileSizes, configInfo.aggregateToRoot)))};
-  if (IREE::LinalgExt::isExpReducePartialReductionEnabled()) {
+  if (shouldUseAttentionReductionPartialReduction(target, originalBounds,
+                                                  workgroupTileSizes)) {
     rootAttrs.push_back(
         NamedAttribute("partial_reduction",
                        b.getI64ArrayAttr(projectTileSizes(
