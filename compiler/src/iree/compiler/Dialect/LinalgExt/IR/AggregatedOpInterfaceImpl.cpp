@@ -209,9 +209,8 @@ static Value applyPostQKMatmulElementwise(OpBuilder &builder, Location loc,
   // Convert iree_linalg_ext.index -> linalg.index in the cloned region.
   Block &block = dstRegion.back();
   SmallVector<IREE::LinalgExt::IndexOp> indexOps;
-  genericOp->walk([&](IREE::LinalgExt::IndexOp indexOp) {
-    indexOps.push_back(indexOp);
-  });
+  genericOp->walk(
+      [&](IREE::LinalgExt::IndexOp indexOp) { indexOps.push_back(indexOp); });
   for (auto indexOp : indexOps) {
     OpBuilder::InsertionGuard g(builder);
     builder.setInsertionPoint(indexOp);
@@ -1185,10 +1184,32 @@ static bool isI8CarrierToF4Cast(Operation *op) {
     Type inputType = getElementTypeOrSelf(bitcastOp.getIn().getType());
     auto resultType =
         dyn_cast<FloatType>(getElementTypeOrSelf(bitcastOp.getOut()));
-    return inputType.isInteger(4) && resultType &&
-           resultType.getWidth() == 4;
+    return inputType.isInteger(4) && resultType && resultType.getWidth() == 4;
   }
   return false;
+}
+
+static bool isI8CarrierForF4(Type actualType, Type expectedType) {
+  auto expectedFloatType =
+      dyn_cast<FloatType>(getElementTypeOrSelf(expectedType));
+  return expectedFloatType && expectedFloatType.getWidth() == 4 &&
+         getElementTypeOrSelf(actualType).isInteger(8);
+}
+
+static bool isI8CarrierCastToF4(Value value, Value expectedSource,
+                                Type expectedF4Type) {
+  auto bitcastOp = value.getDefiningOp<arith::BitcastOp>();
+  if (!bitcastOp || getElementTypeOrSelf(bitcastOp.getOut().getType()) !=
+                        getElementTypeOrSelf(expectedF4Type)) {
+    return false;
+  }
+  if (!getElementTypeOrSelf(bitcastOp.getIn().getType()).isInteger(4)) {
+    return false;
+  }
+  auto truncOp = bitcastOp.getIn().getDefiningOp<arith::TruncIOp>();
+  return truncOp && truncOp.getIn() == expectedSource &&
+         getElementTypeOrSelf(truncOp.getIn().getType()).isInteger(8) &&
+         getElementTypeOrSelf(truncOp.getOut().getType()).isInteger(4);
 }
 
 /// For a given `resultNumber` in a linalg::GenericOp, this op scans the
@@ -1690,8 +1711,8 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
       Value extractedValue =
           mapping.lookup(op.getOperand(extraction->blockArgOperandIndex));
       if (shouldExtractAsI8Carrier(&op)) {
-        extractedValue = castI8CarrierToF4(rewriter, op.getLoc(),
-                                           extractedValue, op.getResult(0).getType());
+        extractedValue = castI8CarrierToF4(
+            rewriter, op.getLoc(), extractedValue, op.getResult(0).getType());
       }
       mapping.map(op.getResult(0), extractedValue);
       continue;
@@ -1820,10 +1841,15 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
                         ArrayRef<Type> expectedElementTypes, Value value,
                         unsigned operandIndex) {
   auto verifySource = [&](Value source, unsigned sourceIndex,
-                          StringRef description) -> LogicalResult {
+                          StringRef description,
+                          Type expectedF4Type = Type()) -> LogicalResult {
     Block &body = genericOp.getRegion().front();
     Value expectedArg = body.getArgument(sourceIndex);
     if (source != expectedArg) {
+      if (expectedF4Type &&
+          isI8CarrierCastToF4(source, expectedArg, expectedF4Type)) {
+        return success();
+      }
       return emitInnerTiledMatmulVerifierError(
           genericOp, loweringConfig, mmaKind,
           Twine(description) + " for mulf operand " + Twine(operandIndex) +
@@ -1896,7 +1922,7 @@ verifyMatmulOperandCast(linalg::GenericOp genericOp, Attribute loweringConfig,
               ", but mma_kind expects " + Twine(formatType(expectedScaleType)));
     }
     if (failed(verifySource(scalingExtfOp->getOperand(0), operandIndex,
-                            "scaling_extf value input"))) {
+                            "scaling_extf value input", expectedInputType))) {
       return failure();
     }
     if (failed(verifySource(scalingExtfOp->getOperand(1), operandIndex + 2,
@@ -1948,8 +1974,7 @@ static LogicalResult verifyInnerTiledLoweringShape(
           IREE::GPU::kScaledMMAOperandAcc}) {
       auto operandType = dyn_cast<RankedTensorType>(
           genericOp->getOperand(operandIndex).getType());
-      if (!operandType ||
-          operandType.getElementType() != expectedElementTypes[operandIndex]) {
+      if (!operandType) {
         return emitInnerTiledMatmulVerifierError(
             genericOp, loweringConfig, mmaKind,
             Twine("operand #") + Twine(operandIndex) + " has element type " +
@@ -1957,6 +1982,21 @@ static LogicalResult verifyInnerTiledLoweringShape(
                     genericOp->getOperand(operandIndex).getType()))) +
                 ", but mma_kind expects " +
                 Twine(formatType(expectedElementTypes[operandIndex])));
+      }
+      Type actualElementType = operandType.getElementType();
+      Type expectedElementType = expectedElementTypes[operandIndex];
+      bool isScaledMmaValueOperand =
+          operandIndex == IREE::GPU::kScaledMMAOperandLhs ||
+          operandIndex == IREE::GPU::kScaledMMAOperandRhs;
+      if (actualElementType != expectedElementType &&
+          !(isScaledMmaValueOperand &&
+            isI8CarrierForF4(actualElementType, expectedElementType))) {
+        return emitInnerTiledMatmulVerifierError(
+            genericOp, loweringConfig, mmaKind,
+            Twine("operand #") + Twine(operandIndex) + " has element type " +
+                Twine(formatType(actualElementType)) +
+                ", but mma_kind expects " +
+                Twine(formatType(expectedElementType)));
       }
     }
     return success();
@@ -2192,8 +2232,8 @@ decomposeMultipleResults(linalg::GenericOp genericOp, RewriterBase &rewriter) {
       if (hasContractionIndexing) {
         if (auto mmaKind = getMmaKind(loweringConfig)) {
           if (!hasPartialReduction(loweringConfig) &&
-              failed(verifyInnerTiledMatmulFma(newOp, loweringConfig,
-                                               mmaKind))) {
+              failed(
+                  verifyInnerTiledMatmulFma(newOp, loweringConfig, mmaKind))) {
             return failure();
           }
         }

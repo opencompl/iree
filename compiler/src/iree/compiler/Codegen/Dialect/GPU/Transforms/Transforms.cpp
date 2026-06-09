@@ -1203,12 +1203,48 @@ convertScaledContractionToInnerTiledMma(
 
   ValueRange inputs = linalgOp->getOperands();
 
+  auto isI8CarrierForF4Operand = [&](int operandIndex,
+                                     Type expectedType) -> bool {
+    auto expectedFloatType =
+        dyn_cast<FloatType>(getElementTypeOrSelf(expectedType));
+    if (!expectedFloatType || expectedFloatType.getWidth() != 4) {
+      return false;
+    }
+    auto operandType =
+        dyn_cast<RankedTensorType>(inputs[operandIndex].getType());
+    if (!operandType || !operandType.getElementType().isInteger(8)) {
+      return false;
+    }
+
+    Block &body = linalgOp->getRegion(0).front();
+    BlockArgument arg = body.getArgument(operandIndex);
+    if (!arg.hasOneUse()) {
+      return false;
+    }
+    auto truncOp = dyn_cast<arith::TruncIOp>(*arg.user_begin());
+    if (!truncOp || !truncOp.getOut().hasOneUse() ||
+        !getElementTypeOrSelf(truncOp.getOut().getType()).isInteger(4)) {
+      return false;
+    }
+    auto bitcastOp = dyn_cast<arith::BitcastOp>(*truncOp.getOut().user_begin());
+    if (!bitcastOp || !bitcastOp.getOut().hasOneUse() ||
+        getElementTypeOrSelf(bitcastOp.getOut().getType()) != expectedType) {
+      return false;
+    }
+    return isa<arith::ScalingExtFOp>(*bitcastOp.getOut().user_begin());
+  };
+
   SmallVector<Type> eltTypes;
   smmaKind.getElementTypes(eltTypes);
   for (int i :
        {kScaledMMAOperandLhs, kScaledMMAOperandRhs, kScaledMMAOperandAcc}) {
-    if (cast<RankedTensorType>(inputs[i].getType()).getElementType() !=
-        eltTypes[i]) {
+    Type actualElementType =
+        cast<RankedTensorType>(inputs[i].getType()).getElementType();
+    Type expectedElementType = eltTypes[i];
+    bool isValueOperand =
+        i == kScaledMMAOperandLhs || i == kScaledMMAOperandRhs;
+    if (actualElementType != expectedElementType &&
+        !(isValueOperand && isI8CarrierForF4Operand(i, expectedElementType))) {
       return failure();
     }
   }

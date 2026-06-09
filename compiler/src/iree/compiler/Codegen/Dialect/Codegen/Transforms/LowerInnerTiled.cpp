@@ -7,8 +7,10 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/Transforms/Transforms.h"
 #include "iree/compiler/Dialect/Util/IR/UtilOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeUtilities.h"
 
 namespace mlir::iree_compiler::IREE::Codegen {
 
@@ -24,6 +26,20 @@ static constexpr llvm::StringLiteral kAddUnitDims = "add_unit_dims";
 //===----------------------------------------------------------------------===//
 // InnerTiledOp lowering to underlying operation
 //===----------------------------------------------------------------------===//
+
+static bool isI8CarrierForF4(Value value, VectorType intrinsicType) {
+  auto valueType = dyn_cast<VectorType>(value.getType());
+  auto intrinsicElementType =
+      dyn_cast<FloatType>(intrinsicType.getElementType());
+  return valueType && intrinsicElementType &&
+         intrinsicElementType.getWidth() == 4 &&
+         valueType.getElementType().isInteger(8);
+}
+
+static VectorType cloneWithIntegerElementType(VectorType type,
+                                              unsigned bitWidth) {
+  return type.clone(IntegerType::get(type.getContext(), bitWidth));
+}
 
 namespace {
 struct LowerInnerTiledPattern final
@@ -49,6 +65,21 @@ struct LowerInnerTiledPattern final
     int64_t numInputs = tiledOp.getNumInputs();
 
     for (int64_t i = 0; i < numInputs; ++i) {
+      if (isI8CarrierForF4(operands[i], regTypes[i])) {
+        VectorType i8RegType =
+            cloneWithIntegerElementType(regTypes[i], /*bitWidth=*/8);
+        if (operands[i].getType() != i8RegType) {
+          operands[i] = vector::ShapeCastOp::create(rewriter, tiledOp.getLoc(),
+                                                    i8RegType, operands[i]);
+        }
+        VectorType i4RegType =
+            cloneWithIntegerElementType(regTypes[i], /*bitWidth=*/4);
+        Value i4Value = arith::TruncIOp::create(rewriter, tiledOp.getLoc(),
+                                                i4RegType, operands[i]);
+        operands[i] = arith::BitcastOp::create(rewriter, tiledOp.getLoc(),
+                                               regTypes[i], i4Value);
+        continue;
+      }
       if (operands[i].getType() != regTypes[i]) {
         operands[i] = vector::ShapeCastOp::create(rewriter, tiledOp.getLoc(),
                                                   regTypes[i], operands[i]);

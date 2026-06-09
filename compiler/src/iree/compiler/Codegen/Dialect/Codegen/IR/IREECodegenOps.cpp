@@ -233,7 +233,14 @@ InnerTiledOp::inferReturnTypes(MLIRContext *, std::optional<Location>,
 //     from each side.
 static bool matchTileTypes(RankedTensorType tensorTileType,
                            VectorType vectorType, bool opaqueSemantics) {
-  if (tensorTileType.getElementType() != vectorType.getElementType()) {
+  auto isI8CarrierForF4Tile = [&]() {
+    auto vectorElementType = dyn_cast<FloatType>(vectorType.getElementType());
+    return opaqueSemantics && vectorElementType &&
+           vectorElementType.getWidth() == 4 &&
+           tensorTileType.getElementType().isInteger(8);
+  };
+  if (tensorTileType.getElementType() != vectorType.getElementType() &&
+      !isI8CarrierForF4Tile()) {
     return false;
   }
 
