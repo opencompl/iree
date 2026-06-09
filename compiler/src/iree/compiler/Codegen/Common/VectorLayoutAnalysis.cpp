@@ -6,7 +6,6 @@
 
 #include "iree/compiler/Codegen/Common/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
-#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
 
@@ -140,14 +139,6 @@ void LayoutAnalysis::seed(Operation *root) {
   root->walk([&](ToLayoutOp toLayout) {
     LDBG() << "Seeding layout from to_layout op: " << toLayout << "\n";
     addCandidate(toLayout.getResult(), toLayout.getLayout());
-  });
-  root->walk([&](IREE::Codegen::PackedScalingTruncFOp op) {
-    auto layout = dyn_cast<VectorLayoutInterface>(op.getLayout());
-    if (!layout) {
-      return;
-    }
-    LDBG() << "Seeding layout from packed_scaling_truncf op: " << op << "\n";
-    addCandidate(op.getResult(), layout);
   });
 }
 
@@ -395,22 +386,6 @@ void LayoutAnalysis::fixupOp(Operation *op) {
     VectorLayoutInterface layout = getResolvedLayout(op->getResult(0));
     for (OpOperand &operand : op->getOpOperands()) {
       setLayoutOrClone(&operand, layout);
-    }
-    return;
-  }
-
-  // packed_scaling_truncf has elementwise semantics, but it is a layout
-  // boundary: operands can be produced in their natural layouts while the
-  // result is anchored to the packed MFMA operand layout. Only assign fallback
-  // operand layouts when analysis did not resolve one; inserting a to_layout
-  // here would leave a non-trivial distribution cast for this op to bridge.
-  if (auto packedTrunc = dyn_cast<IREE::Codegen::PackedScalingTruncFOp>(op)) {
-    VectorLayoutInterface layout = getResolvedLayout(packedTrunc.getResult());
-    if (layout && !hasResolvedLayout(packedTrunc.getInput())) {
-      resolved[packedTrunc.getInput()] = layout;
-    }
-    if (layout && !hasResolvedLayout(packedTrunc.getScale())) {
-      resolved[packedTrunc.getScale()] = layout;
     }
     return;
   }

@@ -9,13 +9,10 @@
 #include "iree/compiler/Codegen/Common/GPU/GPUPromotionAnalysis.h"
 #include "iree/compiler/Codegen/Common/GPU/Passes.h"
 #include "iree/compiler/Codegen/Common/Transforms.h"
-#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenDialect.h"
-#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/DerivedConfigUtils.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUInterfaces.h"
 #include "iree/compiler/Codegen/Dialect/GPU/IR/IREEGPUOps.h"
 #include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtDialect.h"
-#include "iree/compiler/Codegen/Dialect/VectorExt/IR/VectorExtOps.h"
 #include "iree/compiler/Codegen/Utils/GPUUtils.h"
 #include "iree/compiler/Codegen/Utils/LinalgOpInfo.h"
 #include "llvm/ADT/DenseSet.h"
@@ -23,7 +20,6 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
@@ -43,36 +39,6 @@ namespace {
 
 using LayoutMap =
     llvm::MapVector<Value, IREE::VectorExt::VectorLayoutInterface>;
-
-struct AnchorScalingTruncAsPackedOp final
-    : OpRewritePattern<IREE::VectorExt::ToLayoutOp> {
-  using Base::Base;
-
-  LogicalResult matchAndRewrite(IREE::VectorExt::ToLayoutOp toLayoutOp,
-                                PatternRewriter &rewriter) const override {
-    auto truncOp =
-        toLayoutOp.getInput().getDefiningOp<arith::ScalingTruncFOp>();
-    if (!truncOp) {
-      return failure();
-    }
-    auto resultType = dyn_cast<VectorType>(toLayoutOp.getResult().getType());
-    if (!resultType) {
-      return failure();
-    }
-    auto packedTrunc = IREE::Codegen::PackedScalingTruncFOp::create(
-        rewriter, toLayoutOp.getLoc(), resultType, truncOp.getIn(),
-        truncOp.getScale(), toLayoutOp.getLayout());
-    rewriter.replaceOp(toLayoutOp, packedTrunc.getResult());
-    return success();
-  }
-};
-
-static LogicalResult
-anchorScalingTruncAsPackedOp(FunctionOpInterface funcOp) {
-  RewritePatternSet patterns(funcOp.getContext());
-  patterns.add<AnchorScalingTruncAsPackedOp>(funcOp.getContext());
-  return applyPatternsGreedily(funcOp, std::move(patterns));
-}
 
 // Allocates a tensor to copy the vector into a la bufferization.alloc_tensor
 // and then writes the vector into the allocated tensor. This allocation is
@@ -320,12 +286,6 @@ materializeSharedMemoryPromotions(FunctionOpInterface funcOp,
 
 struct GPUVectorAllocPass final
     : impl::GPUVectorAllocPassBase<GPUVectorAllocPass> {
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<IREE::Codegen::IREECodegenDialect>();
-    registry.insert<IREE::VectorExt::IREEVectorExtDialect>();
-    registry.insert<arith::ArithDialect>();
-  }
-
   void runOnOperation() override {
     FunctionOpInterface funcOp = getOperation();
 
@@ -350,10 +310,6 @@ struct GPUVectorAllocPass final
     funcOp.walk([](IREE::VectorExt::ToLayoutOp op) {
       op.removeSharedMemoryConversionAttr();
     });
-
-    if (failed(anchorScalingTruncAsPackedOp(funcOp))) {
-      return signalPassFailure();
-    }
 
     // Run layout analysis to find additional conflict points.
     LayoutMap layouts;

@@ -11,9 +11,6 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenTypes.h"
 #include "iree/compiler/Dialect/Encoding/IR/EncodingOps.h"
 #include "llvm/Support/raw_ostream.h"
-#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
-#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
-#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Support/LLVM.h"
@@ -126,31 +123,6 @@ struct TileMxNxK {
 
 FailureOr<MaterializeEncodingInfo>
 getEncodingInfoForMatmul(Encoding::EncodingAttr encoding, TileMxNxK tileMxNxK);
-
-//===----------------------------------------------------------------------===//
-// Inner tiled MMA matching utilities.
-//===----------------------------------------------------------------------===//
-
-struct InnerTiledMmaConversionInfo {
-  SmallVector<AffineMap> indexingMaps;
-  SmallVector<utils::IteratorType> iteratorTypes;
-  std::optional<SmallVector<SmallVector<int64_t>>> permutations;
-};
-
-struct InnerTiledMmaMatchOptions {
-  /// Require the matched Linalg op loop bounds to already equal the intrinsic
-  /// tile sizes. This should be true when converting a packed Linalg op to
-  /// inner_tiled, and false when validating a configured pre-pack op.
-  bool requireMatchingIntrinsicBounds = true;
-};
-
-/// Matches a contraction-like Linalg op that can be converted to
-/// `iree_codegen.inner_tiled` for the given MMA descriptor, and returns the
-/// maps/iterators/permutations needed to build the inner_tiled op.
-FailureOr<InnerTiledMmaConversionInfo>
-matchContractionToInnerTiledMma(linalg::LinalgOp linalgOp,
-                                InnerTileDescAttrInterface kind,
-                                InnerTiledMmaMatchOptions options = {});
 
 } // namespace mlir::iree_compiler::IREE::Codegen
 

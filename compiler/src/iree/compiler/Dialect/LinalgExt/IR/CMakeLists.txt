@@ -72,7 +72,6 @@ iree_cc_library(
     MLIRValueBoundsOpInterface
     MLIRViewLikeInterface
     iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
-    iree::compiler::Codegen::Dialect::Codegen::Utils
     iree::compiler::Dialect::LinalgExt::Utils
   PUBLIC
 )

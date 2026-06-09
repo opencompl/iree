@@ -5,7 +5,6 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 #include "iree/compiler/Codegen/LLVMGPU/Passes.h"
-#include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/NVGPU/IR/NVGPUDialect.h"
 #include "mlir/Dialect/SCF/Transforms/Patterns.h"
@@ -384,87 +383,6 @@ struct ConvertVectorShapeCast final
       results.push_back(vector::FromElementsOp::create(
           rewriter, loc, resultElemVecType, chunk));
     }
-    rewriter.replaceOpWithMultiple(op, {results});
-    return success();
-  }
-};
-
-static void appendScalarElements(Location loc, Value value,
-                                 ConversionPatternRewriter &rewriter,
-                                 SmallVectorImpl<Value> &scalars) {
-  auto vecType = cast<VectorType>(value.getType());
-  if (vecType.getNumElements() == 1) {
-    scalars.push_back(vector::ExtractOp::create(rewriter, loc, value, 0));
-    return;
-  }
-  auto toElements = vector::ToElementsOp::create(rewriter, loc, value);
-  llvm::append_range(scalars, toElements.getResults());
-}
-
-static Value build1DVectorFromScalars(Location loc, Type elementType,
-                                      ArrayRef<Value> scalars,
-                                      ConversionPatternRewriter &rewriter) {
-  auto vecType =
-      VectorType::get({static_cast<int64_t>(scalars.size())}, elementType);
-  return vector::FromElementsOp::create(rewriter, loc, vecType, scalars);
-}
-
-/// Convert packed_scaling_truncf on n-D vectors by preserving its elementwise
-/// semantics over the type converter's 1-D vector chunks.
-struct ConvertPackedScalingTruncF final
-    : public OpConversionPattern<IREE::Codegen::PackedScalingTruncFOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(IREE::Codegen::PackedScalingTruncFOp op,
-                  OneToNOpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    VectorType inputType = cast<VectorType>(op.getInput().getType());
-    VectorType scaleType = cast<VectorType>(op.getScale().getType());
-    VectorType resultType = dyn_cast<VectorType>(op.getResult().getType());
-    if (!resultType || resultType.getRank() <= 1) {
-      return failure();
-    }
-
-    SmallVector<Type> convertedResultTypes;
-    if (failed(getTypeConverter()->convertType(resultType,
-                                               convertedResultTypes))) {
-      return failure();
-    }
-
-    Location loc = op.getLoc();
-    SmallVector<Value> inputScalars;
-    SmallVector<Value> scaleScalars;
-    for (Value input : adaptor.getInput()) {
-      appendScalarElements(loc, input, rewriter, inputScalars);
-    }
-    for (Value scale : adaptor.getScale()) {
-      appendScalarElements(loc, scale, rewriter, scaleScalars);
-    }
-
-    if (inputScalars.size() != scaleScalars.size() ||
-        inputScalars.size() != static_cast<size_t>(resultType.getNumElements())) {
-      return rewriter.notifyMatchFailure(
-          op, "expected same total element count for input, scale, and result");
-    }
-
-    SmallVector<Value> results;
-    int64_t offset = 0;
-    for (Type convertedType : convertedResultTypes) {
-      auto convertedVectorType = cast<VectorType>(convertedType);
-      int64_t width = convertedVectorType.getNumElements();
-      ArrayRef<Value> inputChunk(inputScalars.data() + offset, width);
-      ArrayRef<Value> scaleChunk(scaleScalars.data() + offset, width);
-      Value inputVector = build1DVectorFromScalars(
-          loc, inputType.getElementType(), inputChunk, rewriter);
-      Value scaleVector = build1DVectorFromScalars(
-          loc, scaleType.getElementType(), scaleChunk, rewriter);
-      results.push_back(arith::ScalingTruncFOp::create(
-          rewriter, loc, convertedVectorType, inputVector, scaleVector,
-          arith::RoundingModeAttr{}, arith::FastMathFlagsAttr{}));
-      offset += width;
-    }
-
     rewriter.replaceOpWithMultiple(op, {results});
     return success();
   }
@@ -961,8 +879,8 @@ struct LLVMGPULegalizeNDVectorsPass final
         ConvertVectorInsertStridedSlice, ConvertArithConstant, ConvertUBPoison,
         ConvertVectorToElements, ConvertVectorFromElements,
         ConvertVectorBroadcast, ConvertVectorBitcast, ConvertVectorInterleave,
-        ConvertVectorDeinterleave, ConvertVectorMultiReduction,
-        ConvertPackedScalingTruncF>(typeConverter, ctx);
+        ConvertVectorDeinterleave, ConvertVectorMultiReduction>(typeConverter,
+                                                                ctx);
 
     // Some nvgpu ops abuse n-D vector types to represent a "struct of
     // vectors". These ops are legal despite having n-D vectors — the

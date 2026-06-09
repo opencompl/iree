@@ -84,7 +84,6 @@ iree_cc_library(
     MLIRVectorUtils
     iree::compiler::Codegen::Dialect::Codegen::IR::IREECodegenDialect
     iree::compiler::Codegen::Dialect::Codegen::Transforms::IREECodegenTransforms
-    iree::compiler::Codegen::Dialect::Codegen::Utils
     iree::compiler::Codegen::Dialect::GPU::IR::IREEGPUDialect
     iree::compiler::Codegen::Dialect::PCF::IR
     iree::compiler::Codegen::Dialect::PCF::Transforms
