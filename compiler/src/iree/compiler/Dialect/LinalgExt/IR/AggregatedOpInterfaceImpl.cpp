@@ -1133,6 +1133,64 @@ struct ExtractableElementwiseOperands {
   SmallVector<unsigned> extraInputOperandIndices;
 };
 
+static Type getIntegerCarrierType(Type type, unsigned bitWidth) {
+  Type integerType = IntegerType::get(type.getContext(), bitWidth);
+  if (auto vectorType = dyn_cast<VectorType>(type)) {
+    return vectorType.clone(integerType);
+  }
+  if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
+    return tensorType.clone(integerType);
+  }
+  return integerType;
+}
+
+static bool shouldExtractAsI8Carrier(Operation *op) {
+  auto scalingTruncFOp = dyn_cast<arith::ScalingTruncFOp>(op);
+  if (!scalingTruncFOp) {
+    return false;
+  }
+  auto resultElementType =
+      dyn_cast<FloatType>(getElementTypeOrSelf(scalingTruncFOp.getOut()));
+  return resultElementType && resultElementType.getWidth() == 4;
+}
+
+static Type getExtractedElementwiseResultType(Operation *op) {
+  if (shouldExtractAsI8Carrier(op)) {
+    return getIntegerCarrierType(op->getResult(0).getType(), /*bitWidth=*/8);
+  }
+  return op->getResult(0).getType();
+}
+
+static Value castF4ToI8Carrier(OpBuilder &builder, Location loc, Value value) {
+  Type i4Type = getIntegerCarrierType(value.getType(), /*bitWidth=*/4);
+  Type i8Type = getIntegerCarrierType(value.getType(), /*bitWidth=*/8);
+  Value i4Value = arith::BitcastOp::create(builder, loc, i4Type, value);
+  return arith::ExtUIOp::create(builder, loc, i8Type, i4Value);
+}
+
+static Value castI8CarrierToF4(OpBuilder &builder, Location loc, Value value,
+                               Type f4Type) {
+  Type i4Type = getIntegerCarrierType(value.getType(), /*bitWidth=*/4);
+  Value i4Value = arith::TruncIOp::create(builder, loc, i4Type, value);
+  return arith::BitcastOp::create(builder, loc, f4Type, i4Value);
+}
+
+static bool isI8CarrierToF4Cast(Operation *op) {
+  if (auto truncOp = dyn_cast<arith::TruncIOp>(op)) {
+    Type inputType = getElementTypeOrSelf(truncOp.getIn().getType());
+    Type resultType = getElementTypeOrSelf(truncOp.getOut().getType());
+    return inputType.isInteger(8) && resultType.isInteger(4);
+  }
+  if (auto bitcastOp = dyn_cast<arith::BitcastOp>(op)) {
+    Type inputType = getElementTypeOrSelf(bitcastOp.getIn().getType());
+    auto resultType =
+        dyn_cast<FloatType>(getElementTypeOrSelf(bitcastOp.getOut()));
+    return inputType.isInteger(4) && resultType &&
+           resultType.getWidth() == 4;
+  }
+  return false;
+}
+
 /// For a given `resultNumber` in a linalg::GenericOp, this op scans the
 /// GenericOp's body for the block arguments and operations that are involved
 /// in its computation.
@@ -1296,6 +1354,9 @@ getExtractableElementwiseBlockArgOperand(Operation *op, Block &body,
   // expected input type for the chosen matmul-like lowering. Peel only when a
   // chain has multiple extf-like ops, e.g. scaling_extf(...)->extf.
   if (isExtfLike(op) && !hasMultipleExtfLikesInSingleUseChain(op, body)) {
+    return std::nullopt;
+  }
+  if (isI8CarrierToF4Cast(op)) {
     return std::nullopt;
   }
   if (op->getNumResults() != 1 || op->getNumRegions() != 0) {
@@ -1503,8 +1564,12 @@ static FailureOr<Value> createElementwiseInputGeneric(
                  }
                  Operation *cloned = builder.clone(*usedOperation, mapping);
                  if (usedOperation->getNumResults() == 1) {
-                   mapping.map(usedOperation->getResult(0),
-                               cloned->getResult(0));
+                   Value result = cloned->getResult(0);
+                   if (usedOperation == elementwiseOp &&
+                       shouldExtractAsI8Carrier(usedOperation)) {
+                     result = castF4ToI8Carrier(builder, nestedLoc, result);
+                   }
+                   mapping.map(usedOperation->getResult(0), result);
                  }
                }
                linalg::YieldOp::create(
@@ -1550,7 +1615,7 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
 
   FailureOr<Value> extractedInput = createElementwiseInputGeneric(
       rewriter, genericOp.getLoc(), extractedInputs, extractedMaps, inputMap,
-      extraction->elementwiseOp->getResult(0).getType(),
+      getExtractedElementwiseResultType(extraction->elementwiseOp),
       extraction->elementwiseOp, mappedOperands);
   if (failed(extractedInput)) {
     return failure();
@@ -1599,7 +1664,7 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
     }
     newArgTypes.push_back(
         index == extraction->operandIndex
-            ? extraction->elementwiseOp->getResult(0).getType()
+            ? getExtractedElementwiseResultType(extraction->elementwiseOp)
             : arg.getType());
   }
   SmallVector<Location> argLocs(newArgTypes.size(), genericOp.getLoc());
@@ -1622,8 +1687,13 @@ extractElementwiseInput(RewriterBase &rewriter, linalg::GenericOp genericOp) {
   rewriter.setInsertionPointToStart(newBody);
   for (Operation &op : body.without_terminator()) {
     if (&op == extraction->elementwiseOp) {
-      mapping.map(op.getResult(0), mapping.lookup(op.getOperand(
-                                       extraction->blockArgOperandIndex)));
+      Value extractedValue =
+          mapping.lookup(op.getOperand(extraction->blockArgOperandIndex));
+      if (shouldExtractAsI8Carrier(&op)) {
+        extractedValue = castI8CarrierToF4(rewriter, op.getLoc(),
+                                           extractedValue, op.getResult(0).getType());
+      }
+      mapping.map(op.getResult(0), extractedValue);
       continue;
     }
     rewriter.clone(op, mapping);
