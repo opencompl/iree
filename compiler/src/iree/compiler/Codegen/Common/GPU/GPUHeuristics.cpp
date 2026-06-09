@@ -308,6 +308,53 @@ static FailureOr<GPUMMASchedule> fitScheduleInSharedMemory(
   return schedule;
 }
 
+/// Tries to fit an attention PV schedule into shared memory. Unlike generic
+/// matmul, PV's N tile is an output tile and QK is computed inside that tile's
+/// loop nest after decomposition. Preserving N therefore avoids recomputing the
+/// same QK tile for each slice of the output feature dimension.
+static FailureOr<GPUMMASchedule> fitAttentionPVScheduleInSharedMemory(
+    GPUMMASchedule schedule,
+    llvm::function_ref<bool(const GPUMMASchedule &schedule)> isScheduleValid) {
+  auto decrementIfPossible =
+      [](MutableArrayRef<int64_t> sizes) -> LogicalResult {
+    for (int64_t &size : sizes) {
+      if (size <= 1) {
+        continue;
+      }
+      --size;
+      return success();
+    }
+    return failure();
+  };
+
+  while (!isScheduleValid(schedule)) {
+    LDBG() << "Chosen attention PV schedule is invalid:\n"
+           << schedule << "\nShrinking schedule...";
+
+    if (succeeded(decrementIfPossible(schedule.kTileSizes))) {
+      continue;
+    }
+    if (succeeded(decrementIfPossible(schedule.mTileSizes))) {
+      continue;
+    }
+    if (succeeded(decrementIfPossible(schedule.mSubgroupCounts))) {
+      continue;
+    }
+    if (succeeded(decrementIfPossible(schedule.nTileSizes))) {
+      continue;
+    }
+    if (succeeded(decrementIfPossible(schedule.nSubgroupCounts))) {
+      continue;
+    }
+
+    return failure();
+  }
+
+  LDBG() << "Chosen attention PV schedule is valid:\n" << schedule;
+
+  return schedule;
+}
+
 LogicalResult canTargetIntrinsic(const GPUMatmulShapeType &problem,
                                  const GPUMatmulShapeType &intrinsic,
                                  int64_t preferredSubgroupSize,
@@ -1300,7 +1347,7 @@ FailureOr<std::pair<GPUMMASchedule, GPUMMASchedule>> deduceAttentionSchedule(
     };
 
     FailureOr<GPUMMASchedule> pvSchedule =
-        fitScheduleInSharedMemory(schedule, isValidSchedule);
+        fitAttentionPVScheduleInSharedMemory(schedule, isValidSchedule);
     if (failed(pvSchedule)) {
       return failure();
     }
