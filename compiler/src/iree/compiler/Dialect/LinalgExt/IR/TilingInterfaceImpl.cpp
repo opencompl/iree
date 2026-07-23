@@ -2562,8 +2562,8 @@ ExpReductionOp::generateResultTileValue(OpBuilder &b, unsigned resultNumber,
 static AffineMap getExpReductionPartialResultMap(
     AffineMap map, const llvm::SetVector<unsigned> &reductionDims) {
   MLIRContext *context = map.getContext();
-  for (auto [idx, dim] : llvm::enumerate(reductionDims)) {
-    map = map.insertResult(getAffineDimExpr(dim, context), idx);
+  for (unsigned dim : reductionDims) {
+    map = map.insertResult(getAffineDimExpr(dim, context), map.getNumResults());
   }
   return map;
 }
@@ -2665,8 +2665,18 @@ FailureOr<TilingResult> ExpReductionOp::tileToPartialReduction(
     getExpReductionPartialResultSlice(
         b, strategy, offsets, sizes, reductionDims, splitReductionIvs,
         partialMap, initOffsets, initSizes, initStrides);
+    SmallVector<OpFoldResult> resultSizes;
+    for (auto [expr, size] :
+         llvm::zip_equal(partialMap.getResults(), initSizes)) {
+      unsigned dim = cast<AffineDimExpr>(expr).getPosition();
+      if (strategy == ReductionTilingStrategy::PartialReductionOuterParallel &&
+          reductionDims.contains(dim)) {
+        continue;
+      }
+      resultSizes.push_back(size);
+    }
     SmallVector<int64_t> resultShape;
-    std::tie(resultShape, std::ignore) = decomposeMixedValues(initSizes);
+    std::tie(resultShape, std::ignore) = decomposeMixedValues(resultSizes);
     auto initType = cast<RankedTensorType>(initValue.getType());
     auto sliceType = RankedTensorType::get(
         resultShape, initType.getElementType(), initType.getEncoding());
@@ -2684,8 +2694,10 @@ FailureOr<TilingResult> ExpReductionOp::tileToPartialReduction(
   }
 
   SmallVector<AffineMap> newMaps = getIndexingMapsArray();
-  for (auto [resultNumber, partialMap] : llvm::enumerate(partialMaps)) {
-    newMaps[getNumDpsInputs() + resultNumber] = partialMap;
+  if (strategy == ReductionTilingStrategy::PartialReductionOuterReduction) {
+    for (auto [resultNumber, partialMap] : llvm::enumerate(partialMaps)) {
+      newMaps[getNumDpsInputs() + resultNumber] = partialMap;
+    }
   }
 
   Operation *partialOp = mlir::clone(
@@ -2706,10 +2718,10 @@ FailureOr<TilingResult> ExpReductionOp::tileToPartialReduction(
 }
 
 template <typename T>
-static Value
-expReductionElementwiseValueInPlace(OpBuilder &builder, Location loc,
-                                    AffineMap inputMap, AffineMap scaleMap,
-                                    Value value, Value scale) {
+static Value expReductionElementwiseValue(OpBuilder &builder, Location loc,
+                                          AffineMap inputMap,
+                                          AffineMap scaleMap, Value value,
+                                          Value scale) {
   SmallVector<AffineMap> compressedMaps =
       compressUnusedDims(SmallVector<AffineMap>{inputMap, scaleMap});
   inputMap = compressedMaps[0];
@@ -2718,10 +2730,14 @@ expReductionElementwiseValueInPlace(OpBuilder &builder, Location loc,
   SmallVector<utils::IteratorType> iteratorTypes(inputMap.getNumDims(),
                                                  utils::IteratorType::parallel);
 
+  SmallVector<OpFoldResult> resultShape =
+      tensor::getMixedSizes(builder, loc, value);
+  Value empty = tensor::EmptyOp::create(builder, loc, resultShape,
+                                        getElementTypeOrSelf(value.getType()));
   auto genericOp = linalg::GenericOp::create(
-      builder, loc, value.getType(), scale, value,
-      SmallVector<AffineMap>{scaleMap, inputMap}, iteratorTypes,
-      [&](OpBuilder &b, Location loc, ValueRange args) {
+      builder, loc, value.getType(), ValueRange{scale, value},
+      ValueRange{empty}, SmallVector<AffineMap>{scaleMap, inputMap, inputMap},
+      iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
         Value scale = convertScalarToDtype(b, loc, args[0], args[1].getType(),
                                            /*isUnsignedCast=*/false);
         Value result = T::create(b, loc, scale, args[1]);
@@ -2741,10 +2757,14 @@ static Value computeExpReductionSubAndExp2(OpBuilder &builder, Location loc,
 
   SmallVector<utils::IteratorType> iteratorTypes(inputMap.getNumDims(),
                                                  utils::IteratorType::parallel);
+  SmallVector<OpFoldResult> resultShape =
+      tensor::getMixedSizes(builder, loc, output);
+  Value empty = tensor::EmptyOp::create(builder, loc, resultShape,
+                                        getElementTypeOrSelf(output.getType()));
   auto genericOp = linalg::GenericOp::create(
-      builder, loc, output.getType(), input, output,
-      SmallVector<AffineMap>{inputMap, outputMap}, iteratorTypes,
-      [&](OpBuilder &b, Location loc, ValueRange args) {
+      builder, loc, output.getType(), ValueRange{input, output},
+      ValueRange{empty}, SmallVector<AffineMap>{inputMap, outputMap, outputMap},
+      iteratorTypes, [&](OpBuilder &b, Location loc, ValueRange args) {
         Value in = convertScalarToDtype(b, loc, args[0], args[1].getType(),
                                         /*isUnsignedCast=*/false);
         Value diff = arith::SubFOp::create(b, loc, args[1], in);
@@ -2846,7 +2866,7 @@ FailureOr<MergeResult> ExpReductionOp::mergeReductions(
     }
     Value partialResult = partialReduce[resultNumber];
     if (expReducedOperands.contains(resultNumber)) {
-      partialResult = expReductionElementwiseValueInPlace<arith::MulFOp>(
+      partialResult = expReductionElementwiseValue<arith::MulFOp>(
           b, loc, partialMaps[resultNumber], partialMaps[getReducingOpIndex()],
           partialResult, norm);
     }

@@ -86,15 +86,42 @@ tileOpAndWrapInDispatch(RewriterBase &rewriter, TilingInterface op,
 
   // Tile the operation and fuse with producers.
   scf::SCFTileAndFuseOptions tileAndFuseOptions;
-  // Only fuse along the dest operand.
+  SmallVector<Operation *> scoreProducers;
+  if (auto expReductionOp =
+          dyn_cast<IREE::LinalgExt::ExpReductionOp>(op.getOperation())) {
+    Value score = expReductionOp.getDpsInputOperand(0)->get();
+    while (Operation *producer = score.getDefiningOp()) {
+      if (auto expandShape = dyn_cast<tensor::ExpandShapeOp>(producer)) {
+        scoreProducers.push_back(producer);
+        score = expandShape.getSrc();
+        continue;
+      }
+      if (auto collapseShape = dyn_cast<tensor::CollapseShapeOp>(producer)) {
+        scoreProducers.push_back(producer);
+        score = collapseShape.getSrc();
+        continue;
+      }
+      auto linalgOp = dyn_cast<linalg::LinalgOp>(producer);
+      if (linalgOp && linalg::isaContractionOpInterface(linalgOp)) {
+        scoreProducers.push_back(producer);
+      }
+      break;
+    }
+  }
+  // Fuse destination producers and the score contraction needed to configure
+  // and lower an explicit attention reduction without materializing scores.
   scf::SCFTileAndFuseOptions::ControlFnTy fusionControlFn =
-      [](tensor::ExtractSliceOp extractOp, OpResult result, bool isDestArg)
+      [scoreProducers](tensor::ExtractSliceOp extractOp, OpResult result,
+                       bool isDestArg)
       -> std::optional<scf::SCFTileAndFuseOptions::ControlFnResult> {
     if (isDestArg) {
       return scf::SCFTileAndFuseOptions::ControlFnResult{false};
     }
     Operation *extractSource = extractOp.getSource().getDefiningOp();
     if (extractSource && IREE::LinalgExt::isBitExtendOp(extractSource)) {
+      return scf::SCFTileAndFuseOptions::ControlFnResult{false};
+    }
+    if (llvm::is_contained(scoreProducers, result.getOwner())) {
       return scf::SCFTileAndFuseOptions::ControlFnResult{false};
     }
     return std::nullopt;
@@ -105,6 +132,7 @@ tileOpAndWrapInDispatch(RewriterBase &rewriter, TilingInterface op,
   MLIRContext *context = rewriter.getContext();
   RewritePatternSet cleanupPatterns(context);
   populateFoldExtractSliceOfBroadcastPattern(cleanupPatterns);
+  populateSwapExtractWithExpandPattern(cleanupPatterns);
   if (fusePad) {
     // When fusing pads we do not want to generate zeroSliceGuards.
     cleanupPatterns.insert<linalg::ExtractSliceOfPadTensorSwapPattern>(
