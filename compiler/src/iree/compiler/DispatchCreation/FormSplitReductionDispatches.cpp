@@ -101,6 +101,13 @@ tileOpAndWrapInDispatch(RewriterBase &rewriter, TilingInterface op,
         score = collapseShape.getSrc();
         continue;
       }
+      if (auto genericOp = dyn_cast<linalg::GenericOp>(producer);
+          genericOp && linalg::isElementwise(genericOp) &&
+          genericOp.getNumDpsInputs() == 1) {
+        scoreProducers.push_back(producer);
+        score = genericOp.getDpsInputOperand(0)->get();
+        continue;
+      }
       auto linalgOp = dyn_cast<linalg::LinalgOp>(producer);
       if (linalgOp && linalg::isaContractionOpInterface(linalgOp)) {
         scoreProducers.push_back(producer);
@@ -225,6 +232,7 @@ void FormSplitReductionDispatchesPass::runOnOperation() {
   }
 
   for (auto [op, tileSizes] : reductionOps) {
+    IREE::LinalgExt::removeSplitReductionAttribute(op);
     FailureOr<IREE::Flow::DispatchRegionOp> formedDispatch =
         tileOpAndWrapInDispatch(rewriter, op, tileSizes, enableFusePad);
     if (failed(formedDispatch)) {

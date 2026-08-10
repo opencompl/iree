@@ -226,9 +226,11 @@ util.func public @split_reduction_arg_compare(%arg0: tensor<4x1x128256xf16>) -> 
 // -----
 
 util.func public @split_exp_reduction(
-    %arg0: tensor<4x16xf32>, %arg1: tensor<4096x16xf32>) -> tensor<4x1xf32> {
+    %arg0: tensor<4x16xf32>, %arg1: tensor<4096x16xf32>,
+    %arg2: tensor<4096x16xf32>) -> tensor<4x16xf32> {
   %zero = arith.constant 0.0 : f32
   %neg_inf = arith.constant -3.40282347E+38 : f32
+  %valid_length = arith.constant 4095 : index
   %score_empty = tensor.empty() : tensor<4x4096xf32>
   %score_init = linalg.fill ins(%zero : f32) outs(%score_empty : tensor<4x4096xf32>) -> tensor<4x4096xf32>
   %score = linalg.generic {
@@ -245,14 +247,32 @@ util.func public @split_exp_reduction(
     %sum = arith.addf %product, %acc : f32
     linalg.yield %sum : f32
   } -> tensor<4x4096xf32>
-  %score_expanded = tensor.expand_shape %score [[0], [1, 2]] output_shape [4, 1, 4096] : tensor<4x4096xf32> into tensor<4x1x4096xf32>
-  %empty = tensor.empty() : tensor<4x1xf32>
-  %max_init = linalg.fill ins(%neg_inf : f32) outs(%empty : tensor<4x1xf32>) -> tensor<4x1xf32>
-  %sum_init = linalg.fill ins(%zero : f32) outs(%empty : tensor<4x1xf32>) -> tensor<4x1xf32>
-  %result:2 = iree_linalg_ext.exp_reduction {
+  %masked_empty = tensor.empty() : tensor<4x4096xf32>
+  %masked_score = linalg.generic {
     indexing_maps = [
-      affine_map<(d0, d1, d2) -> (d0, d1, d2)>,
-      affine_map<(d0, d1, d2) -> (d0, d1)>,
+      affine_map<(d0, d1) -> (d0, d1)>,
+      affine_map<(d0, d1) -> (d0, d1)>
+    ],
+    iterator_types = ["parallel", "parallel"]
+  } ins(%score : tensor<4x4096xf32>)
+    outs(%masked_empty : tensor<4x4096xf32>) {
+  ^bb0(%input: f32, %unused: f32):
+    %index = linalg.index 1 : index
+    %is_valid = arith.cmpi ult, %index, %valid_length : index
+    %masked = arith.select %is_valid, %input, %neg_inf : f32
+    linalg.yield %masked : f32
+  } -> tensor<4x4096xf32>
+  %stat_empty = tensor.empty() : tensor<4xf32>
+  %max_init = linalg.fill ins(%neg_inf : f32) outs(%stat_empty : tensor<4xf32>) -> tensor<4xf32>
+  %sum_init = linalg.fill ins(%zero : f32) outs(%stat_empty : tensor<4xf32>) -> tensor<4xf32>
+  %output_empty = tensor.empty() : tensor<4x16xf32>
+  %output_init = linalg.fill ins(%zero : f32) outs(%output_empty : tensor<4x16xf32>) -> tensor<4x16xf32>
+  %result:3 = iree_linalg_ext.exp_reduction {
+    indexing_maps = [
+      affine_map<(d0, d1, d2) -> (d0, d2)>,
+      affine_map<(d0, d1, d2) -> (d2, d1)>,
+      affine_map<(d0, d1, d2) -> (d0)>,
+      affine_map<(d0, d1, d2) -> (d0)>,
       affine_map<(d0, d1, d2) -> (d0, d1)>
     ],
     iterator_types = [
@@ -260,36 +280,47 @@ util.func public @split_exp_reduction(
       #iree_linalg_ext.iterator_type<parallel>,
       #iree_linalg_ext.iterator_type<reduction>
     ],
-    exp_reduced_operands = [1]
+    exp_reduced_operands = [1, 2]
   } attributes {
     iree_linalg_ext.split_reduction = [128 : index]
-  } ins(%score_expanded : tensor<4x1x4096xf32>)
-    outs(%max_init, %sum_init : tensor<4x1xf32>, tensor<4x1xf32>) {
-  ^bb0(%input: f32, %max: f32, %sum: f32):
-    %new_sum = arith.addf %input, %sum : f32
-    iree_linalg_ext.yield %max, %new_sum : f32, f32
-  } -> tensor<4x1xf32>, tensor<4x1xf32>
-  util.return %result#1 : tensor<4x1xf32>
+  } ins(%masked_score, %arg2 : tensor<4x4096xf32>, tensor<4096x16xf32>)
+    outs(%max_init, %sum_init, %output_init : tensor<4xf32>, tensor<4xf32>, tensor<4x16xf32>) {
+  ^bb0(%input: f32, %value: f32, %max: f32, %sum: f32, %output: f32):
+    %index = iree_linalg_ext.index 2 : index
+    %is_valid = arith.cmpi ult, %index, %valid_length : index
+    %safe_input = arith.select %is_valid, %input, %zero : f32
+    %new_sum = arith.addf %safe_input, %sum : f32
+    %safe_value = arith.select %is_valid, %value, %zero : f32
+    %weighted = arith.mulf %safe_input, %safe_value : f32
+    %new_output = arith.addf %weighted, %output : f32
+    iree_linalg_ext.yield %max, %new_sum, %new_output : f32, f32, f32
+  } -> tensor<4xf32>, tensor<4xf32>, tensor<4x16xf32>
+  util.return %result#2 : tensor<4x16xf32>
 }
 // CHECK-LABEL:  @split_exp_reduction(
-//       CHECK:    %[[DISPATCH:.+]]:2 = flow.dispatch.region -> (tensor<4x1x32xf32>, tensor<4x1x32xf32>) {
-//       CHECK:      %[[FORALL:.+]]:2 = scf.forall
+//       CHECK:    %[[DISPATCH:.+]]:3 = flow.dispatch.region -> (tensor<4x32xf32>, tensor<4x32xf32>, tensor<4x16x32xf32>) {
+//       CHECK:      %[[FORALL:.+]]:3 = scf.forall
 //       CHECK:        %[[SCORE:.+]] = linalg.generic
-//       CHECK:        %[[SCORE_EXPANDED:.+]] = tensor.expand_shape %[[SCORE]]
-//       CHECK:        %[[MAX_SLICE:.+]] = tensor.extract_slice {{.+}} : tensor<4x1x32xf32> to tensor<4x1xf32>
+//       CHECK:        %[[MASKED_SCORE:.+]] = linalg.generic
+//       CHECK:          linalg.index 1
+//       CHECK:        %[[MAX_SLICE:.+]] = tensor.extract_slice {{.+}} : tensor<4x32xf32> to tensor<4xf32>
 //       CHECK:        %[[MAX_FILL:.+]] = linalg.fill {{.+}} outs(%[[MAX_SLICE]]
-//       CHECK:        %[[SUM_SLICE:.+]] = tensor.extract_slice {{.+}} : tensor<4x1x32xf32> to tensor<4x1xf32>
+//       CHECK:        %[[SUM_SLICE:.+]] = tensor.extract_slice {{.+}} : tensor<4x32xf32> to tensor<4xf32>
 //       CHECK:        %[[SUM_FILL:.+]] = linalg.fill {{.+}} outs(%[[SUM_SLICE]]
-//       CHECK:        %[[PARTIAL:.+]]:2 = iree_linalg_ext.exp_reduction
+//       CHECK:        %[[OUTPUT_SLICE:.+]] = tensor.extract_slice {{.+}} : tensor<4x16x32xf32> to tensor<4x16xf32>
+//       CHECK:        %[[OUTPUT_FILL:.+]] = linalg.fill {{.+}} outs(%[[OUTPUT_SLICE]]
+//       CHECK:        %[[PARTIAL:.+]]:3 = iree_linalg_ext.exp_reduction
+//   CHECK-NOT:            iree_linalg_ext.split_reduction
 //  CHECK-SAME:            iterator_types = [
 //  CHECK-SAME:              #iree_linalg_ext.iterator_type<parallel>,
 //  CHECK-SAME:              #iree_linalg_ext.iterator_type<parallel>,
 //  CHECK-SAME:              #iree_linalg_ext.iterator_type<reduction>
-//  CHECK-SAME:            ins(%[[SCORE_EXPANDED]] : tensor<4x1x128xf32>)
-//  CHECK-SAME:            outs(%[[MAX_FILL]], %[[SUM_FILL]] : tensor<4x1xf32>, tensor<4x1xf32>)
+//  CHECK-SAME:            ins(%[[MASKED_SCORE]]{{.*}}tensor<4x128xf32>, tensor<128x16xf32>)
+//  CHECK-SAME:            outs(%[[MAX_FILL]], %[[SUM_FILL]], %[[OUTPUT_FILL]] : tensor<4xf32>, tensor<4xf32>, tensor<4x16xf32>)
 //       CHECK:        tensor.parallel_insert_slice %[[PARTIAL]]#0
 //       CHECK:        tensor.parallel_insert_slice %[[PARTIAL]]#1
-//       CHECK:      flow.return %[[FORALL]]#0, %[[FORALL]]#1 : tensor<4x1x32xf32>, tensor<4x1x32xf32>
+//       CHECK:        tensor.parallel_insert_slice %[[PARTIAL]]#2
+//       CHECK:      flow.return %[[FORALL]]#0, %[[FORALL]]#1, %[[FORALL]]#2 : tensor<4x32xf32>, tensor<4x32xf32>, tensor<4x16x32xf32>
 //       CHECK:    linalg.reduce
 //       CHECK:    linalg.reduce
 

@@ -568,6 +568,46 @@ module attributes { transform.with_named_sequence } {
   }
 }
 
+func.func @exp_reduction_dynamic_tail(
+  %score: tensor<?x?xf32>,
+  %max_init: tensor<?xf32>,
+  %sum_init: tensor<?xf32>
+) -> (tensor<?xf32>, tensor<?xf32>) {
+  %max, %sum = iree_linalg_ext.exp_reduction {
+    indexing_maps = [
+      affine_map<(M, K) -> (M, K)>,
+      affine_map<(M, K) -> (M)>,
+      affine_map<(M, K) -> (M)>
+    ],
+    iterator_types = [
+      #iree_linalg_ext.iterator_type<parallel>,
+      #iree_linalg_ext.iterator_type<reduction>
+    ],
+    exp_reduced_operands = [1]
+  } ins(%score : tensor<?x?xf32>)
+    outs(%max_init, %sum_init : tensor<?xf32>, tensor<?xf32>) {
+  ^bb0(%exp_score: f32, %max_value: f32, %sum_value: f32):
+    %new_sum = arith.addf %exp_score, %sum_value : f32
+    iree_linalg_ext.yield %max_value, %new_sum : f32, f32
+  } -> tensor<?xf32>, tensor<?xf32>
+  return %max, %sum : tensor<?xf32>, tensor<?xf32>
+}
+// CHECK-LABEL: @exp_reduction_dynamic_tail
+// CHECK:         tensor.empty(%{{.+}}, %{{.+}}) : tensor<?x?xf32>
+// CHECK:         math.exp2
+// CHECK:         return
+
+// -----
+
+// Spec to decompose exp reduction op.
+module attributes { transform.with_named_sequence } {
+  transform.named_sequence @__transform_main(%module_op: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["iree_linalg_ext.exp_reduction"]} in %module_op : (!transform.any_op) -> !transform.any_op
+    transform.iree.decompose_aggregate_op %0 : (!transform.any_op) -> ()
+    transform.yield
+  }
+}
+
 func.func @exp_reduction_peel_input_block_arg(
   %s_in: tensor<20x128x256xf32>,
   %v_in: tensor<20x256x64xf32>,

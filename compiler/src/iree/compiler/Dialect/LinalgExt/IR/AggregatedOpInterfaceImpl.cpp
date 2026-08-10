@@ -2275,8 +2275,10 @@ FailureOr<SmallVector<Value>> ExpReductionOp::decomposeOperation(OpBuilder &b) {
       b, loc, b.getFloatAttr(sType.getElementType(), M_LOG2E));
   // Value mul = arith::MulFOp::create(b, loc, diff, log2e);
 
+  SmallVector<OpFoldResult> sSizes =
+      tensor::getMixedSizes(b, loc, sValue->get());
   Value emptyS =
-      tensor::EmptyOp::create(b, loc, sType.getShape(), sType.getElementType());
+      tensor::EmptyOp::create(b, loc, sSizes, sType.getElementType());
   Value log2eTensor =
       linalg::FillOp::create(b, loc, log2eAttr, emptyS).getResult(0);
 

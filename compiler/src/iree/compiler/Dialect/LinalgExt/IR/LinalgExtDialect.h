@@ -25,6 +25,7 @@ namespace mlir::iree_compiler::IREE::LinalgExt {
 // followed by a combined step.
 void setSplitReductionAttribute(Operation *op, ArrayRef<int64_t> splitSize);
 std::optional<SmallVector<int64_t>> getSplitReductionSizes(Operation *op);
+void removeSplitReductionAttribute(Operation *op);
 
 } // namespace mlir::iree_compiler::IREE::LinalgExt
 

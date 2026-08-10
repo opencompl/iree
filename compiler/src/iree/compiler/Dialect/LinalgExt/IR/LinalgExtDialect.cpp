@@ -178,4 +178,8 @@ std::optional<SmallVector<int64_t>> getSplitReductionSizes(Operation *op) {
   }
   return tileSizes;
 }
+
+void removeSplitReductionAttribute(Operation *op) {
+  op->removeAttr(kSplitReductionAttribute);
+}
 } // namespace mlir::iree_compiler::IREE::LinalgExt
