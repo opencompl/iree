@@ -658,6 +658,7 @@ func.func @scffor(%arr: memref<16x16xf16>, %arr2: memref<16xf16>, %a: vector<16x
     // expected-remark @above {{element_tile = [16, 8]}}
     %rootl = iree_vector_ext.to_layout %root to layout(#layout) : vector<16x16xf16>
     %init = vector.extract %arg1[] : f16 from vector<f16>
+    // expected-remark @below {{layout of result #0 is #iree_vector_ext.nested_layout<subgroup_tile = [], batch_tile = [], outer_tile = [], thread_tile = [], element_tile = [], subgroup_strides = [], thread_strides = []>}}
     %root_red = vector.multi_reduction<add>, %rootl, %init [0, 1]  : vector<16x16xf16> to f16
     %c = vector.broadcast %root_red : f16 to vector<f16>
     scf.yield %c : vector<f16>
@@ -885,6 +886,48 @@ func.func @scffor_backward_fixup(%arr: memref<16x16xf16>, %init: vector<16x16xf1
 
 // -----
 
+// Test that a layout learned during backward fixup is propagated forward
+// through a second loop-carried value. Only the matrix result is anchored;
+// the reduction accumulator must inherit its projected layout through the
+// loop body and boundary.
+
+#layout = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1],
+  batch_tile = [1, 1],
+  outer_tile = [1, 1],
+  thread_tile = [1, 1],
+  element_tile = [16, 16],
+
+  subgroup_strides = [0, 0],
+  thread_strides   = [0, 0]
+>
+
+func.func @scffor_backward_then_forward_fixup(
+    %init: vector<16x16xf16>, %stat_init: vector<16xf16>)
+    -> vector<16x16xf16> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c10 = arith.constant 10 : index
+  // expected-remark @below {{layout of result #0 is #iree_vector_ext.nested_layout<subgroup_tile = [1, 1], batch_tile = [1, 1], outer_tile = [1, 1], thread_tile = [1, 1], element_tile = [16, 16], subgroup_strides = [0, 0], thread_strides = [0, 0]>}}
+  // expected-remark @below {{layout of result #1 is #iree_vector_ext.nested_layout<subgroup_tile = [1], batch_tile = [1], outer_tile = [1], thread_tile = [1], element_tile = [16], subgroup_strides = [0], thread_strides = [0]>}}
+  %out:2 = scf.for %iv = %c0 to %c10 step %c1
+      iter_args(%matrix = %init, %stat = %stat_init)
+      -> (vector<16x16xf16>, vector<16xf16>) {
+    // expected-remark @below {{element_tile = [16, 16]}}
+    %matrix_next = arith.addf %matrix, %matrix : vector<16x16xf16>
+    // expected-remark @below {{element_tile = [16]}}
+    %stat_next = vector.multi_reduction <add>, %matrix_next, %stat [1]
+        : vector<16x16xf16> to vector<16xf16>
+    scf.yield %matrix_next, %stat_next
+        : vector<16x16xf16>, vector<16xf16>
+  }
+  %anchored = iree_vector_ext.to_layout %out#0 to layout(#layout)
+      : vector<16x16xf16>
+  return %anchored : vector<16x16xf16>
+}
+
+// -----
+
 // Test that a shared create_mask gets cloned per use site when two
 // transfer_write ops have different data layouts (and thus need different
 // mask layouts). The backward fixup processes transfer_write ops in reverse
@@ -929,6 +972,64 @@ func.func @clone_shared_mask_on_layout_conflict(
   %bl = iree_vector_ext.to_layout %b to layout(#layoutB) : vector<16x16xf16>
   vector.transfer_write %al, %arr[%c0, %c0], %mask {in_bounds = [true, true]} : vector<16x16xf16>, memref<16x16xf16>
   vector.transfer_write %bl, %arr[%c0, %c0], %mask {in_bounds = [true, true]} : vector<16x16xf16>, memref<16x16xf16>
+  func.return
+}
+
+// -----
+
+#layoutA = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1],
+  batch_tile = [1, 1],
+  outer_tile = [1, 1],
+  thread_tile = [1, 1],
+  element_tile = [16, 16],
+
+  subgroup_strides = [0, 0],
+  thread_strides   = [0, 0]
+>
+
+#layoutB = #iree_vector_ext.nested_layout<
+  subgroup_tile = [1, 1],
+  batch_tile = [2, 2],
+  outer_tile = [1, 1],
+  thread_tile = [1, 1],
+  element_tile = [8, 8],
+
+  subgroup_strides = [0, 0],
+  thread_strides   = [0, 0]
+>
+
+// A predicate in a loop may depend on a loop-invariant vector chain defined
+// in the parent block. A conflict between its users should clone the cheap
+// in-loop chain instead of forcing the i1 predicate through shared memory.
+func.func @clone_mask_with_parent_block_vector_operand(
+    %a: vector<16x16xf16>, %b: vector<16x16xf16>, %limit: index) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  // expected-remark @below {{element_tile = [8]}}
+  // expected-remark @below {{element_tile = [16]}}
+  %step = vector.step : vector<16xindex>
+  // expected-remark @below {{element_tile = [8, 8]}}
+  // expected-remark @below {{element_tile = [16, 16]}}
+  %indices = vector.broadcast %step : vector<16xindex> to vector<16x16xindex>
+  scf.for %i = %c0 to %limit step %c1 {
+    // expected-remark @below {{element_tile = [8, 8]}}
+    // expected-remark @below {{element_tile = [16, 16]}}
+    %iv = vector.broadcast %i : index to vector<16x16xindex>
+    // expected-remark @below {{element_tile = [8, 8]}}
+    // expected-remark @below {{element_tile = [16, 16]}}
+    %offset = arith.addi %iv, %indices : vector<16x16xindex>
+    // The original predicate and its clone receive the two consumer layouts.
+    // expected-remark @below {{element_tile = [8, 8]}}
+    // expected-remark @below {{element_tile = [16, 16]}}
+    %mask = arith.cmpi ult, %offset, %offset : vector<16x16xindex>
+    // expected-remark @below {{element_tile = [16, 16]}}
+    %selected_a = arith.select %mask, %a, %b : vector<16x16xi1>, vector<16x16xf16>
+    // expected-remark @below {{element_tile = [8, 8]}}
+    %selected_b = arith.select %mask, %b, %a : vector<16x16xi1>, vector<16x16xf16>
+    %al = iree_vector_ext.to_layout %selected_a to layout(#layoutA) : vector<16x16xf16>
+    %bl = iree_vector_ext.to_layout %selected_b to layout(#layoutB) : vector<16x16xf16>
+  }
   func.return
 }
 

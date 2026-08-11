@@ -605,7 +605,12 @@ static bool collectDuplicatableChain(Operation *op,
         continue;
       }
       if (defOp->getBlock() != block) {
-        return false;
+        // Stop at vector values defined outside the current block. They are
+        // available to the cloned chain and will be fixed up independently if
+        // their layout also conflicts. This commonly occurs when a loop body
+        // builds a cheap predicate from loop-invariant vector.step/broadcast
+        // values.
+        continue;
       }
       worklist.push(defOp);
     }
@@ -688,6 +693,49 @@ void propagateVectorLayoutInfo(
   analysis.resolve();
 
   // Phase 2: Backward fixup (mutates IR).
+  for (Region &region : root->getRegions()) {
+    analysis.fixupRegion(region);
+  }
+
+  bool hasUnresolvedLoopCarriedValue = false;
+  root->walk([&](scf::ForOp op) {
+    for (Value result : op.getResults()) {
+      if (isa<VectorType>(result.getType()) &&
+          !analysis.resolved.contains(result)) {
+        hasUnresolvedLoopCarriedValue = true;
+        return WalkResult::interrupt();
+      }
+    }
+    return WalkResult::advance();
+  });
+  if (!hasUnresolvedLoopCarriedValue) {
+    layouts = std::move(analysis.resolved);
+    return;
+  }
+
+  // A reduction result's layout is determined by projecting its source
+  // layout. Prefer that semantic constraint over an accumulator candidate
+  // that happened to reach the result first through a loop-carried cycle.
+  root->walk([&](vector::MultiDimReductionOp op) {
+    VectorLayoutInterface sourceLayout =
+        analysis.resolved.lookup(op.getSource());
+    if (sourceLayout) {
+      analysis.resolved[op.getResult()] =
+          sourceLayout.project(op.getReductionMask());
+    }
+  });
+
+  // Backward fixup can discover layouts for values that were not reachable
+  // from an anchor during the initial forward propagation. Feed those layouts
+  // back through control-flow edges once, then fix up their newly reached
+  // producers. This is needed for loops with multiple carried values where
+  // only one carried result is directly anchored, such as online reductions
+  // carrying output, sum, and max together.
+  for (auto [value, layout] : analysis.resolved) {
+    analysis.addCandidate(value, layout);
+  }
+  analysis.runForward();
+  analysis.resolve();
   for (Region &region : root->getRegions()) {
     analysis.fixupRegion(region);
   }

@@ -315,8 +315,20 @@ struct GPUVectorAllocPass final
     LayoutMap layouts;
     propagateVectorLayoutInfo(funcOp, layouts);
 
-    // Mark newly-inserted to_layout ops where input/output layouts don't
-    // match — these are genuine conflicts needing shared memory.
+    // Materialize operand promotions based on the analysis.
+    if (failed(materializeSharedMemoryPromotions(funcOp, promotionTypes,
+                                                 layouts))) {
+      return signalPassFailure();
+    }
+
+    // Promotion mutates the vector/layout graph. Recompute layouts before
+    // finding conversion conflicts so conversions introduced by the promoted
+    // graph are materialized before vector distribution. Avoid rerunning the
+    // mutating analysis when there was no promotion.
+    if (!promotionTypes.empty()) {
+      layouts.clear();
+      propagateVectorLayoutInfo(funcOp, layouts);
+    }
     funcOp.walk([&](IREE::VectorExt::ToLayoutOp op) {
       auto inputLayout = layouts.lookup(op.getInput());
       auto outputLayout = layouts.lookup(op.getResult());
@@ -326,12 +338,6 @@ struct GPUVectorAllocPass final
             IREE::GPU::DerivedThreadConfigAttr::get(op.getContext()));
       }
     });
-
-    // Materialize operand promotions based on the analysis.
-    if (failed(materializeSharedMemoryPromotions(funcOp, promotionTypes,
-                                                 layouts))) {
-      return signalPassFailure();
-    }
 
     // Materialize LDS roundtrips for layout conflicts.
     if (failed(materializeSharedMemoryConversions(funcOp))) {
